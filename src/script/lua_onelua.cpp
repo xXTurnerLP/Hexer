@@ -19,6 +19,38 @@
 
 #include "lprefix.h"  // must come first (feature macros)
 
+// Every system header the Lua sources use, up front: llex.c defines a `next(ls)` macro, and a
+// libstdc++ header pulled in later (math.h -> <cmath> -> std::next) would hit it. Included here
+// first, the later #includes inside the .c files are no-ops.
+#include <cassert>
+#include <cctype>
+#include <cerrno>
+#include <cfloat>
+#include <climits>
+#include <clocale>
+#include <cmath>
+#include <csetjmp>
+#include <csignal>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if !defined(_WIN32)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#if defined(LUA_USE_DLOPEN)
+#include <dlfcn.h>
+#endif
+#endif
+
 // One definition for every file below (each defines LUA_CORE or LUA_LIB itself; identical
 // redefinitions are fine). luaconf.h reads them on its first inclusion.
 #define LUA_CORE
@@ -35,6 +67,7 @@
 #include "lstate.c"
 #include "lgc.c"
 #include "llex.c"
+#undef next  // llex.c-local helper; must not reach any header included later
 #include "lcode.c"
 #include "lparser.c"
 #include "ldebug.c"
