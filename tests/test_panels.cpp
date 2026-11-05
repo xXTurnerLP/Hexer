@@ -131,7 +131,7 @@ Bytes make_pcap(int n) {
     for (int i = 0; i < n; ++i) {
         const Bytes f = udp_frame(uint16_t(1000 + i), 10);
         le32(b, uint32_t(100 + i)), le32(b, 0), le32(b, uint32_t(f.size())), le32(b, uint32_t(f.size()));
-        b.insert(b.end(), f.begin(), f.end());
+        for (uint8_t v : f) b.push_back(v);  // (vector::insert trips a GCC 13 -Wstringop-overflow false positive)
     }
     return b;
 }
