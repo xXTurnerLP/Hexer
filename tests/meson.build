@@ -25,7 +25,7 @@ test_ui = executable('test_ui', 'test_ui.cpp', test_main,
 test('ui', test_ui, timeout : 300)
 
 # Feature suites (one exe each so features can be built/tested independently).
-foreach t : ['nav', 'strings', 'hash']
+foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail']
   exe = executable('test_' + t, 'test_' + t + '.cpp', test_main,
     dependencies : [core_dep, doctest_dep], cpp_args : conf_args)
   test(t, exe, timeout : 300)

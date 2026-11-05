@@ -16,6 +16,10 @@ core_lib = static_library('hexer_core',
   'core/strings_scan.cpp',   # background strings extraction
   'core/hash.cpp',           # checksums / hashes of ranges
   'core/cstruct.cpp',        # C struct definitions -> Lua parser source
+  'core/entropy.cpp',        # byte classes + entropy overview (minimap)
+  'core/bitmap.cpp',         # bytes -> pixels (bitmap view)
+  'core/diff.cpp',           # compare two documents
+  'core/pcap.cpp',           # pcap/pcapng packet index
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [threads_dep],
@@ -37,6 +41,7 @@ script_dep = declare_dependency(link_with : script_lib, dependencies : [core_dep
 ui_view_lib = static_library('hexer_ui_view',
   'ui/theme.cpp',
   'ui/hex_view.cpp',
+  'ui/minimap.cpp',
   'ui/third_party/imgui_freetype.cpp',  # vendored from imgui misc/freetype (MIT)
   include_directories : inc,
   cpp_args : conf_args,
@@ -52,6 +57,9 @@ ui_lib = static_library('hexer_ui',
   'ui/panel_strings.cpp',
   'ui/panel_hash.cpp',
   'ui/dialog_cstruct.cpp',
+  'ui/panel_bitmap.cpp',
+  'ui/view_diff.cpp',
+  'ui/panel_packets.cpp',
   include_directories : inc,
   cpp_args : conf_args,
   link_with : ui_view_lib,
