@@ -45,7 +45,7 @@ jobs:
             xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl-mesa0
 
       - name: Cache subproject downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: subprojects/packagecache
           key: wraps-${{ hashFiles('subprojects/*.wrap') }}
@@ -65,6 +65,7 @@ jobs:
           exit $rc
 
       - name: Compile
+        id: compile
         run: |
           echo "::add-matcher::.github/ci/${{ matrix.matcher }}"
           set +e
@@ -91,7 +92,7 @@ jobs:
           exit $rc
 
       - name: Smoke run (Xvfb + Mesa)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !cancelled() && steps.compile.outcome == 'success'
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
         run: |
@@ -115,7 +116,7 @@ jobs:
 
       - name: Upload screenshot
         if: runner.os == 'Linux' && always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: screenshot-${{ matrix.name }}
           path: smoke/
@@ -139,7 +140,7 @@ jobs:
 
       - name: Upload package
         if: matrix.package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: hexer-${{ matrix.name }}
           path: hexer-*.*
