@@ -32,11 +32,14 @@ bool compile_pattern(SearchKind kind, const std::string& input, bool icase, Patt
 // Blocking primitive. Searches forward from `from` (inclusive) or backward from `from` (match must
 // start at < from). No wrap-around. Updates `progress` (bytes scanned) if non-null; returns
 // nullopt if not found or cancelled. Reads in large blocks with overlap; never loads the file.
+// The scan stops at the first unreadable byte (I/O error; *io_error is set) instead of matching
+// the zeros that stand in for it.
 std::optional<uint64_t> find_in(const Snapshot& snap, const Pattern& pat, uint64_t from, bool forward,
                                 const std::atomic<bool>* cancel = nullptr,
-                                std::atomic<uint64_t>* progress = nullptr);
+                                std::atomic<uint64_t>* progress = nullptr, bool* io_error = nullptr);
 
-// Background search job. One job at a time; start() cancels and joins any previous run.
+// Background search job. One job at a time; start() cancels any previous run without waiting for
+// it (that run finishes in the background and its result is discarded).
 class SearchJob {
 public:
     enum class Mode { Next, Prev, All };
@@ -57,16 +60,16 @@ public:
         bool wrapped = false;
         bool truncated = false;      // All: hit max_results
         bool cancelled = false;
+        bool io_error = false;       // part of the data could not be read; the scan stopped there
     };
     Result result() const;         // copy of the last finished run
 
 private:
-    void join();
-    std::thread thread_;
-    std::atomic<bool> cancel_{false};
+    struct Run;                    // per-run cancel flag + progress, shared with its worker
+    std::shared_ptr<Run> current() const;
+    std::shared_ptr<Run> run_;     // the current run (guarded by mu_); null before the first start
+    std::vector<std::pair<std::thread, std::shared_ptr<Run>>> threads_;  // current + superseded runs
     std::atomic<bool> running_{false};
-    std::atomic<uint64_t> done_{0};
-    std::atomic<uint64_t> total_{0};
     std::atomic<uint64_t> generation_{0};
     mutable std::mutex mu_;
     Result result_;

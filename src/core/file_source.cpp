@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <list>
 #include <mutex>
@@ -13,6 +14,10 @@ namespace hx {
 namespace {
 constexpr size_t kBypassThreshold = 1 << 20;  // reads this large go straight to the OS
 using Block = std::vector<uint8_t>;
+using Clock = std::chrono::steady_clock;
+// A block that failed to read is not retried for this long: the hex view re-reads visible rows
+// every frame, and each failing read of a bad sector can take seconds of kernel retries.
+constexpr auto kBadRetry = std::chrono::seconds(10);
 }  // namespace
 
 struct FileSource::Impl {
@@ -27,6 +32,22 @@ struct FileSource::Impl {
     using Lru = std::list<std::pair<uint64_t, std::shared_ptr<const Block>>>;
     Lru lru;                                    // front = most recently used
     std::unordered_map<uint64_t, Lru::iterator> map;
+    std::unordered_map<uint64_t, Clock::time_point> bad;  // failed block -> earliest retry
+
+    void clear_cache_locked() {
+        epoch++;
+        lru.clear();
+        map.clear();
+        bad.clear();
+    }
+
+    // True if a block in [first, last] recently failed (so a large read should go block by block).
+    bool any_bad(uint64_t first, uint64_t last) const {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const auto& [index, until] : bad)
+            if (index >= first && index <= last) return true;
+        return false;
+    }
 
     std::shared_ptr<OsFile> handle() const {
         std::lock_guard<std::mutex> lk(mu);
@@ -44,6 +65,11 @@ struct FileSource::Impl {
                 lru.splice(lru.begin(), lru, it->second);
                 return it->second->second;
             }
+            auto b = bad.find(index);
+            if (b != bad.end()) {
+                if (Clock::now() < b->second) return nullptr;  // known bad: fail fast
+                bad.erase(b);
+            }
             my_epoch = epoch;
             f = file;
         }
@@ -57,6 +83,11 @@ struct FileSource::Impl {
         int64_t got = f->read_at(off, b->data(), want);  // I/O outside the lock
         if (got < 0 || size_t(got) < want) {
             io_error = true;
+            std::lock_guard<std::mutex> lk(mu);
+            if (epoch == my_epoch) {
+                if (bad.size() >= 65536) bad.clear();
+                bad[index] = Clock::now() + kBadRetry;
+            }
             return nullptr;
         }
         std::lock_guard<std::mutex> lk(mu);
@@ -98,15 +129,16 @@ size_t FileSource::read(uint64_t offset, uint8_t* dst, size_t len) const {
     if (offset >= im.size || len == 0) return 0;
     len = size_t(std::min<uint64_t>(len, im.size - offset));
 
-    if (len >= kBypassThreshold) {
+    if (len >= kBypassThreshold && !im.any_bad(offset / kBlockSize, (offset + len - 1) / kBlockSize)) {
         auto f = im.handle();
         int64_t got = f ? f->read_at(offset, dst, len) : -1;
-        if (got < 0) {
-            im.io_error = true;
-            return 0;
+        if (got >= 0) {
+            if (size_t(got) < len) im.io_error = true;  // file shrank under us
+            return size_t(got);
         }
-        if (size_t(got) < len) im.io_error = true;  // file shrank under us
-        return size_t(got);
+        im.io_error = true;
+        // Fall through: retry block by block, so one bad sector does not fail the whole request
+        // and the failing blocks get remembered.
     }
 
     size_t done = 0;
@@ -125,16 +157,12 @@ size_t FileSource::read(uint64_t offset, uint8_t* dst, size_t len) const {
 
 void FileSource::invalidate() {
     std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->epoch++;
-    impl_->lru.clear();
-    impl_->map.clear();
+    impl_->clear_cache_locked();
 }
 
 void FileSource::close_file() {
     std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->epoch++;
-    impl_->lru.clear();
-    impl_->map.clear();
+    impl_->clear_cache_locked();
     impl_->file.reset();
 }
 
@@ -142,9 +170,7 @@ bool FileSource::reopen_file(std::string* err) {
     auto f = OsFile::open(impl_->path, OsFile::Mode::Read, err);
     if (!f) return false;
     std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->epoch++;
-    impl_->lru.clear();
-    impl_->map.clear();
+    impl_->clear_cache_locked();
     impl_->file = std::shared_ptr<OsFile>(std::move(f));
     return true;
 }

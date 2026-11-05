@@ -1359,3 +1359,352 @@ TEST_CASE("document: in-place save of a huge overwrite trims history instead of 
     d.reset();
     os_remove(p);
 }
+
+// =============================================================================================
+// regression tests for the data-safety review
+// =============================================================================================
+namespace {
+uint32_t test_crc32(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        c ^= p[i];
+        for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+std::string read_text(const std::string& p) {
+    Bytes b = read_file(p);
+    return std::string(b.begin(), b.end());
+}
+}  // namespace
+
+TEST_CASE("session: docs that cannot be restored now are kept, not deleted") {
+    TempDir t;
+    std::string sdir = t.file("session");
+    std::string p = t.file("usb.bin"), away = t.file("usb.away");
+    write_file(p, str_bytes("ABCDEFGH"));
+    std::string err;
+    {
+        auto d = Document::open_file(p);
+        const uint8_t x = 'X';
+        REQUIRE(d->overwrite(1, &x, 1));
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+    }
+    REQUIRE(fs::exists(from_u8(sdir) / "doc-1.hxs"));
+    fs::rename(from_u8(p), from_u8(away));  // drive unplugged
+    {
+        Session s(sdir);
+        auto r = s.load();
+        CHECK(r.docs.empty());
+        REQUIRE(r.warnings.size() == 1);
+        CHECK(r.warnings[0].find("kept") != std::string::npos);
+        CHECK(s.kept() == std::vector<std::string>{"doc-1.hxs"});
+        // A new doc must not take the kept file's name, and saving must not delete it.
+        auto u = Document::create_from_bytes("U", reinterpret_cast<const uint8_t*>("u"), 1);
+        REQUIRE(s.save({u.get()}, 0, &err));
+        REQUIRE(s.save({}, 0, &err));
+        CHECK(fs::exists(from_u8(sdir) / "doc-1.hxs"));
+        CHECK(read_text(t.file("session/session.ini")).find("doc=doc-1.hxs") != std::string::npos);
+    }
+    fs::rename(from_u8(away), from_u8(p));  // drive back
+    {
+        Session s(sdir);
+        auto r = s.load();
+        CHECK(r.warnings.empty());
+        REQUIRE(r.docs.size() == 1);
+        CHECK(doc_bytes(*r.docs[0]) == str_bytes("AXCDEFGH"));
+        CHECK(r.docs[0]->dirty());
+        CHECK(s.kept().empty());
+    }
+
+    // A file written by another Hexer version (valid checksum, other format) is kept as well; only
+    // integrity failures are dropped. discard_kept() gives up on it.
+    std::string f = t.file("session/doc-1.hxs");
+    Bytes b = read_file(f);
+    REQUIRE(b.size() > 12);
+    b[4] = 99;  // version
+    uint32_t c = test_crc32(b.data(), b.size() - 4);
+    for (int i = 0; i < 4; ++i) b[b.size() - 4 + size_t(i)] = uint8_t(c >> (8 * i));
+    write_file(f, b);
+    {
+        Session s(sdir);
+        auto r = s.load();
+        CHECK(r.docs.empty());
+        REQUIRE(r.warnings.size() == 1);
+        CHECK(r.warnings[0].find("different Hexer version") != std::string::npos);
+        REQUIRE(s.save({}, 0, &err));
+        CHECK(fs::exists(from_u8(f)));
+        s.discard_kept();
+        REQUIRE(s.save({}, 0, &err));
+        CHECK(!fs::exists(from_u8(f)));
+    }
+}
+
+TEST_CASE("session: a second instance never touches the first one's session") {
+    TempDir t;
+    std::string sdir = t.file("session");
+    auto a = Document::create_from_bytes("A", reinterpret_cast<const uint8_t*>("aaaa"), 4);
+    auto b = Document::create_from_bytes("B", reinterpret_cast<const uint8_t*>("bbbb"), 4);
+    std::string err;
+    {
+        Session first(sdir);
+        CHECK(first.load().docs.empty());
+        REQUIRE(first.save({a.get()}, 0, &err));
+        {
+            Session second(sdir);
+            auto r = second.load();
+            CHECK(r.docs.empty());  // does not restore the first instance's docs
+            CHECK(second.secondary());
+            CHECK_FALSE(first.secondary());
+            REQUIRE(second.save({b.get()}, 0, &err));
+            REQUIRE(first.save({a.get()}, 0, &err));  // does not delete the second one's file
+            REQUIRE(second.save({b.get()}, 0, &err));
+            CHECK(os_list_files(sdir, ".hxs").size() == 1);
+        }
+        REQUIRE(first.save({a.get()}, 0, &err));
+    }
+    // The next instance owning the main dir adopts what the second one left behind.
+    {
+        Session s(sdir);
+        auto r = s.load();
+        CHECK(r.warnings.empty());
+        REQUIRE(r.docs.size() == 2);
+        CHECK(r.docs[0]->display_name() == "A");
+        CHECK(r.docs[1]->display_name() == "B");
+        CHECK(doc_bytes(*r.docs[1]) == str_bytes("bbbb"));
+        REQUIRE(s.save({r.docs[0].get(), r.docs[1].get()}, 1, &err));
+        CHECK(os_list_files(sdir, ".hxs").size() == 2);
+    }
+    CHECK(os_list_files(t.file("session/instance-1"), ".hxs").empty());
+    auto r = Session(sdir).load();
+    REQUIRE(r.docs.size() == 2);  // adopted once, not twice
+    CHECK(r.active_index == 1);
+}
+
+TEST_CASE("session: a save that finished just before exit is not replayed on top of itself") {
+    TempDir t;
+    std::string sdir = t.file("session");
+    std::string p = t.file("s.bin");
+    write_file(p, str_bytes("ABCDEF"));
+    std::string err;
+    {
+        auto d = Document::open_file(p);
+        const uint8_t x = 'X';
+        REQUIRE(d->insert(0, &x, 1));
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        REQUIRE(d->save(nullptr, &err));  // rewrite; then the process dies before the next autosave
+    }
+    CHECK(read_file(p) == str_bytes("XABCDEF"));
+    {
+        Session s(sdir);
+        auto r = s.load();
+        REQUIRE(r.docs.size() == 1);
+        CHECK(doc_bytes(*r.docs[0]) == str_bytes("XABCDEF"));  // not "XXABCDE"
+        CHECK_FALSE(r.docs[0]->dirty());
+        REQUIRE(r.warnings.size() == 1);
+        CHECK(r.warnings[0].find("saved just before") != std::string::npos);
+        REQUIRE(s.save({r.docs[0].get()}, 0, &err));
+    }
+    CHECK(Session(sdir).load().warnings.empty());
+
+    // In-place variant: content stays right and no undo entry reads the overwritten bytes.
+    {
+        auto d = Document::open_file(p);
+        const uint8_t y = 'Y';
+        REQUIRE(d->overwrite(3, &y, 1));
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        REQUIRE(d->save(nullptr, &err));
+        CHECK(d->current_source() == 0);  // in place
+    }
+    {
+        auto r = Session(sdir).load();
+        REQUIRE(r.docs.size() == 1);
+        CHECK(doc_bytes(*r.docs[0]) == str_bytes("XABYDEF"));
+        CHECK_FALSE(r.docs[0]->dirty());
+        CHECK_FALSE(r.docs[0]->can_undo());
+    }
+
+    // If the session file cannot be rewritten after a save, the stale one is removed.
+    {
+        auto d = Document::open_file(p);
+        const uint8_t z = 'Z';
+        REQUIRE(d->insert(0, &z, 1));
+        Session s(sdir);
+        s.load();
+        REQUIRE(s.save({d.get()}, 0, &err));
+        auto files = os_list_files(sdir, ".hxs");
+        REQUIRE(files.size() == 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        REQUIRE(d->save(nullptr, &err));
+        d->view_generation++;
+        fs::create_directories(from_u8(files[0] + ".tmp"));  // makes the atomic write fail
+        CHECK_FALSE(s.save({d.get()}, 0, &err));
+        CHECK(!fs::exists(from_u8(files[0])));
+        fs::remove(from_u8(files[0] + ".tmp"));
+    }
+}
+
+TEST_CASE("document: hot exit of a state referencing a large replaced file version is reported") {
+    TempDir t;
+    std::string sdir = t.file("session");
+    std::string p = t.file("big.bin");
+    Bytes orig = random_bytes(size_t(17) << 20, 5);
+    write_file(p, orig);
+    auto d = Document::open_file(p);
+    const uint8_t x = 'X';
+    REQUIRE(d->insert(0, &x, 1));
+    std::string err;
+    REQUIRE(d->save(nullptr, &err));  // rewrite
+    CHECK(d->hot_exit_safe());
+    REQUIRE(d->undo());  // back to the original content, which now only lives in the old version
+    CHECK(d->dirty());
+    CHECK_FALSE(d->hot_exit_safe());
+    {
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+    }
+    d.reset();
+    auto r = Session(sdir).load();
+    REQUIRE(r.docs.size() == 1);
+    REQUIRE(r.warnings.size() == 1);
+    CHECK(r.warnings[0].find("too large to keep") != std::string::npos);
+    CHECK(r.docs[0]->size() == orig.size() + 1);  // the saved version
+}
+
+TEST_CASE("document: save after the file was replaced or modified by another program") {
+    TempDir t;
+    std::string p = t.file("r.bin"), q = t.file("r2.bin");
+    write_file(p, str_bytes("AAAAAAAA"));
+    auto d = Document::open_file(p);
+    write_file(q, str_bytes("BBBBBBBB"));
+    fs::last_write_time(from_u8(q), fs::last_write_time(from_u8(p)));  // same size and mtime
+    REQUIRE(os_replace_file(q, p));
+    CHECK(d->changed_on_disk());  // different file identity
+    const uint8_t x = 'X';
+    REQUIRE(d->overwrite(0, &x, 1));
+    std::string err;
+    REQUIRE(d->save(nullptr, &err));  // rewrite from the still-open old version, not a patch
+    CHECK(read_file(p) == str_bytes("XAAAAAAA"));
+    CHECK(doc_bytes(*d) == str_bytes("XAAAAAAA"));
+    CHECK_FALSE(d->dirty());
+    CHECK_FALSE(d->changed_on_disk());
+
+    // Modified in place: the cached and the re-read blocks would be a torn mix -> refuse.
+    std::string m = t.file("m.bin");
+    write_file(m, Bytes(256 * 1024, 'a'));
+    auto e = Document::open_file(m);
+    Bytes buf(65536);
+    REQUIRE(e->read(0, buf.data(), buf.size()) == buf.size());  // cached
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    {
+        auto f = OsFile::open(m, OsFile::Mode::ReadWrite);
+        REQUIRE(f);
+        Bytes bs(256 * 1024, 'b');
+        REQUIRE(f->write_at(0, bs.data(), bs.size()));
+    }
+    REQUIRE(e->insert(e->size(), &x, 1));
+    CHECK_FALSE(e->save(nullptr, &err));
+    CHECK(err.find("modified on disk") != std::string::npos);
+    CHECK(read_file(m) == Bytes(256 * 1024, 'b'));
+    CHECK(e->dirty());
+    REQUIRE(e->save(nullptr, &err, true));  // forced: consistent with the current disk contents
+    Bytes want(256 * 1024, 'b');
+    want.push_back('X');
+    CHECK(read_file(m) == want);
+}
+
+TEST_CASE("document: saving through a symlink updates the target") {
+    TempDir t;
+    std::string real = t.file("real.bin"), link = t.file("link.bin");
+    write_file(real, str_bytes("abcdef"));
+    std::error_code ec;
+    fs::create_symlink(from_u8(real), from_u8(link), ec);
+    if (ec) {
+        MESSAGE("symlinks unavailable here, skipped: " << ec.message());
+        return;
+    }
+    CHECK(os_stat(link).size == 6);  // follows the link (Windows too)
+    CHECK(os_resolve_symlinks(link) == u8(from_u8(real).lexically_normal()));
+    CHECK(os_resolve_symlinks(real) == real);
+    auto d = Document::open_file(link);
+    REQUIRE(d);
+    const uint8_t x = 'X';
+    REQUIRE(d->insert(0, &x, 1));  // size change -> rewrite path
+    std::string err;
+    REQUIRE(d->save(nullptr, &err));
+    CHECK(fs::is_symlink(from_u8(link)));
+    CHECK(read_file(real) == str_bytes("Xabcdef"));
+    CHECK(doc_bytes(*d) == str_bytes("Xabcdef"));
+    REQUIRE(d->overwrite(1, &x, 1));  // in place through the link
+    REQUIRE(d->save(nullptr, &err));
+    CHECK(read_file(real) == str_bytes("XXbcdef"));
+    CHECK(!tmp_left_over(t));
+}
+
+TEST_CASE("document: devices never take the rewrite path") {
+#ifdef _WIN32
+    const std::string dev = "\\\\.\\NUL";
+#else
+    const std::string dev = "/dev/null";
+#endif
+    FileStat st = os_stat(dev);
+    REQUIRE(st.exists);
+    CHECK(st.is_device);
+    auto d = Document::open_file(dev);
+    REQUIRE(d);
+    CHECK_FALSE(d->changed_on_disk());
+    const uint8_t x = 'X';
+    REQUIRE(d->insert(0, &x, 1));
+    std::string err;
+    CHECK_FALSE(d->save(nullptr, &err));
+    CHECK(err.find("device") != std::string::npos);
+    CHECK_FALSE(os_stat(dev + ".hexer-tmp").exists);
+    auto u = Document::create_from_bytes("U", &x, 1);
+    CHECK_FALSE(u->save_as(dev, nullptr, &err));
+    CHECK(err.find("device") != std::string::npos);
+}
+
+TEST_CASE("document: add-buffer chunks nothing references are released") {
+    auto d = Document::create_empty("u");
+    Bytes big(size_t(3) << 20, 0x11), big2(size_t(3) << 20, 0x22);
+    REQUIRE(d->insert(0, big.data(), big.size()));
+    auto snap = d->snapshot();  // a reader still using those bytes
+    REQUIRE(d->undo());
+    REQUIRE(d->insert(0, big2.data(), big2.size()));  // drops the redo state -> its chunk is unused
+    size_t live = 0;
+    uint64_t bytes = 0;
+    for (const auto& c : d->add_buffer().chunks())
+        if (c->capacity) {
+            ++live;
+            bytes += c->capacity;
+        }
+    CHECK(live == 1);
+    CHECK(bytes == big2.size());
+    CHECK(doc_bytes(*d) == big2);
+    REQUIRE(d->undo());
+    CHECK(d->size() == 0);
+    REQUIRE(d->redo());
+    CHECK(doc_bytes(*d) == big2);
+    Bytes old(big.size());
+    REQUIRE(snap->read(0, old.data(), old.size()) == old.size());
+    CHECK(old == big);  // the snapshot keeps the released chunk alive
+    // Fill + undo repeatedly does not accumulate pattern chunks.
+    auto e = Document::create_from_bytes("f", big.data(), big.size());
+    const uint8_t pat[2] = {1, 2};
+    for (int i = 0; i < 10; ++i) {
+        REQUIRE(e->fill(0, big.size(), pat, 2));
+        REQUIRE(e->undo());
+    }
+    REQUIRE(e->fill(0, 8, pat, 2));
+    uint64_t total = 0;
+    for (const auto& c : e->add_buffer().chunks()) total += c->capacity;
+    CHECK(total <= big.size() + 2 * AddBuffer::kChunkSize);
+    REQUIRE(e->undo());
+    CHECK(doc_bytes(*e) == big);
+}

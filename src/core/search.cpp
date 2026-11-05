@@ -188,18 +188,18 @@ private:
 bool cancelled(const std::atomic<bool>* c) { return c && c->load(std::memory_order_relaxed); }
 
 // Reads match starts [lo, lo+count) plus the m-1 byte tail into buf. Returns how many starts are
-// fully readable (short only on a read error).
+// fully readable (callers never ask past EOF, so short only before an unreadable byte).
 size_t read_window(const Snapshot& snap, uint64_t lo, size_t count, size_t m, std::vector<uint8_t>& buf) {
     size_t want = count + m - 1;
     if (buf.size() < want) buf.resize(want);
-    size_t got = snap.read(lo, buf.data(), want);
+    size_t got = snap.read_valid(lo, buf.data(), want);
     return got >= m ? std::min(count, got - m + 1) : 0;
 }
 
 // Forward scan over match starts in [lo, hi). `on_hit(offset)` returns the next allowed start
 // (> offset) to continue, or UINT64_MAX to stop. Returns false if cancelled.
 bool scan_forward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t hi,
-                  const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
+                  const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress, bool* io_err,
                   const std::function<uint64_t(uint64_t)>& on_hit) {
     std::vector<uint8_t> buf;
     uint64_t pos = lo;
@@ -224,7 +224,10 @@ bool scan_forward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t
             i = size_t(next - pos);
         }
         if (progress) progress->fetch_add(count, std::memory_order_relaxed);
-        if (n < count) return true;  // read error: treat as end of data
+        if (n < count) {  // read error: treat as end of data
+            if (io_err) *io_err = true;
+            return true;
+        }
         pos = next_pos;
     }
     return true;
@@ -232,16 +235,19 @@ bool scan_forward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t
 
 // Backward scan for the last match with start in [lo, hi).
 std::optional<uint64_t> scan_backward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t hi,
-                                      const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress) {
+                                      const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
+                                      bool* io_err) {
     std::vector<uint8_t> buf;
     while (hi > lo) {
         if (cancelled(cancel)) return std::nullopt;
         size_t count = size_t(std::min<uint64_t>(kBlock, hi - lo));
         uint64_t start = hi - count;
         size_t n = read_window(snap, start, count, mt.size(), buf);
+        if (n < count && io_err) *io_err = true;  // later matches in this window may be hidden
         size_t k = mt.last(buf.data(), 0, n);
         if (progress) progress->fetch_add(count, std::memory_order_relaxed);
         if (k != SIZE_MAX) return start + k;
+        if (n < count) return std::nullopt;  // read error: stop
         hi = start;
     }
     return std::nullopt;
@@ -253,12 +259,13 @@ uint64_t start_limit(const Snapshot& snap, size_t m) {
 }
 
 std::optional<uint64_t> find_range(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t hi, bool forward,
-                                   const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress) {
+                                   const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
+                                   bool* io_err) {
     hi = std::min(hi, start_limit(snap, mt.size()));
     if (lo >= hi) return std::nullopt;
-    if (!forward) return scan_backward(snap, mt, lo, hi, cancel, progress);
+    if (!forward) return scan_backward(snap, mt, lo, hi, cancel, progress, io_err);
     std::optional<uint64_t> found;
-    scan_forward(snap, mt, lo, hi, cancel, progress, [&](uint64_t off) {
+    scan_forward(snap, mt, lo, hi, cancel, progress, io_err, [&](uint64_t off) {
         found = off;
         return UINT64_MAX;
     });
@@ -268,30 +275,43 @@ std::optional<uint64_t> find_range(const Snapshot& snap, const Matcher& mt, uint
 }  // namespace
 
 std::optional<uint64_t> find_in(const Snapshot& snap, const Pattern& pat, uint64_t from, bool forward,
-                                const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress) {
+                                const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
+                                bool* io_error) {
+    if (io_error) *io_error = false;
     if (pat.size() == 0 || pat.mask.size() != pat.bytes.size()) return std::nullopt;
     Matcher mt(pat);
-    if (forward) return find_range(snap, mt, from, UINT64_MAX, true, cancel, progress);
-    return find_range(snap, mt, 0, from, false, cancel, progress);
+    if (forward) return find_range(snap, mt, from, UINT64_MAX, true, cancel, progress, io_error);
+    return find_range(snap, mt, 0, from, false, cancel, progress, io_error);
 }
 
 // ---- background job -----------------------------------------------------------------------------
 
+struct SearchJob::Run {
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> finished{false};  // worker is about to exit: joining it does not block
+    std::atomic<uint64_t> done{0};
+    uint64_t total = 0;
+};
+
 SearchJob::~SearchJob() {
-    cancel_ = true;
-    join();
+    for (auto& t : threads_) t.second->cancel = true;
+    for (auto& t : threads_) t.first.join();
 }
 
-void SearchJob::join() {
-    if (thread_.joinable()) thread_.join();
+std::shared_ptr<SearchJob::Run> SearchJob::current() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return run_;
 }
 
-void SearchJob::cancel() { cancel_ = true; }
+void SearchJob::cancel() {
+    if (auto r = current()) r->cancel = true;
+}
 
 bool SearchJob::running() const { return running_.load(); }
 
 double SearchJob::progress() const {
-    uint64_t t = total_.load(), d = done_.load();
+    auto r = current();
+    uint64_t t = r ? r->total : 0, d = r ? r->done.load() : 0;
     if (!t) return running_.load() ? 0.0 : 1.0;
     return d >= t ? 1.0 : double(d) / double(t);
 }
@@ -305,13 +325,28 @@ SearchJob::Result SearchJob::result() const {
 
 void SearchJob::start(std::shared_ptr<const Snapshot> snap, Pattern pat, uint64_t from, Mode mode,
                       size_t max_results) {
-    cancel_ = true;
-    join();
-    cancel_ = false;
-    done_ = 0;
-    total_ = snap ? snap->size() : 0;
+    // Never block the UI thread on the previous run (it may sit in one slow read): cancel it, let it
+    // finish in the background (it no longer publishes anything) and join it once it has exited.
+    auto run = std::make_shared<Run>();
+    run->total = snap ? snap->size() : 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (run_) run_->cancel = true;
+        run_ = run;
+    }
+    for (auto it = threads_.begin(); it != threads_.end();) {
+        if (it->second->finished) {
+            it->first.join();
+            it = threads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
     running_ = true;
-    thread_ = std::thread([this, snap = std::move(snap), pat = std::move(pat), from, mode, max_results]() {
+    std::thread th([this, run, snap = std::move(snap), pat = std::move(pat), from, mode, max_results]() {
+        std::atomic<bool>& cancel_ = run->cancel;
+        std::atomic<uint64_t>& done_ = run->done;
+        bool io = false;
         Result r;
         r.mode = mode;
         r.pattern_len = pat.size();
@@ -322,22 +357,22 @@ void SearchJob::start(std::shared_ptr<const Snapshot> snap, Pattern pat, uint64_
             const uint64_t f = std::min(from, size);
             std::optional<uint64_t> hit;
             if (mode == Mode::Next) {
-                hit = find_range(s, mt, f, UINT64_MAX, true, &cancel_, &done_);
+                hit = find_range(s, mt, f, UINT64_MAX, true, &cancel_, &done_, &io);
                 if (!hit && !cancel_ && f > 0) {  // wrap: starts in [0, from)
-                    hit = find_range(s, mt, 0, f, true, &cancel_, &done_);
+                    hit = find_range(s, mt, 0, f, true, &cancel_, &done_, &io);
                     r.wrapped = hit.has_value();
                 }
             } else if (mode == Mode::Prev) {
-                hit = find_range(s, mt, 0, f, false, &cancel_, &done_);
+                hit = find_range(s, mt, 0, f, false, &cancel_, &done_, &io);
                 if (!hit && !cancel_) {  // wrap: last match at or after `from`
-                    hit = find_range(s, mt, f, UINT64_MAX, false, &cancel_, &done_);
+                    hit = find_range(s, mt, f, UINT64_MAX, false, &cancel_, &done_, &io);
                     r.wrapped = hit.has_value();
                 }
             } else {
                 // All: non-overlapping matches from `from` to EOF.
                 uint64_t hi = start_limit(s, mt.size());
                 const size_t m = mt.size();
-                scan_forward(s, mt, f, hi, &cancel_, &done_, [&](uint64_t off) -> uint64_t {
+                scan_forward(s, mt, f, hi, &cancel_, &done_, &io, [&](uint64_t off) -> uint64_t {
                     if (r.hits.size() >= max_results) {
                         r.truncated = true;
                         return UINT64_MAX;
@@ -349,15 +384,20 @@ void SearchJob::start(std::shared_ptr<const Snapshot> snap, Pattern pat, uint64_
             if (hit) r.hits.push_back(*hit);
         }
         r.cancelled = cancel_.load();
+        r.io_error = io;
         if (r.cancelled && mode != Mode::All) r.hits.clear();
         {
             std::lock_guard<std::mutex> lock(mu_);
-            result_ = std::move(r);
+            if (run_ == run) {  // superseded runs publish nothing
+                result_ = std::move(r);
+                done_ = run->total;
+                running_ = false;
+                generation_.fetch_add(1);
+            }
         }
-        done_ = total_.load();
-        running_ = false;
-        generation_.fetch_add(1);
+        run->finished = true;
     });
+    threads_.emplace_back(std::move(th), std::move(run));
 }
 
 }  // namespace hx

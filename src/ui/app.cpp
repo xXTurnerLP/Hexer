@@ -46,6 +46,8 @@ const char* const kPopFill = "Fill selection###fill";
 const char* const kPopCopyAs = "###copyas";
 const char* const kPopClose = "Unsaved changes###closeprompt";
 const char* const kPopQuit = "Unsaved changes###quitprompt";
+const char* const kPopReload = "Reload from disk###reloadprompt";
+const char* const kPopOverwrite = "File changed on disk###overwriteprompt";
 const char* const kPopSaving = "Saving###saving";
 const char* const kPopMessage = "###message";
 const char* const kPopAbout = "About Hexer###about";
@@ -277,9 +279,34 @@ void request_close_tab(App& app, int index) {
     close_tab_now(app, index);
 }
 
+// Index of the open tab showing `path` (same spelling, or the same file on disk), else -1.
+int tab_for_path(App& app, const std::string& path) {
+    if (path.empty()) return -1;
+    const std::string key = path_key(path);
+    for (size_t i = 0; i < app.tabs.size(); ++i) {
+        const Tab& t = *app.tabs[i];
+        if (t.path.empty()) continue;
+        if (path_key(t.path) == key || os_same_file(t.path, path)) return int(i);
+    }
+    return -1;
+}
+
 void reopen_closed_tab(App& app) {
     if (app.closed.empty()) {
         set_status(app, "No closed tabs to reopen");
+        return;
+    }
+    // Two Documents on one file would overwrite each other's bytes on save.
+    if (int open = tab_for_path(app, app.closed.back()->path); open >= 0) {
+        app.select_request = open;
+        app.active = open;
+        const std::string label = app.closed.back()->label;
+        if (!app.closed.back()->doc->dirty()) {
+            app.closed.pop_back();  // nothing unsaved in it: the open tab replaces it
+            set_status(app, label + " is already open");
+        } else {
+            set_status(app, label + " is already open. Close that tab first to reopen the closed one with its edits.", 8.0);
+        }
         return;
     }
     app.tabs.push_back(std::move(app.closed.back()));
@@ -313,16 +340,15 @@ bool any_busy(App& app) {
 
 bool open_path(App& app, const std::string& path) {
     if (path.empty()) return false;
-    const std::string key = path_key(path);
-    for (size_t i = 0; i < app.tabs.size(); ++i) {
-        if (!app.tabs[i]->path.empty() && path_key(app.tabs[i]->path) == key) {
-            app.select_request = int(i);
-            app.active = int(i);
-            return true;
-        }
+    // Tab paths are absolute, so compare absolute paths (and file identity for links, 8.3 names).
+    const std::string abs = os_absolute_path(path);
+    if (int i = tab_for_path(app, abs); i >= 0) {
+        app.select_request = i;
+        app.active = i;
+        return true;
     }
     std::string err;
-    std::unique_ptr<Document> doc = Document::open_file(path, &err);
+    std::unique_ptr<Document> doc = Document::open_file(abs, &err);
     if (!doc) {
         std::string msg = "Cannot open " + path + (err.empty() ? "" : ": " + err);
         log_console(app, ConsoleLine::Error, msg);
@@ -330,7 +356,7 @@ bool open_path(App& app, const std::string& path) {
         return false;
     }
     add_tab(app, std::move(doc));
-    app.settings.push_recent(path);
+    app.settings.push_recent(abs);
     mark_settings_dirty(app);
     return true;
 }
@@ -412,8 +438,25 @@ void open_with_dialog(App& app) {
 
 namespace {
 
+bool save_session(App& app, bool force, std::string* err_out = nullptr);  // per-frame section
+
+// The on-disk version is one the user chose to ignore (banner "Ignore").
+bool ignored_version(const Tab& t) {
+    if (!t.ignore_valid) return false;
+    const FileStat st = os_stat(t.path);
+    return st.exists == t.ignored_stat.exists && st.size == t.ignored_stat.size &&
+           st.mtime_ns == t.ignored_stat.mtime_ns;
+}
+
+// The file was changed by someone else since we opened / last saved it.
+bool disk_conflict(const Tab& t) {
+    return t.doc->has_path() && (t.disk_changed || t.doc->changed_on_disk()) && !ignored_version(t);
+}
+
 // Starts saving `tab` on a worker thread. Shows a Save As dialog for untitled docs / save_as.
-bool start_save(App& app, Tab& tab, bool save_as, AfterSave after) {
+// A save over a file that changed on disk first asks Overwrite / Save As / Reload / Cancel,
+// unless `confirmed` (the user already chose Overwrite).
+bool start_save(App& app, Tab& tab, bool save_as, AfterSave after, bool confirmed = false) {
     SaveTask& s = app.save;
     if (s.running) {
         set_status(app, "Another save is still in progress");
@@ -426,6 +469,11 @@ bool start_save(App& app, Tab& tab, bool save_as, AfterSave after) {
         if (!save_dialog(app, d, target)) return false;
     } else if (!d.dirty() && after == AfterSave::None) {
         set_status(app, "No changes to save");
+        return false;
+    } else if (!confirmed && disk_conflict(tab)) {
+        app.overwrite_prompt_doc = d.id();
+        app.overwrite_prompt_after = after;
+        app.overwrite_prompt_pending = true;
         return false;
     }
     s.progress.done = 0;
@@ -444,9 +492,11 @@ bool start_save(App& app, Tab& tab, bool save_as, AfterSave after) {
     app.bm_edit.end();
     SaveTask* task = &s;
     Document* doc = &d;
-    s.thread = std::thread([task, doc, target] {
+    // Overwrite confirmed: save over a file another program modified (Document::save refuses).
+    const bool force = confirmed;
+    s.thread = std::thread([task, doc, target, force] {
         std::string err;
-        bool ok = target.empty() ? doc->save(&task->progress, &err)
+        bool ok = target.empty() ? doc->save(&task->progress, &err, force)
                                  : doc->save_as(target, &task->progress, &err);
         task->ok = ok;
         task->err = std::move(err);
@@ -488,7 +538,9 @@ void poll_save(App& app) {
         if (s.after == AfterSave::CloseTab) close_tab_now(app, tab_index(app, t));
         return;
     }
-    if (s.progress.cancel.load())
+    // Cancel can be pressed while an in-place write is already past the point of no return; only
+    // a save that really stopped because of it is reported as cancelled, any other error is shown.
+    if (s.progress.cancel.load() && s.err.find("cancelled") != std::string::npos)
         set_status(app, "Save cancelled");
     else
         show_message(app, "Save failed", "Could not save " + t->label + ":\n" + s.err);
@@ -510,7 +562,21 @@ void process_quit(App& app) {
         app.quit = true;
         return;
     }
-    if (app.hot_exit || !any_dirty(app)) {
+    if (app.hot_exit) {
+        // Quitting without a prompt is only safe once the session (the unsaved edits) is on disk.
+        std::string err;
+        if (save_session(app, true, &err) || !any_dirty(app)) {
+            app.quit = true;
+            return;
+        }
+        show_message(app, "Session not saved",
+                     "Hot exit could not write the session, so unsaved edits would be lost on quit:\n" + err +
+                         "\n\nSave or discard them in the next dialog.");
+        app.quit_requested = false;
+        app.quit_prompt_pending = true;
+        return;
+    }
+    if (!any_dirty(app)) {
         app.quit = true;
         return;
     }
@@ -542,27 +608,50 @@ void do_undo(App& app, bool redo) {
         set_status(app, redo ? "Nothing to redo" : "Nothing to undo");
         return;
     }
+    d->view().low_nibble = false;  // the restored caret sits on a whole byte, not a half-typed one
     after_edit(*t);
     set_status(app, std::string(redo ? "Redo" : "Undo") + (label.empty() ? "" : ": " + label));
 }
 
-void copy_selection(App& app, CopyFormat fmt) {
+// Most bytes that may be copied as `fmt`: the clipboard text (not the raw bytes) is capped at
+// kMaxClipboardBytes, and e.g. a C array needs ~6.25 characters per byte.
+uint64_t copy_limit(CopyFormat fmt) {
+    uint64_t chars_per_byte = 1;
+    switch (fmt) {
+        case CopyFormat::HexSpaced: chars_per_byte = 3; break;
+        case CopyFormat::HexCompact: chars_per_byte = 2; break;
+        case CopyFormat::CArray: chars_per_byte = 7; break;
+        case CopyFormat::PythonBytes: chars_per_byte = 4; break;
+        case CopyFormat::Base64: chars_per_byte = 2; break;
+        case CopyFormat::EscapedString: chars_per_byte = 4; break;
+        default: break;
+    }
+    return kMaxClipboardBytes / chars_per_byte;
+}
+
+CopyFormat default_copy_format(const Document& d) {
+    return d.view().ascii_focus ? CopyFormat::Text : CopyFormat::HexSpaced;
+}
+
+// Returns true if the clipboard now holds the bytes.
+bool copy_selection(App& app, CopyFormat fmt) {
     Document* d = usable_doc(app);
-    if (!d) return;
+    if (!d) return false;
     const ViewState& v = d->view();
     uint64_t off = v.sel_begin(), len = v.sel_len();
     if (len == 0) {  // no selection: copy the byte under the caret
         if (v.cursor >= d->size()) {
             set_status(app, "Nothing to copy");
-            return;
+            return false;
         }
         off = v.cursor;
         len = 1;
     }
-    if (len > kMaxClipboardBytes) {
-        show_message(app, "Copy", "The selection is " + fmt_size(len) +
-                                      ". Copying more than 64 MiB to the clipboard is not supported.");
-        return;
+    if (len > copy_limit(fmt)) {
+        show_message(app, "Copy", "The selection is " + fmt_size(len) + ". Copying more than " +
+                                      fmt_size(copy_limit(fmt)) + " as " + copy_format_name(fmt) +
+                                      " is not supported (the clipboard text is limited to 64 MiB).");
+        return false;
     }
     std::vector<uint8_t> buf(static_cast<size_t>(len));
     size_t n = d->read(off, buf.data(), buf.size());
@@ -570,12 +659,13 @@ void copy_selection(App& app, CopyFormat fmt) {
     ImGui::SetClipboardText(text.c_str());
     set_status(app, "Copied " + std::to_string(n) + (n == 1 ? " byte" : " bytes") + " as " +
                         copy_format_name(fmt));
+    return true;
 }
 
-void copy_default(App& app) {
+bool copy_default(App& app) {
     Document* d = usable_doc(app);
-    if (!d) return;
-    copy_selection(app, d->view().ascii_focus ? CopyFormat::Text : CopyFormat::HexSpaced);
+    if (!d) return false;
+    return copy_selection(app, default_copy_format(*d));
 }
 
 void cut_selection(App& app) {
@@ -591,11 +681,12 @@ void cut_selection(App& app) {
         report_edit_failure(app, *d);
         return;
     }
-    if (v.sel_len() > kMaxClipboardBytes) {
-        show_message(app, "Cut", "Cutting more than 64 MiB to the clipboard is not supported.");
+    if (v.sel_len() > copy_limit(default_copy_format(*d))) {
+        show_message(app, "Cut", "Cutting more than " + fmt_size(copy_limit(default_copy_format(*d))) +
+                                     " to the clipboard is not supported.");
         return;
     }
-    copy_default(app);
+    if (!copy_default(app)) return;  // never erase bytes that did not reach the clipboard
     uint64_t b = v.sel_begin(), len = v.sel_len();
     if (!d->erase(b, len)) {
         report_edit_failure(app, *d);
@@ -622,9 +713,12 @@ void paste(App& app) {
     if (!parsed_hex) bytes.assign(text.begin(), text.end());
     if (bytes.empty()) return;
     bool ok;
-    uint64_t at = v.has_selection() ? v.sel_begin() : v.cursor;
-    if (v.has_selection())
-        ok = d->replace(at, v.sel_len(), bytes.data(), bytes.size());
+    const uint64_t at = v.has_selection() ? v.sel_begin() : v.cursor;
+    const uint64_t sel_len = v.sel_len();
+    // Insert mode replaces the selection; overwrite mode (size-preserving patching) overwrites
+    // from the selection start, like typing does.
+    if (v.has_selection() && t->insert_mode)
+        ok = d->replace(at, sel_len, bytes.data(), bytes.size());
     else if (t->insert_mode)
         ok = d->insert(at, bytes.data(), bytes.size());
     else
@@ -636,7 +730,10 @@ void paste(App& app) {
     v.cursor = v.anchor = std::min<uint64_t>(at + bytes.size(), d->size());
     v.low_nibble = false;
     after_edit(*t);
-    set_status(app, "Pasted " + std::to_string(bytes.size()) + " bytes" + (parsed_hex ? " (hex)" : " (text)"));
+    std::string msg = "Pasted " + std::to_string(bytes.size()) + " bytes" + (parsed_hex ? " (hex)" : " (text)");
+    if (sel_len && !t->insert_mode && sel_len != bytes.size())
+        msg += ", overwriting from the selection start (selection was " + std::to_string(sel_len) + " bytes)";
+    set_status(app, msg, 6.0);
 }
 
 void select_all(App& app) {
@@ -747,6 +844,18 @@ void reload_from_disk(App& app, Tab& t) {
     set_status(app, "Reloaded " + t.label + " from disk");
 }
 
+// File > Reload from Disk: reloading drops edits and the whole undo history and cannot be undone,
+// so ask first when there is anything to lose. (The banner's "Reload (discard edits)" is explicit.)
+void request_reload(App& app, Tab& t) {
+    if (t.doc->busy()) return;
+    if (t.doc->dirty() || t.doc->can_undo() || t.doc->can_redo()) {
+        app.reload_prompt_doc = t.doc->id();
+        app.reload_prompt_pending = true;
+        return;
+    }
+    reload_from_disk(app, t);
+}
+
 void force_reparse(App& app) {
     Tab* t = active_tab(app);
     if (!t) return;
@@ -786,6 +895,7 @@ void find_start(App& app, SearchJob::Mode mode) {
         from = v.has_selection() ? v.sel_begin() : v.cursor;
     f.job_len = pat.size();
     f.job_doc = d->id();
+    f.job_doc_gen = d->generation();
     f.job_query = f.input;
     f.job.start(d->snapshot(), std::move(pat), from, mode);
 }
@@ -794,10 +904,11 @@ void poll_search(App& app) {
     FindState& f = app.find;
     const uint64_t g = f.job.generation();
     if (g == f.seen_gen) return;
-    f.seen_gen = g;
-    SearchJob::Result r = f.job.result();
     Tab* t = find_tab(app, f.job_doc);
-    if (!t || t->doc->busy()) return;
+    if (t && t->doc->busy()) return;  // apply the result once the save is done
+    f.seen_gen = g;
+    if (!t) return;
+    SearchJob::Result r = f.job.result();
     if (r.cancelled) {
         set_status(app, "Search cancelled");
         return;
@@ -807,7 +918,7 @@ void poll_search(App& app) {
         h.offsets = std::move(r.hits);
         h.len = r.pattern_len ? r.pattern_len : f.job_len;
         h.truncated = r.truncated;
-        h.doc_gen = t->doc->generation();
+        h.doc_gen = f.job_doc_gen;  // edits made while the search ran mark the hits as stale
         h.query = f.job_query;
         h.layer.clear();
         const uint32_t color = hex_colors().search_hit;
@@ -836,7 +947,7 @@ namespace {
 
 struct Action {
     const char* name;
-    ImGuiKeyChord keys[2];
+    ImGuiKeyChord keys[4];  // unused slots are 0
     void (*run)(App&);
     bool (*enabled)(App&);  // nullptr = always enabled
     bool in_text;           // also fires while a text field has keyboard focus
@@ -878,7 +989,7 @@ const Action kActions[] = {
     {"Close Tab", {C(ImGuiKey_W), 0}, [](App& a) { request_close_tab(a, a.active); }, has_tab, true, false},
     {"Reopen Closed Tab", {CS(ImGuiKey_T), 0}, [](App& a) { reopen_closed_tab(a); },
      [](App& a) { return !a.closed.empty(); }, true, false},
-    {"Reload from Disk", {0, 0}, [](App& a) { if (Tab* t = active_tab(a)) reload_from_disk(a, *t); }, has_file, true, false},
+    {"Reload from Disk", {0, 0}, [](App& a) { if (Tab* t = active_tab(a)) request_reload(a, *t); }, has_file, true, false},
     {"Exit", {0, 0}, [](App& a) { a.quit_requested = true; }, nullptr, true, false},
     // Edit
     {"Undo", {C(ImGuiKey_Z), 0}, [](App& a) { do_undo(a, false); }, can_undo, false, true},
@@ -903,7 +1014,8 @@ const Action kActions[] = {
     {"Next Tab", {C(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, +1); }, nullptr, true, true},
     {"Previous Tab", {CS(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, -1); }, nullptr, true, true},
     // View
-    {"Zoom In", {C(ImGuiKey_Equal), C(ImGuiKey_KeypadAdd)}, [](App& a) { zoom(a, +1.0f); }, nullptr, true, true},
+    // "+" is Shift+= on US layouts and keeps the US "]" key code on e.g. German ones (GLFW backend).
+    {"Zoom In", {C(ImGuiKey_Equal), C(ImGuiKey_KeypadAdd), CS(ImGuiKey_Equal), C(ImGuiKey_RightBracket)}, [](App& a) { zoom(a, +1.0f); }, nullptr, true, true},
     {"Zoom Out", {C(ImGuiKey_Minus), C(ImGuiKey_KeypadSubtract)}, [](App& a) { zoom(a, -1.0f); }, nullptr, true, true},
     {"Reset Zoom", {C(ImGuiKey_0), C(ImGuiKey_Keypad0)}, [](App& a) { zoom(a, 0.0f); }, nullptr, true, false},
     {"Command Palette", {CS(ImGuiKey_P), 0}, [](App& a) { a.req_palette = true; }, nullptr, true, false},
@@ -994,10 +1106,23 @@ void draw_recent_menu(App& app) {
     if (!open_me.empty()) open_path(app, open_me);
 }
 
-void draw_copy_as_items(App& app) {
-    for (int i = 0; i < int(CopyFormat::Count); ++i)
-        if (ImGui::MenuItem(copy_format_name(CopyFormat(i)), nullptr, false, has_doc(app)))
+// `numbered`: show 1..N as shortcuts and accept those keys (the keyboard-opened Copy As popup).
+void draw_copy_as_items(App& app, bool numbered = false) {
+    for (int i = 0; i < int(CopyFormat::Count); ++i) {
+        const std::string key = std::to_string(i + 1);
+        const bool pressed = numbered && i < 9 && ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_1 + i), false);
+        if (ImGui::MenuItem(copy_format_name(CopyFormat(i)), numbered && i < 9 ? key.c_str() : nullptr, false,
+                            has_doc(app)) ||
+            (pressed && has_doc(app))) {
             copy_selection(app, CopyFormat(i));
+            if (pressed) ImGui::CloseCurrentPopup();
+        }
+    }
+}
+
+// Popups close on Esc only with keyboard navigation enabled, which the hex view does not use.
+void close_popup_on_escape() {
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
 }
 
 void draw_edit_menu(App& app) {
@@ -1078,11 +1203,15 @@ void draw_scripts_menu(App& app) {
     menu_action(app, "Open Scripts Folder");
     const auto& cmds = app.engine->commands();
     if (!cmds.empty()) ImGui::Separator();
+    // Run after the loop, with a copy of the name: a command may register commands, which
+    // reallocates the engine's list this loop (and a reference into it) points into.
+    std::string run;
     for (const ScriptCommand& c : cmds) {
-        if (ImGui::MenuItem(c.name.c_str(), nullptr, false, idle(app))) app.engine->run_command(c.name);
+        if (ImGui::MenuItem(c.name.c_str(), nullptr, false, idle(app))) run = c.name;
         if (!c.description.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s", c.description.c_str());
     }
+    if (!run.empty()) app.engine->run_command(run);
 }
 
 void draw_main_menu(App& app) {
@@ -1342,6 +1471,7 @@ void draw_hex_context_menu(App& app) {
     menu_action(app, "Toggle Bookmark");
     menu_action(app, "Go to Offset...");
     menu_action(app, "Find...");
+    close_popup_on_escape();
     ImGui::EndPopup();
 }
 
@@ -1556,6 +1686,8 @@ void draw_palette(App& app) {
     }
     int run = -1;
     if (enter && n > 0) run = app.palette_sel;
+    // Enter deactivates the input; when it ran nothing (no match / disabled entry) keep typing.
+    if (enter && (run < 0 || run >= n || !app.palette_view[size_t(run)].enabled)) ImGui::SetKeyboardFocusHere(-1);
     const float list_h = ImGui::GetTextLineHeightWithSpacing() * 14.0f;
     if (ImGui::BeginChild("##list", ImVec2(0.0f, list_h), ImGuiChildFlags_None)) {
         ImGuiListClipper clip;
@@ -1612,13 +1744,14 @@ void draw_goto(App& app) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     const bool enter = ImGui::InputTextWithHint("##expr", "0x1F00   +0x10   end-0x100   50%   cur+4*0x10",
                                                 &app.goto_input, ImGuiInputTextFlags_EnterReturnsTrue);
-    const bool shift = ImGui::GetIO().KeyShift;
-    if (ImGui::Checkbox("Bare numbers are hex", &app.settings.goto_default_hex)) mark_settings_dirty(app);
     uint64_t target = 0;
     std::string err;
     const ViewState& v = d->view();
     const bool ok = !app.goto_input.empty() &&
                     parse_offset(app.goto_input, v.cursor, d->size(), app.settings.goto_default_hex, target, &err);
+    if (enter && !ok) ImGui::SetKeyboardFocusHere(-1);  // Enter deactivated the input: keep editing
+    const bool shift = ImGui::GetIO().KeyShift;
+    if (ImGui::Checkbox("Bare numbers are hex", &app.settings.goto_default_hex)) mark_settings_dirty(app);
     if (app.goto_input.empty())
         ImGui::TextDisabled("Size: %s (%s)", fmt_offset(d->size()).c_str(), fmt_size(d->size()).c_str());
     else if (ok)
@@ -1689,7 +1822,7 @@ void draw_copy_as_popup(App& app) {
     if (!ImGui::BeginPopup(kPopCopyAs)) return;
     ImGui::TextDisabled("Copy selection as");
     ImGui::Separator();
-    draw_copy_as_items(app);
+    draw_copy_as_items(app, true);
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }
@@ -1708,14 +1841,75 @@ void draw_close_prompt(App& app) {
     ImGui::Text("Save changes to \"%s\" before closing?", t->label.c_str());
     ImGui::TextDisabled("Discarded tabs can still be reopened with Ctrl+Shift+T until Hexer exits.");
     ImGui::Spacing();
-    if (ImGui::Button("Save")) {
+    if (ImGui::Button("Save") || ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
         ImGui::CloseCurrentPopup();
         start_save(app, *t, false, AfterSave::CloseTab);
     }
+    ImGui::SetItemTooltip("Enter");
     ImGui::SameLine();
     if (ImGui::Button("Discard")) {
         ImGui::CloseCurrentPopup();
         close_tab_now(app, tab_index(app, t));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void draw_reload_prompt(App& app) {
+    center_next_window(app, 0.0f, 0.3f);
+    if (!ImGui::BeginPopupModal(kPopReload, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    Tab* t = find_tab(app, app.reload_prompt_doc);
+    if (!t || t->doc->busy()) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ImGui::Text("Reload \"%s\" from disk?", t->label.c_str());
+    ImGui::TextDisabled(t->doc->dirty() ? "Unsaved changes and the undo history will be discarded. This cannot be undone."
+                                        : "The undo history will be discarded. This cannot be undone.");
+    ImGui::Spacing();
+    if (ImGui::Button("Reload and discard")) {
+        ImGui::CloseCurrentPopup();
+        reload_from_disk(app, *t);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+// Save over a file that another program changed since it was opened / last saved.
+void draw_overwrite_prompt(App& app) {
+    center_next_window(app, 0.0f, 0.3f);
+    if (!ImGui::BeginPopupModal(kPopOverwrite, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    Tab* t = find_tab(app, app.overwrite_prompt_doc);
+    if (!t || t->doc->busy()) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    // A save started from the quit flow does not resume quitting; the user quits again.
+    const AfterSave after = app.overwrite_prompt_after == AfterSave::Quit ? AfterSave::None : app.overwrite_prompt_after;
+    ImGui::Text("\"%s\" was changed by another program.", t->label.c_str());
+    ImGui::PushTextWrapPos(520.0f * app.ui_scale);
+    ImGui::TextDisabled("Overwrite replaces the version on disk. Bytes you did not edit come partly from the file as "
+                        "it was and partly as it is now, so the result can mix both versions. Save As keeps both.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    if (ImGui::Button("Save As...")) {
+        ImGui::CloseCurrentPopup();
+        start_save(app, *t, true, after);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Overwrite")) {
+        ImGui::CloseCurrentPopup();
+        start_save(app, *t, false, after, true);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(t->doc->dirty() ? "Reload (discard edits)" : "Reload")) {
+        ImGui::CloseCurrentPopup();
+        reload_from_disk(app, *t);
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
@@ -1820,6 +2014,16 @@ void open_pending_popup(App& app) {
         ImGui::OpenPopup(kPopQuit);
         return;
     }
+    if (app.reload_prompt_pending) {
+        app.reload_prompt_pending = false;
+        ImGui::OpenPopup(kPopReload);
+        return;
+    }
+    if (app.overwrite_prompt_pending) {
+        app.overwrite_prompt_pending = false;
+        ImGui::OpenPopup(kPopOverwrite);
+        return;
+    }
     if (app.req_palette) {
         app.req_palette = false;
         app.palette_query.clear();
@@ -1849,6 +2053,8 @@ void draw_popups(App& app) {
     draw_message(app);
     draw_close_prompt(app);
     draw_quit_prompt(app);
+    draw_reload_prompt(app);
+    draw_overwrite_prompt(app);
     draw_palette(app);
     draw_goto(app);
     draw_fill(app);
@@ -1939,14 +2145,7 @@ void poll_disk_change(App& app) {
     const double n = now_s();
     if (n < t->next_disk_check) return;
     t->next_disk_check = n + 2.0;
-    bool changed = t->doc->changed_on_disk();
-    if (changed && t->ignore_valid) {
-        FileStat st = os_stat(t->path);
-        if (st.exists == t->ignored_stat.exists && st.size == t->ignored_stat.size &&
-            st.mtime_ns == t->ignored_stat.mtime_ns)
-            changed = false;
-    }
-    t->disk_changed = changed;
+    t->disk_changed = t->doc->changed_on_disk() && !ignored_version(*t);
 }
 
 void poll_scripts(App& app) {
@@ -1974,20 +2173,28 @@ uint64_t session_signature(App& app) {
     return h;
 }
 
-void save_session(App& app, bool force) {
-    if (!app.hot_exit || !app.session || any_busy(app)) return;
+// Returns false only if a session write was attempted (or impossible because a save is running)
+// and failed; `err_out` gets the reason.
+bool save_session(App& app, bool force, std::string* err_out) {
+    if (!app.hot_exit || !app.session) return true;
+    if (any_busy(app)) {
+        if (err_out) *err_out = "a document is being saved";
+        return false;
+    }
     const uint64_t sig = session_signature(app);
-    if (!force && sig == app.session_sig) return;
+    if (!force && sig == app.session_sig) return true;
     std::vector<Document*> docs;
     for (auto& t : app.tabs) docs.push_back(t->doc.get());
     std::string err;
     if (!app.session->save(docs, std::max(app.active, 0), &err)) {
         if (err != app.last_session_err) log_console(app, ConsoleLine::Warn, "Session save failed: " + err);
         app.last_session_err = err;
-        return;
+        if (err_out) *err_out = err.empty() ? std::string("unknown error") : err;
+        return false;
     }
     app.session_sig = sig;
     app.last_session_err.clear();
+    return true;
 }
 
 void autosave(App& app) {
@@ -2042,6 +2249,16 @@ void draw_dockspace(App& app) {
 }
 
 void draw_panels(App& app) {
+    // Inline edits are keyed by row / cursor within one document: end them when the active
+    // document changes (Ctrl+Tab, new tab, script reveal...) so Enter cannot commit into another.
+    const Tab* at = active_tab(app);
+    const uint64_t doc_id = at ? at->doc->id() : 0;
+    if (doc_id != app.edit_doc) {
+        app.edit_doc = doc_id;
+        app.insp_edit.end();
+        app.st_edit.end();
+        app.bm_edit.end();
+    }
     if (app.show_inspector) draw_inspector_panel(app);
     if (app.show_structure) draw_structure_panel(app);
     if (app.show_console) {
@@ -2097,6 +2314,24 @@ void on_drop(GLFWwindow* w, int count, const char** paths) {
         if (paths[i]) app->pending_open.emplace_back(paths[i]);
 }
 
+// Monitor DPI changed (window moved to another monitor, system scale changed).
+void on_content_scale(GLFWwindow* w, float sx, float /*sy*/) {
+    App* app = static_cast<App*>(glfwGetWindowUserPointer(w));
+    if (!app || sx <= 0.0f || sx == app->dpi_scale) return;
+    app->dpi_scale = sx;
+    app->dpi_changed = true;
+}
+
+// Re-applies ui_scale = monitor scale * settings.ui_scale (user factor). Between frames only.
+void apply_ui_scale(App& app) {
+    app.dpi_changed = false;
+    const float s = std::clamp(app.dpi_scale * app.settings.ui_scale, 0.5f, 4.0f);
+    if (s == app.ui_scale) return;
+    app.ui_scale = s;
+    ImGui::GetStyle().FontSizeBase = kUiFontPx * s;  // fonts are rasterised on demand at any size
+    apply_dark_theme(s);
+}
+
 void on_glfw_error(int code, const char* desc) {
     std::fprintf(stderr, "hexer: GLFW error %d: %s\n", code, desc ? desc : "");
 }
@@ -2104,8 +2339,19 @@ void on_glfw_error(int code, const char* desc) {
 void restore_session(App& app) {
     Session::Restored r = app.session->load();
     const bool any = !r.docs.empty();
-    for (auto& d : r.docs)
-        if (d) add_tab(app, std::move(d));
+    for (auto& d : r.docs) {
+        if (!d) continue;
+        // Continue the "Untitled N" numbering after restored untitled tabs.
+        const std::string name = d->display_name();
+        if (!d->has_path() && name.rfind("Untitled ", 0) == 0) {
+            const long n = std::strtol(name.c_str() + 9, nullptr, 10);
+            if (n > app.untitled_counter && n < 1000000) app.untitled_counter = int(n);
+        }
+        Tab& t = add_tab(app, std::move(d));
+        // top_row is a row index; with another bytes-per-row (auto-fit, window size) it would show
+        // another region, so make sure the caret is on screen (no-op when it already is).
+        t.view.request_scroll_to(t.doc->view().cursor, false);
+    }
     if (any && !app.tabs.empty()) {
         app.active = std::clamp(r.active_index, 0, int(app.tabs.size()) - 1);
         app.select_request = app.active;
@@ -2191,7 +2437,7 @@ int run_app(const AppOptions& opts) {
     app.opts = opts;
     if (!opts.config_dir.empty()) paths::set_config_dir_override(opts.config_dir);
     paths::ensure_dirs();
-    const bool have_settings = app.settings.load(paths::settings_file());
+    app.settings.load(paths::settings_file());
 
     glfwSetErrorCallback(on_glfw_error);
     if (!glfwInit()) {
@@ -2208,13 +2454,14 @@ int run_app(const AppOptions& opts) {
     glfwSwapInterval(1);
     glfwSetWindowUserPointer(app.window, &app);
     glfwSetDropCallback(app.window, on_drop);
+    glfwSetWindowContentScaleCallback(app.window, on_content_scale);
 
-    if (!have_settings) {
-        float sx = 1.0f, sy = 1.0f;
-        glfwGetWindowContentScale(app.window, &sx, &sy);
-        app.settings.ui_scale = sx > 0.0f ? sx : 1.0f;
-    }
-    app.ui_scale = std::clamp(app.settings.ui_scale, 0.5f, 4.0f);
+    // settings.ui_scale is a user factor on top of the monitor's content scale, which is read on
+    // every start and followed at runtime (on_content_scale).
+    float sx = 1.0f, sy = 1.0f;
+    glfwGetWindowContentScale(app.window, &sx, &sy);
+    app.dpi_scale = sx > 0.0f ? sx : 1.0f;
+    app.ui_scale = std::clamp(app.dpi_scale * app.settings.ui_scale, 0.5f, 4.0f);
     app.settings.font_size = std::clamp(app.settings.font_size, kMinFont, kMaxFont);
 
     IMGUI_CHECKVERSION();
@@ -2253,6 +2500,7 @@ int run_app(const AppOptions& opts) {
             glfwSetWindowShouldClose(app.window, GLFW_FALSE);
             app.quit_requested = true;  // the session makes this prompt-free (see process_quit)
         }
+        if (app.dpi_changed) apply_ui_scale(app);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();

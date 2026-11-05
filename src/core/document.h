@@ -39,6 +39,9 @@ public:
     void push_chunk(const uint8_t* data, size_t len);
     const std::vector<std::shared_ptr<Chunk>>& chunks() const { return chunks_; }
     void clear();
+    // Frees a chunk nothing references any more (its index stays valid but empty; Snapshots that
+    // still hold the old chunk keep their copy alive).
+    void release(uint32_t chunk);
 
 private:
     std::vector<std::shared_ptr<Chunk>> chunks_;
@@ -49,6 +52,9 @@ class Snapshot {
 public:
     uint64_t size() const { return size_; }
     size_t read(uint64_t offset, uint8_t* dst, size_t len) const;  // returns bytes copied
+    // Like read() (unreadable bytes are zero-filled), but returns only how many bytes before the
+    // first unreadable one (I/O error) are valid.
+    size_t read_valid(uint64_t offset, uint8_t* dst, size_t len) const;
 
     // Implementation detail, public for Document/Session code.
     std::vector<std::shared_ptr<FileSource>> sources;      // file versions (Original piece .chunk)
@@ -108,6 +114,9 @@ struct PersistedDoc {
     ViewState view;
     bool dirty = false;
     bool read_only = false;
+    // persist() could not export the unsaved current state (it referenced too many bytes of an
+    // older file version) and exported the last saved state instead.
+    bool edits_dropped = false;
 };
 
 struct Progress {
@@ -197,12 +206,18 @@ public:
     // After success the current pieces are the identity over the new file version and dirty()==false.
     // On failure/cancel the original file is untouched (rewrite path) and the document is unchanged.
     // `progress` may be null. Safe to call from a worker thread (sets busy()).
-    bool save(Progress* progress, std::string* err);
+    // save() refuses (returns false) when the file was modified in place by another program since
+    // it was opened: the original bytes our pieces refer to are gone, so the result would be a mix
+    // of both versions. `force` saves anyway (our edits on top of the current disk contents).
+    // If the file was replaced (other inode), the rewrite path streams from the still-open old
+    // version. Devices (block devices, raw Windows disks) only accept in-place saves.
+    bool save(Progress* progress, std::string* err, bool force = false);
     bool save_as(const std::string& path, Progress* progress, std::string* err);
 
     // ---- external change detection -----------------------------------------------------------
     // True if the file on disk no longer matches what we opened (size or mtime changed).
     bool changed_on_disk() const;
+    FileStat disk_stat() const;        // stat of the file version we last opened/wrote
     // Re-open from disk, discarding all edits and undo history. Keeps view state (clamped).
     bool reload(std::string* err);
 
@@ -214,10 +229,17 @@ public:
     // Export state for the session. History entries that reference older file versions (from a
     // rewrite save in this run) are dropped; Original pieces are renumbered to chunk 0.
     PersistedDoc persist() const;
+    // False if persist() cannot export the current unsaved state (it references more than 16 MiB
+    // of a file version replaced by a save in this run, reachable by undoing past that save): a
+    // hot exit would lose it, so the UI should ask before quitting.
+    bool hot_exit_safe() const;
     // Rebuild from a PersistedDoc. If the file at `path` no longer matches `file_stat`, the doc is
     // still restored (edits on top of the new contents) and `*changed_on_disk` is set to true.
+    // If the file on disk already holds exactly the persisted content (our own save completed but
+    // the session was not rewritten before exit), the doc opens clean from disk instead of
+    // re-applying the edits, history from before that save is dropped and *note explains it.
     static std::unique_ptr<Document> restore(const PersistedDoc& state, bool* changed_on_disk,
-                                             std::string* err);
+                                             std::string* err, std::string* note = nullptr);
     // Monotonic id of the current content state; lets the session skip re-writing unchanged docs.
     uint64_t state_id() const { return state_id_; }
     // Bumps whenever view state that the session persists may have changed (set by UI on cursor moves).
@@ -242,6 +264,7 @@ private:
     const std::vector<UndoEntry>& eff_undo() const { return pend_ ? pend_undo_ : undo_; }
     const std::vector<UndoEntry>& eff_redo() const { return pend_ ? pend_redo_ : redo_; }
     void prune_sources();       // release file versions no state references any more
+    void reclaim_add();         // release add-buffer chunks no state references any more
     void clamp_view();
     bool is_base_piece(const Piece& p) const;
     std::shared_ptr<Snapshot> make_snapshot() const;
@@ -264,6 +287,7 @@ private:
     uint32_t base_chunks_ = 0;            // untitled docs: add bytes that count as "original"
     uint64_t base_last_used_ = 0;
     std::atomic<uint64_t> persist_gen_{0};
+    size_t trims_since_reclaim_ = 0;      // history entries dropped by kMaxUndo since reclaim_add()
 
     uint64_t id_ = 0;
     std::string path_;

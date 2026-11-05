@@ -64,6 +64,11 @@ int inline_edit_input(InlineEdit& e, bool commit_on_blur) {
     return 0;
 }
 
+// Popups close on Esc only with keyboard navigation enabled, which the app does not use.
+void close_popup_on_escape() {
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+}
+
 // Keep editing after a rejected value (error shown as tooltip + status).
 void retry_edit(App& app, InlineEdit& e, const std::string& err) {
     e.error = err.empty() ? "invalid value" : err;
@@ -144,6 +149,7 @@ void draw_inspector_row(App& app, Document& d, const InspRow& r, int i, bool be)
         if (ImGui::MenuItem("Copy value")) ImGui::SetClipboardText(value);
         if (ImGui::MenuItem("Edit value", nullptr, false, r.editable && !d.read_only()))
             app.insp_edit.begin(i, cur, r.value);
+        close_popup_on_escape();
         ImGui::EndPopup();
     }
     ImGui::TableSetColumnIndex(1);
@@ -233,9 +239,13 @@ void draw_inspector_panel(App& app) {
 
 namespace {
 
+// A parse slower than this (detect + parse, on the UI thread) is not re-run on every edit.
+constexpr double kAutoParseBudgetMs = 50.0;
+
 void run_parse(App& app, Tab& t) {
     StructureState& st = t.st;
     Document& d = *t.doc;
+    const double t0 = now_s();
     const std::string requested = d.view().parser;
     const std::string name = requested.empty() ? app.engine->detect_parser(d) : requested;
     const size_t old_count = st.result.fields.size();
@@ -247,6 +257,8 @@ void run_parse(App& app, Tab& t) {
         st.has_result = true;
     }
     st.used_parser = name;
+    st.last_parse_ms = (now_s() - t0) * 1000.0;
+    st.slow = st.has_result && (st.last_parse_ms > kAutoParseBudgetMs || st.result.truncated);
     st.gen = d.generation();
     st.reload = app.engine->reload_count();
     st.requested = requested;
@@ -260,6 +272,7 @@ void run_parse(App& app, Tab& t) {
     st.rows_dirty = true;
     st.cursor_field = -1;  // re-evaluated (and revealed) on the next draw
     st.scroll_to_field = -1;
+    st.clicked_field = -1;
     if (app.st_edit.ctx == d.id()) app.st_edit.end();  // field indices may have changed
 }
 
@@ -335,7 +348,7 @@ void draw_parser_combo(App& app, Tab& t, Document& d) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run the parser again (F5)");
 }
 
-void draw_parse_info(App& app, StructureState& st) {
+void draw_parse_info(App& app, StructureState& st, const Document& d) {
     if (!st.has_result) {
         if (st.gen == UINT64_MAX)
             ImGui::TextDisabled("Parsing...");
@@ -346,6 +359,12 @@ void draw_parse_info(App& app, StructureState& st) {
     }
     const ParseResult& r = st.result;
     ImGui::TextDisabled("%zu fields  \xC2\xB7  %.1f ms", r.fields.size(), r.ms);
+    if (st.slow && st.gen != d.generation()) {
+        ImGui::SameLine();
+        ImGui::TextColored(kWarnColor, "(stale: press F5 to re-parse)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("This parser took %.0f ms, so it is not re-run automatically after edits.", st.last_parse_ms);
+    }
     if (r.truncated) {
         ImGui::SameLine();
         ImGui::TextColored(kWarnColor, "(truncated: field limit reached)");
@@ -360,27 +379,31 @@ void draw_parse_info(App& app, StructureState& st) {
     (void)app;
 }
 
-void commit_field_edit(App& app, Document& d, const Field& f) {
+bool commit_field_edit(App& app, Document& d, const Field& f) {
     std::string err;
     if (!app.engine->edit_field(d, f, app.st_edit.buf, &err)) {
         if (d.read_only() || d.busy()) {
             app.st_edit.end();
             report_edit_failure(app, d);
-            return;
+            return false;
         }
         retry_edit(app, app.st_edit, err);
-        return;
+        return false;
     }
     app.st_edit.end();
     d.view_generation++;
     set_status(app, "Set " + f.name + " = " + app.st_edit.buf);
+    return true;
 }
 
-void draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
+// Returns whether the row is visible (taken from the name cell: the last cell may be in a hidden column).
+bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     StructureState& st = t.st;
     const int fi = st.rows[size_t(row)];
     const Field& f = st.result.fields[size_t(fi)];
     const bool leaf = f.children.empty();
+    // A stale result (content changed, not re-parsed yet) has stale offsets: no field edits.
+    const bool can_edit = f.editable() && !d.read_only() && st.gen == d.generation();
     ImGui::TableNextRow();
     if (fi == hover_field && fi != st.cursor_field)
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, ImGui::GetColorU32(ImGuiCol_HeaderHovered, 0.45f));
@@ -395,6 +418,7 @@ void draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     if (fi == st.cursor_field) fl |= ImGuiTreeNodeFlags_Selected;
     if (!leaf) ImGui::SetNextItemOpen(st.open[size_t(fi)] != 0, ImGuiCond_Always);
     const bool is_open = ImGui::TreeNodeEx("##node", fl, "%s", f.name.c_str());
+    const bool row_visible = ImGui::IsItemVisible();
     const bool toggled = ImGui::IsItemToggledOpen();
     if (!leaf && is_open != (st.open[size_t(fi)] != 0)) {
         st.open[size_t(fi)] = is_open ? 1 : 0;
@@ -404,8 +428,10 @@ void draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !toggled) {
         reveal_range(app, t, f.offset, f.size, false);
         st.cursor_field = fi;  // already visible: no auto-scroll
+        st.clicked_field = leaf ? -1 : fi;
+        st.clicked_cursor = d.view().cursor;
     }
-    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && f.editable() && !d.read_only())
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && can_edit)
         app.st_edit.begin(fi, d.id(), f.value);
     if (hovered && ImGui::BeginItemTooltip()) {  // full name + type (the Type column starts hidden)
         ImGui::Text("%s  :  %s", f.name.c_str(), f.type.c_str());
@@ -414,12 +440,13 @@ void draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     }
     if (ImGui::BeginPopupContextItem("##ctx")) {
         if (ImGui::MenuItem("Select bytes")) reveal_range(app, t, f.offset, f.size, true);
-        if (ImGui::MenuItem("Edit value", nullptr, false, f.editable() && !d.read_only()))
+        if (ImGui::MenuItem("Edit value", nullptr, false, can_edit))
             app.st_edit.begin(fi, d.id(), f.value);
         ImGui::Separator();
         if (ImGui::MenuItem("Copy value")) ImGui::SetClipboardText(f.value.c_str());
         if (ImGui::MenuItem("Copy name")) ImGui::SetClipboardText(f.name.c_str());
         if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(f.offset).c_str());
+        close_popup_on_escape();
         ImGui::EndPopup();
     }
 
@@ -427,7 +454,10 @@ void draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     ImGui::TableSetColumnIndex(1);
     if (app.st_edit.active(fi, d.id())) {
         int res = inline_edit_input(app.st_edit, false);
-        if (res > 0) commit_field_edit(app, d, f);
+        if (res > 0 && commit_field_edit(app, d, f)) {
+            st.gen = UINT64_MAX;  // one explicit edit: re-parse even if auto-parse is off (slow parser)
+            st.pending_gen = UINT64_MAX - 1;
+        }
         if (res < 0) app.st_edit.end();
     } else {
         draw_swatch(f.color);
@@ -442,12 +472,28 @@ void draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     ImGui::TableSetColumnIndex(4);
     ImGui::TextDisabled("%s", f.type.c_str());
     ImGui::PopID();
+    return row_visible;
 }
 
 void draw_field_table(App& app, Tab& t, Document& d) {
     StructureState& st = t.st;
     const int hover_field = t.ev.has_hover ? field_at(st, t.ev.hover_offset) : -1;
-    const int cur_field = d.view().cursor < d.size() ? field_at(st, d.view().cursor) : -1;
+    int cur_field = d.view().cursor < d.size() ? field_at(st, d.view().cursor) : -1;
+    // Highlights exist for leaves only: after clicking a container row, the caret byte maps to
+    // its first leaf. Keep the container selected (and collapsed) until the caret moves.
+    if (st.clicked_field >= 0) {
+        bool inside = false;
+        if (st.clicked_field < int(st.result.fields.size()) && d.view().cursor == st.clicked_cursor)
+            for (int p = cur_field; p >= 0 && p < int(st.result.fields.size()); p = st.result.fields[size_t(p)].parent)
+                if (p == st.clicked_field) {
+                    inside = true;
+                    break;
+                }
+        if (inside)
+            cur_field = st.clicked_field;
+        else
+            st.clicked_field = -1;
+    }
     if (cur_field != st.cursor_field) {
         st.cursor_field = cur_field;
         if (cur_field >= 0) {
@@ -455,6 +501,7 @@ void draw_field_table(App& app, Tab& t, Document& d) {
             st.scroll_to_field = cur_field;
         }
     }
+    if (app.st_edit.ctx == d.id() && app.st_edit.row >= 0 && st.gen != d.generation()) app.st_edit.end();
     if (st.rows_dirty) rebuild_rows(st);
 
     int scroll_row = -1;
@@ -479,8 +526,8 @@ void draw_field_table(App& app, Tab& t, Document& d) {
     if (scroll_row >= 0) clip.IncludeItemByIndex(scroll_row);
     while (clip.Step()) {
         for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) {
-            draw_field_row(app, t, d, r, hover_field);
-            if (r == scroll_row && !ImGui::IsItemVisible()) ImGui::SetScrollHereY(0.5f);
+            const bool row_visible = draw_field_row(app, t, d, r, hover_field);
+            if (r == scroll_row && !row_visible) ImGui::SetScrollHereY(0.5f);
         }
     }
     ImGui::EndTable();
@@ -495,6 +542,12 @@ void update_structure(App& app, Tab& t) {
     const uint64_t rel = app.engine->reload_count();
     const std::string& want = d.view().parser;
     if (gen == st.gen && rel == st.reload && want == st.requested) {
+        st.due = 0.0;
+        return;
+    }
+    // Only the content changed and the last parse was slow: don't freeze the UI after every
+    // keystroke. The panel shows the result as stale; F5 / Reparse (st.gen = UINT64_MAX) runs it.
+    if (st.slow && st.gen != UINT64_MAX && rel == st.reload && want == st.requested) {
         st.due = 0.0;
         return;
     }
@@ -520,7 +573,7 @@ void draw_structure_panel(App& app) {
         return;
     }
     draw_parser_combo(app, *t, *d);
-    draw_parse_info(app, t->st);
+    draw_parse_info(app, t->st, *d);
     if (t->st.has_result && !t->st.result.fields.empty()) draw_field_table(app, *t, *d);
     ImGui::End();
 }
@@ -569,13 +622,14 @@ int console_history_cb(ImGuiInputTextCallbackData* data) {
     if (h.empty()) return 0;
     int& pos = app.console_history_pos;
     if (data->EventKey == ImGuiKey_UpArrow) {
+        if (pos < 0) app.console_draft.assign(data->Buf, size_t(data->BufTextLen));  // keep the typed line
         pos = pos < 0 ? int(h.size()) - 1 : std::max(0, pos - 1);
     } else if (data->EventKey == ImGuiKey_DownArrow) {
         if (pos < 0) return 0;
         if (++pos >= int(h.size())) pos = -1;
     }
     data->DeleteChars(0, data->BufTextLen);
-    if (pos >= 0) data->InsertChars(0, h[size_t(pos)].c_str());
+    data->InsertChars(0, pos >= 0 ? h[size_t(pos)].c_str() : app.console_draft.c_str());
     return 0;
 }
 
@@ -602,6 +656,7 @@ void draw_console_output(App& app) {
         if (ImGui::MenuItem("Copy all")) ImGui::SetClipboardText(console_text(lines).c_str());
         if (ImGui::MenuItem("Clear", "Ctrl+L")) app.engine->clear_console();
         ImGui::MenuItem("Word wrap", nullptr, &app.console_wrap);
+        close_popup_on_escape();
         ImGui::EndPopup();
     }
     const bool at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.0f;

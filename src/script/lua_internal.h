@@ -46,6 +46,9 @@ struct ScriptEngine::Impl {
     // Time limit enforced by an instruction-count hook while Lua code runs.
     std::chrono::steady_clock::time_point deadline{};
     bool deadline_on = false;
+    // Set once the deadline passed: the hook then fires on every instruction (sticky), so a
+    // pcall / coroutine loop cannot swallow the error. Cleared when the timed-out call returns.
+    bool timed_out = false;
     int limit_ms = 0;              // for the timeout message
     int depth = 0;                 // nesting of protected calls (callbacks may re-enter the engine)
 
@@ -98,6 +101,8 @@ std::string error_head(const std::string& full);
 constexpr int kParseTimeLimitMs = 2000;
 constexpr int kDetectTimeLimitMs = 1000;
 constexpr int kScriptTimeLimitMs = 10000;   // script load, commands, console
+constexpr int kGcTimeLimitMs = 1000;        // each __gc finalizer (also at reload / exit)
+constexpr int kHookCount = 4096;            // instructions between time checks
 constexpr size_t kMaxFields = 200000;
 
 }  // namespace hx

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <set>
 
 #include "core/os_file.h"
@@ -187,20 +188,24 @@ std::string serialize(const PersistedDoc& d) {
     w.bookmarks(d.view.bookmarks);
     w.u8(d.dirty);
     w.u8(d.read_only);
+    if (d.edits_dropped) w.u8(1);  // optional trailing flag (absent in older files)
     w.u32(crc32(reinterpret_cast<const uint8_t*>(w.b.data()), w.b.size()));
     return std::move(w.b);
 }
 
-bool deserialize(const std::string& data, PersistedDoc& d) {
-    if (data.size() < 12 || std::memcmp(data.data(), kMagic, 4) != 0) return false;
+enum class Parse { Ok, Corrupt, Unsupported };
+
+Parse deserialize(const std::string& data, PersistedDoc& d) {
+    if (data.size() < 12 || std::memcmp(data.data(), kMagic, 4) != 0) return Parse::Corrupt;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(data.data());
     size_t body = data.size() - 4;
     Reader crc_r{p + body, 4};
-    if (crc_r.u32() != crc32(p, body)) return false;  // torn or corrupted write
+    if (crc_r.u32() != crc32(p, body)) return Parse::Corrupt;  // torn or corrupted write
+    // From here on the bytes are exactly what some Hexer wrote: failures mean another version.
 
     Reader r{p, body};
     r.pos = 4;
-    if (r.u32() != kVersion) return false;
+    if (r.u32() != kVersion) return Parse::Unsupported;
     d.path = r.str();
     d.display_name = r.str();
     d.file_stat.exists = r.u8() != 0;
@@ -227,7 +232,8 @@ bool deserialize(const std::string& data, PersistedDoc& d) {
     d.view.bookmarks = r.bookmarks();
     d.dirty = r.u8() != 0;
     d.read_only = r.u8() != 0;
-    return r.ok && r.pos == body;
+    if (r.ok && r.pos < body) d.edits_dropped = r.u8() != 0;
+    return r.ok && r.pos == body ? Parse::Ok : Parse::Unsupported;
 }
 
 // Everything that, when unchanged, means the doc file on disk is still up to date.
@@ -244,84 +250,47 @@ std::string doc_key(const Document& doc) {
 
 }  // namespace
 
-Session::Session(std::string dir) : dir_(std::move(dir)) {}
 
-bool Session::save(const std::vector<Document*>& docs, int active_index, std::string* err) {
-    if (!os_mkdirs(dir_)) {
-        if (err) *err = "Cannot create session directory " + dir_;
-        return false;
-    }
-    bool ok = true;
-    std::string first_err;
-    std::vector<Saved> next;
-    std::set<std::string> names_in_use;
-    for (const Saved& s : saved_) names_in_use.insert(s.file);
+namespace {
 
-    for (Document* doc : docs) {
-        if (!doc) continue;
-        auto it = std::find_if(saved_.begin(), saved_.end(), [&](const Saved& s) { return s.doc_id == doc->id(); });
-        Saved entry;
-        if (it != saved_.end()) {
-            entry = *it;
-        } else {
-            entry.doc_id = doc->id();
-            for (int n = 1;; ++n) {  // a name neither in use nor left over on disk
-                std::string name = "doc-" + std::to_string(n) + ".hxs";
-                if (!names_in_use.count(name) && !os_stat(path_join(dir_, name)).exists) {
-                    entry.file = name;
-                    names_in_use.insert(name);
-                    break;
-                }
-            }
-        }
-        std::string key = doc_key(*doc);
-        std::string full = path_join(dir_, entry.file);
-        if (entry.view_hash != key || !os_stat(full).exists) {
-            std::string bytes = serialize(doc->persist());
-            std::string e;
-            if (os_write_whole_atomic(full, bytes.data(), bytes.size(), &e)) {
-                entry.view_hash = key;
-                entry.state_id = doc->state_id();
-            } else {
-                ok = false;
-                if (first_err.empty()) first_err = "Cannot write " + full + ": " + e;
-                entry.view_hash.clear();  // retry next time
-                if (!os_stat(full).exists) continue;  // nothing usable on disk for this doc
-            }
-        }
-        next.push_back(entry);
-    }
+constexpr int kMaxSlots = 16;  // main dir + instance-1..15
 
-    std::string ini = "version=1\n";
-    int active = std::clamp(active_index, 0, std::max(0, int(next.size()) - 1));
-    ini += "active=" + std::to_string(active) + "\n";
-    for (const Saved& s : next) ini += "doc=" + s.file + "\n";
-    std::string e;
-    if (!os_write_whole_atomic(path_join(dir_, kIndexFile), ini.data(), ini.size(), &e)) {
-        ok = false;
-        if (first_err.empty()) first_err = "Cannot write session index: " + e;
-    } else {
-        // Only once the index no longer references them: delete files of closed docs.
-        for (const std::string& f : os_list_files(dir_, ".hxs")) {
-            std::string name = path_filename(f);
-            bool keep = std::any_of(next.begin(), next.end(), [&](const Saved& s) { return s.file == name; });
-            if (!keep) os_remove(f);
-        }
-        for (const std::string& f : os_list_files(dir_, ".hxs.tmp")) os_remove(f);  // torn writes
-    }
-    saved_ = std::move(next);
-    if (!ok && err) *err = first_err;
-    return ok;
+std::string slot_path(const std::string& base, int k) {
+    return k == 0 ? base : path_join(base, "instance-" + std::to_string(k));
 }
 
-Session::Restored Session::load() {
-    Restored out;
-    saved_.clear();
-    std::string ini;
-    if (!os_read_whole(path_join(dir_, kIndexFile), ini)) return out;
+// Whole-file read without os_read_whole's 4 GiB cap (a session file holds every referenced
+// pasted/preserved byte and can legitimately be that large).
+bool read_session_file(const std::string& path, std::string& out, std::string* err) {
+    auto f = OsFile::open(path, OsFile::Mode::Read, err);
+    if (!f) return false;
+    uint64_t n = f->size();
+    if (n > uint64_t(SIZE_MAX / 2)) {
+        if (err) *err = "too large for this build";
+        return false;
+    }
+    try {
+        out.resize(size_t(n));
+    } catch (const std::bad_alloc&) {
+        if (err) *err = "not enough memory to load it";
+        return false;
+    }
+    int64_t got = n ? f->read_at(0, out.data(), size_t(n)) : 0;
+    if (got < 0 || uint64_t(got) != n) {
+        if (err) *err = "read error";
+        return false;
+    }
+    return true;
+}
 
+struct Index {
     int active = 0;
     std::vector<std::string> files;
+};
+
+bool read_index(const std::string& dir, Index& idx) {
+    std::string ini;
+    if (!os_read_whole(path_join(dir, kIndexFile), ini)) return false;
     size_t pos = 0;
     while (pos < ini.size()) {
         size_t eol = ini.find('\n', pos);
@@ -333,59 +302,266 @@ Session::Restored Session::load() {
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq), val = line.substr(eq + 1);
         if (key == "active") {
-            active = std::atoi(val.c_str());
+            idx.active = std::atoi(val.c_str());
         } else if (key == "doc") {
             // Only plain names inside the session dir.
             if (!val.empty() && val.find_first_of("/\\") == std::string::npos && val != "." && val != "..")
-                files.push_back(val);
+                idx.files.push_back(val);
         }
+    }
+    return true;
+}
+
+bool write_index(const std::string& dir, int active, const std::vector<std::string>& files, std::string* err) {
+    std::string ini = "version=1\n";
+    ini += "active=" + std::to_string(active) + "\n";
+    for (const std::string& f : files) ini += "doc=" + f + "\n";
+    return os_write_whole_atomic(path_join(dir, kIndexFile), ini.data(), ini.size(), err);
+}
+
+bool same_disk_version(const FileStat& a, const FileStat& b) {
+    return a.exists == b.exists && a.size == b.size && a.mtime_ns == b.mtime_ns && !os_identity_differs(a, b);
+}
+
+}  // namespace
+
+Session::Session(std::string dir) : dir_(std::move(dir)) {}
+Session::~Session() = default;
+
+// Takes the lock of the first free slot: the main dir, or instance-<k> when other instances run.
+bool Session::acquire() {
+    if (lock_tried_) return !slot_dir_.empty();
+    lock_tried_ = true;
+    for (int k = 0; k < kMaxSlots; ++k) {
+        std::string d = slot_path(dir_, k);
+        if (!os_mkdirs(d)) {
+            if (k == 0) {
+                slot_dir_ = d;  // save() reports the error; nothing to protect yet
+                return true;
+            }
+            continue;
+        }
+        bool held = false;
+        auto l = OsLock::acquire(path_join(d, "lock"), &held);
+        if (l || !held) {  // !held: locking unsupported here, behave as before
+            lock_ = std::move(l);
+            slot_dir_ = d;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Session::secondary() { return acquire() && slot_dir_ != dir_; }
+
+bool Session::save(const std::vector<Document*>& docs, int active_index, std::string* err) {
+    if (!acquire()) {
+        if (err) *err = "Too many Hexer instances are running; the session of this window is not saved";
+        return false;
+    }
+    const std::string& dir = slot_dir_;
+    if (!os_mkdirs(dir)) {
+        if (err) *err = "Cannot create session directory " + dir;
+        return false;
+    }
+    bool ok = true;
+    std::string first_err;
+    std::vector<Saved> next;
+    std::set<std::string> names_in_use(kept_.begin(), kept_.end());
+    for (const Saved& s : saved_) names_in_use.insert(s.file);
+
+    for (Document* doc : docs) {
+        if (!doc) continue;
+        auto it = std::find_if(saved_.begin(), saved_.end(), [&](const Saved& s) { return s.doc_id == doc->id(); });
+        Saved entry;
+        if (it != saved_.end())
+            entry = *it;
+        else
+            entry.doc_id = doc->id();
+        if (entry.file.empty()) {
+            for (int n = 1;; ++n) {  // a name neither in use nor left over on disk
+                std::string name = "doc-" + std::to_string(n) + ".hxs";
+                if (!names_in_use.count(name) && !os_stat(path_join(dir, name)).exists) {
+                    entry.file = name;
+                    names_in_use.insert(name);
+                    break;
+                }
+            }
+        }
+        std::string key = doc_key(*doc);
+        std::string full = path_join(dir, entry.file);
+        if (entry.view_hash != key || !os_stat(full).exists) {
+            std::string e;
+            FileStat disk = doc->disk_stat();
+            std::string bytes = serialize(doc->persist());
+            if (os_write_whole_atomic(full, bytes.data(), bytes.size(), &e)) {
+                entry.view_hash = key;
+                entry.state_id = doc->state_id();
+                entry.disk = disk;
+                entry.written = true;
+            } else {
+                ok = false;
+                if (first_err.empty()) first_err = "Cannot write " + full + ": " + e;
+                entry.view_hash.clear();  // retry next time
+                if (!os_stat(full).exists) continue;  // nothing usable on disk for this doc
+                // The doc was saved (or reloaded) since that file was written: replaying its old
+                // pieces over the new file version would corrupt it, so drop the stale file.
+                if (entry.written && !same_disk_version(entry.disk, disk)) {
+                    os_remove(full);
+                    continue;
+                }
+            }
+        }
+        next.push_back(entry);
     }
 
-    int restored_active = 0;
-    for (size_t i = 0; i < files.size(); ++i) {
-        std::string data, e;
-        if (!os_read_whole(path_join(dir_, files[i]), data, &e)) {
-            out.warnings.push_back("Session file " + files[i] + " is missing (skipped)");
-            continue;
+    std::vector<std::string> files;
+    for (const Saved& s : next) files.push_back(s.file);
+    files.insert(files.end(), kept_.begin(), kept_.end());  // never lose what we could not restore
+    int active = std::clamp(active_index, 0, std::max(0, int(next.size()) - 1));
+    std::string e;
+    if (!write_index(dir, active, files, &e)) {
+        ok = false;
+        if (first_err.empty()) first_err = "Cannot write session index: " + e;
+    } else {
+        // Only once the index no longer references them: delete files of closed docs.
+        for (const std::string& f : os_list_files(dir, ".hxs")) {
+            std::string name = path_filename(f);
+            if (std::find(files.begin(), files.end(), name) == files.end()) os_remove(f);
         }
-        PersistedDoc pd;
-        if (!deserialize(data, pd)) {
-            out.warnings.push_back("Session file " + files[i] + " is corrupt (skipped)");
-            continue;
-        }
-        bool changed = false;
-        std::string rerr;
-        auto doc = Document::restore(pd, &changed, &rerr);
-        std::string name = pd.display_name.empty() ? path_filename(pd.path) : pd.display_name;
-        if (!doc) {
-            out.warnings.push_back(rerr.empty() ? name + " could not be restored (skipped)"
-                                                : rerr + " (skipped)");
-            continue;
-        }
-        if (changed && pd.dirty)
-            out.warnings.push_back(name + " changed on disk since last session; edits were restored on top "
-                                          "of the new contents");
-        bool recovered = !pd.path.empty() && doc->path().empty();
-        if (recovered && !(changed && pd.dirty))
-            out.warnings.push_back(name + " no longer exists; its edits were restored as an untitled document");
-        if (int(i) == active) restored_active = int(out.docs.size());
-        Saved s;
-        s.doc_id = doc->id();
-        s.state_id = doc->state_id();
-        s.file = files[i];
-        // Rewrite docs whose state was adjusted on restore so the warning is not repeated next time.
-        s.view_hash = (changed || recovered) ? std::string() : doc_key(*doc);
-        saved_.push_back(s);
-        out.docs.push_back(std::move(doc));
+        for (const std::string& f : os_list_files(dir, ".hxs.tmp")) os_remove(f);  // torn writes
     }
-    out.active_index = out.docs.empty() ? 0 : std::clamp(restored_active, 0, int(out.docs.size()) - 1);
+    saved_ = std::move(next);
+    if (ok) finish_adoption();  // adopted docs now live in our dir: clean up their old slots
+    if (!ok && err) *err = first_err;
+    return ok;
+}
+
+void Session::finish_adoption() {
+    for (Adopted& a : adopted_) {
+        for (const std::string& f : os_list_files(a.dir, ".hxs")) {
+            std::string name = path_filename(f);
+            if (std::find(a.failed.begin(), a.failed.end(), name) == a.failed.end()) os_remove(f);
+        }
+        if (a.failed.empty())
+            os_remove(path_join(a.dir, kIndexFile));
+        else
+            write_index(a.dir, 0, a.failed, nullptr);  // retried by the next main instance
+    }
+    adopted_.clear();  // releases their locks
+}
+
+// Restores the docs listed in the index of `dir` into `out`. Returns the index in out.docs of the
+// active doc of that index, or -1. Adopted docs get no file name yet (save() writes them to our dir).
+int Session::load_dir(const std::string& dir, Restored& out, Adopted* adopt) {
+    Index idx;
+    if (!read_index(dir, idx)) return -1;
+    int restored_active = -1;
+    for (size_t i = 0; i < idx.files.size(); ++i) {
+        const std::string& file = idx.files[i];
+        const std::string full = path_join(dir, file);
+        auto keep = [&](const std::string& why) {
+            out.warnings.push_back(why + "; it is kept for a later session");
+            (adopt ? adopt->failed : kept_).push_back(file);
+        };
+        try {
+            std::string data, e;
+            if (!read_session_file(full, data, &e)) {
+                if (!os_stat(full).exists)
+                    out.warnings.push_back("Session file " + file + " is missing (skipped)");
+                else
+                    keep("Session file " + file + " could not be read (" + e + ")");
+                continue;
+            }
+            PersistedDoc pd;
+            Parse parsed = deserialize(data, pd);
+            data.clear();
+            data.shrink_to_fit();
+            if (parsed == Parse::Corrupt) {
+                out.warnings.push_back("Session file " + file + " is corrupt (skipped)");
+                continue;
+            }
+            if (parsed == Parse::Unsupported) {
+                keep("Session file " + file + " was written by a different Hexer version");
+                continue;
+            }
+            bool changed = false;
+            std::string rerr, note;
+            auto doc = Document::restore(pd, &changed, &rerr, &note);
+            std::string name = pd.display_name.empty() ? path_filename(pd.path) : pd.display_name;
+            if (!doc) {
+                keep(rerr.empty() ? name + " could not be restored" : rerr);
+                continue;
+            }
+            if (changed && pd.dirty)
+                out.warnings.push_back(name + " changed on disk since last session; edits were restored on top "
+                                              "of the new contents");
+            if (!note.empty()) out.warnings.push_back(note);
+            if (pd.edits_dropped)
+                out.warnings.push_back(name + ": unsaved changes that referenced a previous version of the file "
+                                              "were too large to keep; the last saved version was opened");
+            bool recovered = !pd.path.empty() && doc->path().empty();
+            if (recovered && !(changed && pd.dirty))
+                out.warnings.push_back(name + " no longer exists; its edits were restored as an untitled document");
+            if (int(i) == idx.active) restored_active = int(out.docs.size());
+            Saved s;
+            s.doc_id = doc->id();
+            s.state_id = doc->state_id();
+            s.file = adopt ? std::string() : file;
+            s.disk = doc->disk_stat();
+            s.written = !adopt;
+            // Rewrite docs whose state was adjusted on restore so the warning is not repeated next time.
+            s.view_hash = (changed || recovered || !note.empty() || pd.edits_dropped || adopt) ? std::string()
+                                                                                             : doc_key(*doc);
+            saved_.push_back(s);
+            out.docs.push_back(std::move(doc));
+        } catch (const std::bad_alloc&) {
+            keep("Session file " + file + " is too large to load (out of memory)");
+        }
+    }
+    return restored_active;
+}
+
+Session::Restored Session::load() {
+    Restored out;
+    saved_.clear();
+    kept_.clear();
+    adopted_.clear();
+    if (!acquire()) {
+        out.warnings.push_back("Too many Hexer instances are running; the session of this window is not saved");
+        return out;
+    }
+    int active = load_dir(slot_dir_, out, nullptr);
+    if (slot_dir_ == dir_) {
+        // Adopt the sessions of secondary instances that have exited since.
+        for (int k = 1; k < kMaxSlots; ++k) {
+            std::string d = slot_path(dir_, k);
+            if (!os_stat(path_join(d, kIndexFile)).exists) continue;
+            auto l = OsLock::acquire(path_join(d, "lock"));
+            if (!l) continue;  // still running
+            Adopted a;
+            a.dir = d;
+            a.lock = std::move(l);
+            load_dir(d, out, &a);
+            adopted_.push_back(std::move(a));
+        }
+    }
+    out.active_index = out.docs.empty() ? 0 : std::clamp(std::max(active, 0), 0, int(out.docs.size()) - 1);
     return out;
 }
 
 void Session::clear() {
-    for (const std::string& f : os_list_files(dir_, ".hxs")) os_remove(f);
-    os_remove(path_join(dir_, kIndexFile));
+    if (!acquire()) return;  // not ours to delete
+    for (const std::string& f : os_list_files(slot_dir_, ".hxs")) os_remove(f);
+    os_remove(path_join(slot_dir_, kIndexFile));
     saved_.clear();
+    kept_.clear();
+}
+
+void Session::discard_kept() {
+    if (!acquire()) return;
+    for (const std::string& f : kept_) os_remove(path_join(slot_dir_, f));
+    kept_.clear();
 }
 
 }  // namespace hx

@@ -48,6 +48,8 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] XOR / rotate brute-force helpers to find simple obfuscation
 - [ ] Script API: `doc:view_range()` (visible bytes) and a prompt/input call so commands can ask for values
 - [ ] Linux CI + AppImage; Windows portable zip
+- [ ] Run parsers on a worker thread over a Snapshot (a parse slower than ~50 ms is currently
+      not re-run after edits; the Structure panel shows it as stale until F5)
 
 ## Known limitations / tech debt
 - Each undo entry stores a full copy of the piece list; thousands of scattered edits combined with

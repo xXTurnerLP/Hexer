@@ -9,7 +9,8 @@ struct Tab;
 
 // Debounced re-parse of the tab's document (~120 ms after generation / parser / script reload
 // changed). Called every frame for the active tab, before the hex view is drawn, so the parser
-// highlight layer is current. Keeps the last result per document.
+// highlight layer is current. Keeps the last result per document. A parse that took longer than
+// ~50 ms (or hit the field limit) is not re-run on content edits; it shows as stale until F5.
 void update_structure(App& app, Tab& tab);
 
 void draw_inspector_panel(App& app);       // "Inspector": typed values at the cursor, editable

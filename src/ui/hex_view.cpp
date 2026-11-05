@@ -626,7 +626,13 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                 moved = true;
             }
             if (nav(ImGuiKey_End)) {
-                v.cursor = ctrl ? size : std::min(v.cursor - v.cursor % bpr + bpr - 1, size);
+                const uint64_t row_start = v.cursor - v.cursor % bpr;
+                if (ctrl)
+                    v.cursor = size;
+                else if (shift)  // half-open selection: end after the row's last byte
+                    v.cursor = std::min(row_start + bpr, size);
+                else             // caret on the row's last byte (stays put on an empty last row)
+                    v.cursor = row_start + bpr - 1 < size ? row_start + bpr - 1 : (size > row_start ? size - 1 : size);
                 moved = true;
             }
         }
@@ -650,8 +656,9 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             keep_caret_visible = true;
         }
 
-        // Typed characters. Ctrl/Alt chords are shortcuts (AltGr = Ctrl+Alt still types).
-        const bool chord = (io.KeyCtrl != io.KeyAlt) || io.KeySuper;
+        // Typed characters. Ctrl chords are shortcuts. AltGr types: it is Ctrl+Alt on Windows and
+        // plain (Right) Alt on X11/Wayland; GLFW already drops characters of real Alt chords.
+        const bool chord = (io.KeyCtrl && !io.KeyAlt) || io.KeySuper;
         if (!chord && editable) {
             for (ImWchar wc : io.InputQueueCharacters) {
                 unsigned c = unsigned(wc);

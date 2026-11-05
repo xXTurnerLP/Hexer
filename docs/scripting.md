@@ -92,7 +92,7 @@ The cursor starts at offset 0. Typed readers read at the cursor, advance it, **e
 | `p:endian("le"\|"be")` | default for readers without a suffix; returns the current one |
 | `p:u8 i8 u16 i16 u24 i24 u32 i32 u64 i64 f32 f64 (name, opts?)` | default endianness |
 | `p:u16le(name)`, `p:u32be(name)`, ... | explicit endianness (`le`/`be` suffix on every multi-byte type) |
-| `p:read(fmt, name, opts?)` | any `string.unpack` format, e.g. `p:read(">I3", "len24")`; returns all values |
+| `p:read(fmt, name, opts?)` | any `string.unpack` format, e.g. `p:read(">I3", "len24")`; returns all values. Variable-length values (`s4`, `z`, ...) may be up to 16 MiB |
 | `p:bytes(name, n, opts?)` | raw bytes; returns the string if `n` <= 64 KiB, else `nil` |
 | `p:str(name, n, opts?)` | fixed-length string (max 16 MiB) |
 | `p:cstr(name, opts?)` | NUL-terminated (max 64 KiB); the field includes the NUL |
@@ -122,7 +122,9 @@ the first 16 bytes in hex followed by `…`. Strings are shown quoted, with esca
 
 Every field from a typed reader, or from `p:read` with a single numeric format, is **editable**
 in the Structure panel. The new text is parsed as decimal, `0x` hex, `0b` binary, a float for
-`f32`/`f64`, or an enum name (case-insensitive). It is range-checked, encoded with the field's
+`f32`/`f64`, an enum name (case-insensitive), or a char literal such as `'IHDR'` (most
+significant byte first, like `fmt = "char"` shows it). For signed fields, hex and binary also
+take the bit pattern (`0xFF` in an `i8` is -1). The value is range-checked, encoded with the field's
 `string.pack` format (`>I2`, `<i4`, `<d`, ...) and written over the field's bytes as one undo
 step. Derived data such as checksums is *not* updated automatically. Re-parse and the parser's
 check (see `png.lua`) shows the mismatch, or write a command that fixes it (see below).
@@ -152,7 +154,7 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | `doc:u8(off)` `doc:i8(off)` `doc:u16le/u16be/i16le/i16be/u24le/u24be/u32le/u32be/i32le/i32be/u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)` | number, or `nil` past the end |
 | `doc:write(off, bytes)` | overwrite (may extend at the end) |
 | `doc:insert(off, bytes)` `doc:erase(off, len)` `doc:replace(off, len, bytes)` | |
-| `doc:transaction(fn, label?)` | every edit inside `fn` becomes **one** undo step, even if `fn` errors |
+| `doc:transaction(fn, label?)` | every edit inside `fn` becomes **one** undo step, even if `fn` errors. Inside a command, which already is one step (`Script: <name>`), the label is ignored |
 | `doc:cursor()` `doc:selection()` → start, len | |
 | `doc:select(off, len)` `doc:jump(off)` | moves the selection/cursor and scrolls it into view (`doc:goto` also exists, but `goto` is a Lua keyword: call it as `doc["goto"](doc, off)`) |
 | `doc:find(needle, start?, {hex=bool, backward=bool})` | offset or `nil`; `hex=true` takes patterns like `"DE ?? AD"` |
@@ -170,7 +172,7 @@ and while a save is running.
 | `hx.parser{...}` `hx.command{...}` | registration (see above / below) |
 | `hx.run(name)` | runs a registered command exactly like the palette (one undo step on the active document); handy with `hexer --exec` |
 | `print(...)` `hx.log(...)` `hx.warn(...)` `hx.error(...)` | console output; tables are pretty-printed. `hx.error` only logs, it does not raise. |
-| `hx.inspect(v, depth?)` | readable dump: nested and sorted, cycle-safe, strings quoted |
+| `hx.inspect(v, depth?)` | readable dump: nested and sorted, cycle-safe, strings quoted. `depth` is 1..64 (default 6); output stops after about 1 MiB |
 | `hx.clear_console()` | |
 | `hx.doc()` | active document or `nil` |
 | `hx.new_doc(name, bytes)` | opens the bytes in a new tab and returns its Doc |
@@ -180,8 +182,10 @@ and while a save is running.
 | `hx.crc32(s, prev?)` | zlib/PNG/ZIP CRC-32; pass the previous result to continue over chunks |
 | `string.pack` / `string.unpack` | standard Lua, the recommended way to (de)serialize |
 
-`os.exit` and `io.read` are disabled: Hexer has no stdin, and a stray `os.exit()` must not
-close the editor.
+`os.exit` and stdin are disabled: Hexer has no stdin (`io.read`, `io.lines()`, `io.stdin`,
+`loadfile()` / `dofile()` without a file name raise), and a stray `os.exit()` must not close the
+editor. File names are UTF-8 everywhere, also on Windows (`io.open`, `io.lines`, `loadfile`,
+`dofile`, `require`). A `__gc` finalizer runs under a 1 s limit of its own.
 
 ---
 
@@ -220,7 +224,7 @@ hx.command {
 * Tables print readably: `{ a = 1, list = { 1, 2, 3 } }`.
 * Prototype a parser in a file and keep it open in your editor: every save hot-reloads it.
 * Commands and console code are stopped after 10 s, so an accidental infinite loop does not
-  freeze Hexer.
+  freeze Hexer. `pcall` cannot catch the time limit: once it fires, the script stops.
 
 ## Lua 5.5 notes
 

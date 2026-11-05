@@ -245,13 +245,14 @@ hx.command {
         local rec = record("NAME", hxp_record_text)
         if len + #rec > 0xFFFF then return hx.error("packet would exceed 65535 payload bytes") end
 
-        -- All three edits become ONE undo step (Ctrl+Z reverts the whole patch).
+        -- All three edits become ONE undo step (Ctrl+Z reverts the whole patch). A command already is
+        -- one step ("Script: <name>"); outside commands, doc:transaction(fn, "label") names the step.
         doc:transaction(function()
             doc:insert(at, rec)
             local new_len = len + #rec
             doc:write(pkt + 4, string.pack(">I2", new_len))
             doc:write(pkt + 6 + new_len, string.pack(">I2", crc16(doc:read(pkt, 6 + new_len))))
-        end, "HXP: append record")
+        end)
         doc:select(at, #rec)
         print(string.format("Inserted %d-byte NAME record at 0x%X; packet at 0x%X now has %d payload bytes",
             #rec, at, pkt, len + #rec))

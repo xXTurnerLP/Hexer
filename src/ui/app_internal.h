@@ -51,6 +51,14 @@ struct StructureState {
     bool rows_dirty = true;
     int cursor_field = -1;            // field containing the caret (selected row)
     int scroll_to_field = -1;         // reveal this field's row on the next draw
+    // A clicked container row stays selected (and collapsed) while the caret stays where the
+    // click put it, although the caret byte belongs to one of its children.
+    int clicked_field = -1;
+    uint64_t clicked_cursor = 0;
+    // Wall time of the last detect + parse. A slow (or truncated) parse is not re-run on every
+    // edit; the panel shows it as stale until F5 / Reparse.
+    double last_parse_ms = 0.0;
+    bool slow = false;
 };
 
 struct SearchHits {
@@ -109,6 +117,7 @@ struct FindState {
     std::string error;
     SearchJob job;
     uint64_t job_doc = 0;             // doc id the running/last job searches
+    uint64_t job_doc_gen = 0;         // that document's generation when the job took its snapshot
     uint64_t seen_gen = 0;            // job.generation() already handled
     size_t job_len = 0;
     std::string job_query;
@@ -157,7 +166,9 @@ struct App final : ScriptHost {
     Settings settings;
     double settings_dirty_at = -1.0;  // >= 0: save settings once this is ~1 s old
     Fonts fonts;
-    float ui_scale = 1.0f;
+    float ui_scale = 1.0f;            // monitor content scale * settings.ui_scale
+    float dpi_scale = 1.0f;           // monitor content scale (GLFW), followed at runtime
+    bool dpi_changed = false;         // content-scale callback fired: re-apply before next frame
     std::string ini_path;
     std::unique_ptr<ScriptEngine> engine;
     std::unique_ptr<Session> session; // null with --no-session
@@ -190,6 +201,11 @@ struct App final : ScriptHost {
          req_about = false;
     uint64_t close_prompt_doc = 0;    // doc id awaiting Save/Discard/Cancel
     bool close_prompt_pending = false;
+    uint64_t reload_prompt_doc = 0;   // doc id awaiting "Reload from disk and discard edits?"
+    bool reload_prompt_pending = false;
+    uint64_t overwrite_prompt_doc = 0;  // doc id whose save waits for "file changed on disk" choice
+    AfterSave overwrite_prompt_after = AfterSave::None;
+    bool overwrite_prompt_pending = false;
     bool quit_prompt_pending = false;
     std::vector<MsgBox> messages;
 
@@ -209,12 +225,14 @@ struct App final : ScriptHost {
     std::string console_input;
     std::vector<std::string> console_history;  // last 100 lines
     int console_history_pos = -1;
+    std::string console_draft;        // line being typed before browsing the history
     uint64_t console_seen_gen = 0;
     bool console_wrap = true;
     bool console_force_scroll = false;
 
     // Inline editors.
     InlineEdit insp_edit, st_edit, bm_edit;
+    uint64_t edit_doc = 0;            // active doc id the inline edits belong to (ended on change)
     int insp_sel = -1;                // selected inspector row (Enter edits it)
 
     // Status bar / notifications.

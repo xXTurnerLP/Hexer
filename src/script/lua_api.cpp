@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -781,7 +782,8 @@ Unpacked unpack_at(lua_State* L, ParseCtx* c, int fmt_idx, const char* who) {
     Impl& im = impl_of(L);
     const char* fmt = lua_tostring(L, fmt_idx);
     uint64_t rem = ctx_remaining(c);
-    // Fixed-size formats: exact size via string.packsize; variable ones get a window.
+    // Fixed-size formats: exact size via string.packsize. Variable ones (s4, z, ...) get a 64 KiB
+    // window first and, if their value is longer, one retry with up to kMaxStr bytes.
     lua_rawgeti(L, LUA_REGISTRYINDEX, im.ref_packsize);
     lua_pushvalue(L, fmt_idx);
     uint64_t need;
@@ -790,19 +792,29 @@ Unpacked unpack_at(lua_State* L, ParseCtx* c, int fmt_idx, const char* who) {
     else need = std::min<uint64_t>(rem, kSmall);
     lua_pop(L, 1);
     if (need > rem) eof_error(L, c->pos, need, rem);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, im.ref_unpack);
-    lua_pushvalue(L, fmt_idx);
-    push_bytes(L, c, c->pos, size_t(need));
-    int base = lua_gettop(L) - 3;
-    if (lua_pcall(L, 2, LUA_MULTRET, 0) != LUA_OK) {
+    for (;;) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, im.ref_unpack);
+        lua_pushvalue(L, fmt_idx);
+        push_bytes(L, c, c->pos, size_t(need));
+        int base = lua_gettop(L) - 3;
+        if (lua_pcall(L, 2, LUA_MULTRET, 0) == LUA_OK) {
+            int n = lua_gettop(L) - base;  // values + next position
+            Unpacked u{n - 1, uint64_t(lua_tointeger(L, -1) - 1)};
+            lua_pop(L, 1);
+            return u;
+        }
         const char* msg = lua_tostring(L, -1);
-        if (!fixed && msg && std::strstr(msg, "too short")) eof_error(L, c->pos, need + 1, rem);
+        bool short_data = !fixed && msg && (std::strstr(msg, "too short") || std::strstr(msg, "unfinished string"));
+        if (short_data && need < rem && need < kMaxStr) {  // the window was too small: widen it once
+            lua_pop(L, 1);
+            need = std::min<uint64_t>(rem, kMaxStr);
+            continue;
+        }
+        if (short_data && need < rem)
+            luaL_error(L, "%s('%s'): variable-length value larger than 16 MiB (use p:str / p:bytes)", who, fmt);
+        if (short_data) eof_error(L, c->pos, need + 1, rem);
         luaL_error(L, "%s('%s'): %s", who, fmt, msg ? msg : "error");
     }
-    int n = lua_gettop(L) - base;  // values + next position
-    Unpacked u{n - 1, uint64_t(lua_tointeger(L, -1) - 1)};
-    lua_pop(L, 1);
-    return u;
 }
 
 int p_read(lua_State* L) {
@@ -1067,7 +1079,11 @@ struct Inspector {
     lua_State* L;
     int max_depth;
     std::vector<const void*> path;
+    size_t budget = 1u << 20;  // total key + scalar text; shared subtables can blow up exponentially
     static constexpr size_t kMaxEntries = 500;
+    static constexpr int kMaxDepth = 64;  // the dump recurses in C++
+
+    void charge(size_t n) { budget -= std::min(budget, n); }
 
     struct Entry {
         int rank = 0;           // 0 integer key, 1 float key, 2 string key, 3 other
@@ -1111,14 +1127,14 @@ struct Inspector {
     std::string table(int t, int depth, int indent) {
         const void* p = lua_topointer(L, t);
         if (std::find(path.begin(), path.end(), p) != path.end()) return "<cycle>";
-        if (depth >= max_depth || !lua_checkstack(L, 6)) return "{...}";
+        if (depth >= max_depth || depth >= kMaxDepth || !budget || !lua_checkstack(L, 6)) return "{...}";
         path.push_back(p);
         std::vector<Entry> es;
         size_t total = 0;
         lua_pushnil(L);
         while (lua_next(L, t)) {
             ++total;
-            if (es.size() < kMaxEntries) {
+            if (es.size() < kMaxEntries && budget) {
                 Entry e;
                 int kt = lua_type(L, -2);
                 if (kt == LUA_TNUMBER && lua_isinteger(L, -2)) {
@@ -1141,6 +1157,7 @@ struct Inspector {
                     e.sk = e.key;
                 }
                 e.val = value(lua_gettop(L), depth + 1, indent + 1);
+                charge(e.key.size() + 4 + (lua_type(L, -1) == LUA_TTABLE ? 0 : e.val.size()));
                 es.push_back(std::move(e));
             }
             lua_pop(L, 1);
@@ -1215,9 +1232,10 @@ int l_no_stdin(lua_State* L) { return luaL_error(L, "io.read: there is no stdin 
 
 int l_inspect(lua_State* L) {
     luaL_checkany(L, 1);
-    int depth = int(luaL_optinteger(L, 2, 6));
+    lua_Integer depth = luaL_optinteger(L, 2, 6);
+    depth = std::clamp<lua_Integer>(depth, 1, Inspector::kMaxDepth);
     {
-        std::string s = lua_inspect(L, 1, depth < 1 ? 1 : depth);
+        std::string s = lua_inspect(L, 1, int(depth));
         lua_pushlstring(L, s.data(), s.size());
     }
     return 1;
@@ -1428,9 +1446,217 @@ void warn_fn(void* ud, const char* msg, int tocont) {
     }
 }
 
+// ---- sandbox: finalizers, stdin, UTF-8 file names ----------------------------------------------
+
+// Lua runs __gc metamethods with debug hooks off, so the time limit could not stop a looping one
+// (not even at reload / exit). setmetatable therefore swaps a metatable's __gc function for this
+// runner (upvalue 1 = the original), which calls it on a fresh coroutine (hooks on) under a limit.
+int gc_runner(lua_State* L) {
+    Impl& im = impl_of(L);
+    lua_State* co = lua_newthread(L);
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_pushvalue(L, 1);
+    lua_xmove(L, co, 2);
+    auto saved_deadline = im.deadline;
+    bool saved_on = im.deadline_on, saved_timed_out = im.timed_out;
+    int saved_limit = im.limit_ms;
+    auto mine = std::chrono::steady_clock::now() + std::chrono::milliseconds(kGcTimeLimitMs);
+    if (!im.deadline_on || mine < im.deadline) {
+        im.deadline = mine;
+        im.limit_ms = kGcTimeLimitMs;
+    }
+    im.deadline_on = true;
+    lua_sethook(co, lua_time_hook, LUA_MASKCOUNT, im.timed_out ? 1 : kHookCount);
+    int nres = 0;
+    int st = lua_resume(co, L, 1, &nres);
+    im.deadline = saved_deadline;
+    im.deadline_on = saved_on;
+    im.timed_out = saved_timed_out;
+    im.limit_ms = saved_limit;
+    if (im.L) {  // a timeout inside re-armed the main thread's hook
+        if (saved_on) lua_sethook(im.L, lua_time_hook, LUA_MASKCOUNT, saved_timed_out ? 1 : kHookCount);
+        else lua_sethook(im.L, nullptr, 0, 0);
+    }
+    if (st != LUA_OK && st != LUA_YIELD) {
+        lua_xmove(co, L, 1);
+        return lua_error(L);  // Lua turns it into an "error in __gc" warning (console)
+    }
+    return 0;
+}
+
+// setmetatable / debug.setmetatable wrapper (upvalue 1 = the original).
+int l_setmetatable(lua_State* L) {
+    int n = std::min(lua_gettop(L), 2);
+    lua_settop(L, n);
+    if (lua_type(L, 2) == LUA_TTABLE) {
+        lua_pushliteral(L, "__gc");
+        if (lua_rawget(L, 2) == LUA_TFUNCTION && lua_tocfunction(L, -1) != gc_runner) {
+            lua_pushcclosure(L, gc_runner, 1);
+            lua_pushliteral(L, "__gc");
+            lua_insert(L, -2);
+            lua_rawset(L, 2);
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    lua_call(L, n, 1);
+    return 1;
+}
+
+void wrap_setmetatable(lua_State* L, int table_idx) {
+    table_idx = lua_absindex(L, table_idx);
+    lua_getfield(L, table_idx, "setmetatable");
+    lua_pushcclosure(L, l_setmetatable, 1);
+    lua_setfield(L, table_idx, "setmetatable");
+}
+
+#ifdef _WIN32
+int io_fclose_utf8(lua_State* L) {
+    auto* p = static_cast<luaL_Stream*>(luaL_checkudata(L, 1, LUA_FILEHANDLE));
+    errno = 0;
+    return luaL_fileresult(L, std::fclose(p->f) == 0, nullptr);
+}
+
+// io.open taking a UTF-8 file name (the CRT's fopen expects the ANSI code page on Windows).
+int l_io_open_utf8(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    const char* mode = luaL_optstring(L, 2, "r");
+    const char* m = mode;  // same check as liolib: [rwa]%+?b*
+    bool valid = *m && std::strchr("rwa", *m++);
+    if (valid && *m == '+') ++m;
+    valid = valid && std::strspn(m, "b") == std::strlen(m);
+    luaL_argcheck(L, valid, 2, "invalid mode");
+    auto* p = static_cast<luaL_Stream*>(lua_newuserdatauv(L, sizeof(luaL_Stream), 0));
+    p->f = nullptr;
+    p->closef = nullptr;  // "closed" until opened
+    luaL_setmetatable(L, LUA_FILEHANDLE);
+    {
+        std::wstring wname = utf8_to_wide(name), wmode = utf8_to_wide(mode);
+        errno = 0;
+        p->f = _wfopen(wname.c_str(), wmode.c_str());
+    }
+    if (!p->f) return luaL_fileresult(L, 0, name);
+    p->closef = io_fclose_utf8;
+    return 1;
+}
+#endif
+
+// Runs once per state with one argument: a UTF-8 io.open (Windows) or nil. Closes the stdin holes
+// left by liolib (loadfile()/dofile()/io.lines() without a name) and, on Windows, routes file names
+// through the UTF-8 io.open: require's Lua searcher, loadfile, dofile, io.lines/input/output.
+const char* kSandboxLua = R"LUA(
+local wopen = ...
+local io, package, load, error, type, tostring = io, package, load, error, type, tostring
+local sub, gsub, gmatch, concat = string.sub, string.gsub, string.gmatch, table.concat
+local no_stdin = "there is no stdin inside Hexer (use io.open)"
+local open, lines, input, output, orig_loadfile = wopen or io.open, io.lines, io.input, io.output, loadfile
+
+local function readall(path)
+    local f, err = open(path, "rb")
+    if not f then return nil, err end
+    local s = f:read("a")
+    f:close()
+    if sub(s, 1, 3) == "\239\187\191" then s = sub(s, 4) end   -- UTF-8 BOM
+    if sub(s, 1, 1) == "#" then s = gsub(s, "^#[^\n]*", "", 1) end  -- shebang; keeps line numbers
+    return s
+end
+
+local function lfile(path, ...)
+    if path == nil then return nil, "loadfile: " .. no_stdin end
+    if not wopen then return orig_loadfile(path, ...) end
+    local s, err = readall(path)
+    if not s then return nil, "cannot open " .. tostring(err) end
+    return load(s, "@" .. path, ...)
+end
+loadfile = lfile
+
+function dofile(path)
+    if path == nil then error("dofile: " .. no_stdin, 2) end
+    local f, err = lfile(path)
+    if not f then error(err, 0) end
+    return f()
+end
+
+function io.lines(path, ...)
+    if path == nil then error("io.lines: " .. no_stdin, 2) end
+    if not wopen then return lines(path, ...) end
+    local f, err = open(path, "r")
+    if not f then error(err, 2) end
+    return f:lines(...), nil, nil, f   -- f is closed by the generic for
+end
+
+if not wopen then return end
+io.open = wopen
+
+local function reopen(orig, mode)
+    return function(f, ...)
+        if type(f) == "string" then
+            local h, err = open(f, mode)
+            if not h then error("cannot open file '" .. f .. "' (" .. tostring(err) .. ")", 2) end
+            f = h
+        end
+        return orig(f, ...)
+    end
+end
+io.input, io.output = reopen(input, "r"), reopen(output, "w")
+
+package.searchers[2] = function(name)
+    local fname = gsub(gsub(name, "%.", "/"), "%%", "%%%%")
+    local tried = {}
+    for tpl in gmatch(package.path, "[^;]+") do
+        local path = gsub(tpl, "%?", fname)
+        local s = readall(path)
+        if s then
+            local fn, err = load(s, "@" .. path)
+            if not fn then
+                error("error loading module '" .. name .. "' from file '" .. path .. "':\n\t" .. err, 0)
+            end
+            return fn, path
+        end
+        tried[#tried + 1] = "no file '" .. path .. "'"
+    end
+    return concat(tried, "\n\t")
+end
+)LUA";
+
+void install_sandbox(lua_State* L) {
+    // __gc finalizers run under a time limit (see gc_runner).
+    lua_pushglobaltable(L);
+    wrap_setmetatable(L, -1);
+    lua_pop(L, 1);
+    lua_getglobal(L, "debug");
+    wrap_setmetatable(L, -1);
+    lua_pop(L, 1);
+
+    // No stdin: io.stdin and the default input become a closed file handle, io.read an error.
+    auto* p = static_cast<luaL_Stream*>(lua_newuserdatauv(L, sizeof(luaL_Stream), 0));
+    p->f = nullptr;
+    p->closef = nullptr;  // closed
+    luaL_setmetatable(L, LUA_FILEHANDLE);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "_IO_input");  // liolib's default-input key
+    lua_getglobal(L, "io");
+    lua_insert(L, -2);
+    lua_setfield(L, -2, "stdin");
+    lua_pushcfunction(L, l_no_stdin);
+    lua_setfield(L, -2, "read");
+    lua_pop(L, 1);
+
+    if (luaL_loadbufferx(L, kSandboxLua, std::strlen(kSandboxLua), "=sandbox", "t") != LUA_OK) lua_error(L);
+#ifdef _WIN32
+    lua_pushcfunction(L, l_io_open_utf8);
+#else
+    lua_pushnil(L);
+#endif
+    lua_call(L, 1, 0);
+}
+
 int install_main(lua_State* L) {
     Impl& im = impl_of(L);
     luaL_openlibs(L);
+    install_sandbox(L);
 
     // Doc metatable: methods + one closure per number type with explicit endianness.
     luaL_newmetatable(L, kDocMeta);
@@ -1475,14 +1701,10 @@ int install_main(lua_State* L) {
     lua_pushcfunction(L, l_print);
     lua_setglobal(L, "print");
 
-    // A stray os.exit() in the console must not kill the editor, and there is no stdin to read.
+    // A stray os.exit() in the console must not kill the editor (stdin: see install_sandbox).
     lua_getglobal(L, "os");
     lua_pushcfunction(L, l_no_exit);
     lua_setfield(L, -2, "exit");
-    lua_pop(L, 1);
-    lua_getglobal(L, "io");
-    lua_pushcfunction(L, l_no_stdin);
-    lua_setfield(L, -2, "read");
     lua_pop(L, 1);
 
     // Keep the original string.pack/unpack/packsize for the engine's own use.
@@ -1514,7 +1736,16 @@ int lua_msg_handler(lua_State* L) {
 
 void lua_time_hook(lua_State* L, lua_Debug* ar) {
     Impl& im = impl_of(L);
-    if (!im.deadline_on || std::chrono::steady_clock::now() < im.deadline) return;
+    if (!im.deadline_on) return;
+    if (!im.timed_out && std::chrono::steady_clock::now() < im.deadline) {
+        if (lua_gethookcount(L) != kHookCount) lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, kHookCount);
+        return;
+    }
+    // Sticky: from now on every instruction raises (on this thread and the main one), so code that
+    // catches the error (pcall / xpcall / coroutine.resume in a loop) dies at its next instruction.
+    im.timed_out = true;
+    if (lua_gethookcount(L) != 1) lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, 1);
+    if (im.L && im.L != L && lua_gethookcount(im.L) != 1) lua_sethook(im.L, lua_time_hook, LUA_MASKCOUNT, 1);
     if (lua_getinfo(L, "Sl", ar) && ar->currentline > 0)
         lua_pushfstring(L, "%s:%d: script time limit exceeded (%d ms)", ar->short_src, ar->currentline, im.limit_ms);
     else

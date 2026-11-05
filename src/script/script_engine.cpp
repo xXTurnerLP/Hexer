@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -122,8 +124,9 @@ bool iequals(const std::string& a, const std::string& b) {
     return true;
 }
 
-// "123", "-5", "0x1F", "0b101", "1_000" -> magnitude + sign. False on garbage / overflow.
-bool parse_integer(const std::string& text, bool& negative, uint64_t& magnitude) {
+// "123", "-5", "0x1F", "0b101", "1_000" -> magnitude + sign (+ the base used). False on garbage /
+// overflow.
+bool parse_integer(const std::string& text, bool& negative, uint64_t& magnitude, int* base_out = nullptr) {
     std::string s;
     for (char c : text)
         if (c != '_' && c != '\'') s += c;
@@ -135,8 +138,44 @@ bool parse_integer(const std::string& text, bool& negative, uint64_t& magnitude)
     else if (s.size() - i > 2 && s[i] == '0' && (s[i + 1] == 'b' || s[i + 1] == 'B')) base = 2, i += 2;
     else if (s.size() - i > 1 && (s.back() == 'h' || s.back() == 'H')) base = 16, s.pop_back();
     if (i >= s.size()) return false;
+    if (base_out) *base_out = base;
     auto r = std::from_chars(s.data() + i, s.data() + s.size(), magnitude, base);
     return r.ec == std::errc() && r.ptr == s.data() + s.size();
+}
+
+// A quoted char literal as fmt="char" displays it: "'IHDR'" or "'IHDR' (1229472850)", with the
+// escapes of the display (\n \r \t \0 \\ \" \xHH). False if `text` is not one.
+bool parse_char_literal(const std::string& text, std::string& out) {
+    if (text.size() < 2 || text[0] != '\'') return false;
+    size_t end = text.back() == '\'' ? text.size() - 1 : text.rfind("' (");
+    if (end == std::string::npos || end == 0 || (end != text.size() - 1 && text.back() != ')')) return false;
+    out.clear();
+    for (size_t i = 1; i < end; ++i) {
+        char c = text[i];
+        if (c != '\\') {
+            out += c;
+            continue;
+        }
+        if (++i >= end) return false;
+        switch (text[i]) {
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        case '0': out += '\0'; break;
+        case '\\': case '"': case '\'': out += text[i]; break;
+        case 'x': {
+            unsigned v = 0;
+            if (i + 2 >= end) return false;
+            auto r = std::from_chars(text.data() + i + 1, text.data() + i + 3, v, 16);
+            if (r.ec != std::errc() || r.ptr != text.data() + i + 3) return false;
+            out += char(v);
+            i += 2;
+            break;
+        }
+        default: return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -150,6 +189,7 @@ void ScriptEngine::Impl::close_state() {
     command_refs.clear();
     ref_pack = ref_unpack = ref_packsize = LUA_NOREF;
     deadline_on = false;
+    timed_out = false;
     depth = 0;
     warn_buf.clear();
     logged_errors.clear();
@@ -185,7 +225,7 @@ bool ScriptEngine::Impl::pcall(int nargs, int nresults, int time_limit_ms, std::
         limit_ms = time_limit_ms;
     }
     deadline_on = true;
-    lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, 4096);
+    lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, timed_out ? 1 : kHookCount);
 
     ++depth;
     int st = lua_pcall(L, nargs, nresults, fn);
@@ -194,7 +234,10 @@ bool ScriptEngine::Impl::pcall(int nargs, int nresults, int time_limit_ms, std::
     deadline = saved_deadline;
     deadline_on = saved_on;
     limit_ms = saved_limit;
+    // The timeout stays sticky only while the (restored) outer deadline has passed too.
+    if (timed_out && (!deadline_on || std::chrono::steady_clock::now() < deadline)) timed_out = false;
     if (!deadline_on) lua_sethook(L, nullptr, 0, 0);
+    else if (!timed_out) lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, kHookCount);
 
     bool ok = st == LUA_OK;
     if (!ok) {
@@ -516,6 +559,17 @@ bool ScriptEngine::edit_field(Document& doc, const Field& field, const std::stri
                     break;
                 }
     }
+    // Char literal (fmt="char"): bytes, most significant first, like the display.
+    std::string chars;
+    if (!have_int && !pi.is_float && parse_char_literal(text, chars)) {
+        if (chars.empty() || chars.size() > size_t(pi.size))
+            return fail("char literal must have 1.." + std::to_string(pi.size) + " characters");
+        uint64_t bits = 0;
+        for (unsigned char ch : chars) bits = bits << 8 | ch;
+        if (pi.is_signed && pi.size < 8 && ((bits >> (pi.size * 8 - 1)) & 1)) bits |= ~0ull << (pi.size * 8);
+        iv = int64_t(bits);
+        have_int = true;
+    }
     if (!have_int) {
         size_t eq = text.find(" = ");
         if (eq != std::string::npos) text = trim(text.substr(0, eq));
@@ -534,12 +588,17 @@ bool ScriptEngine::edit_field(Document& doc, const Field& field, const std::stri
             lua_pop(L, 2);
             return fail("not a number: '" + text + "'");
         }
+        if (pi.size == 4 && std::isfinite(dv) && std::fabs(dv) > double(FLT_MAX)) {  // inf / nan stay allowed
+            lua_pop(L, 2);
+            return fail("value out of range for f32 (max 3.4028235e38)");
+        }
         lua_pushnumber(L, dv);
     } else {
         if (!have_int) {
             bool neg;
             uint64_t mag;
-            if (!parse_integer(text, neg, mag)) {
+            int base = 10;
+            if (!parse_integer(text, neg, mag, &base)) {
                 lua_pop(L, 2);
                 return fail("not a number or enum name: '" + text + "'");
             }
@@ -547,8 +606,13 @@ bool ScriptEngine::edit_field(Document& doc, const Field& field, const std::stri
             bool ok;
             if (pi.is_signed) {
                 uint64_t lim = pi.size >= 8 ? (1ull << 63) : (1ull << (pi.size * 8 - 1));
+                uint64_t umax = pi.size >= 8 ? ~0ull : (1ull << (pi.size * 8)) - 1;
                 ok = neg ? mag <= lim : mag < lim;
                 iv = neg ? int64_t(0 - mag) : int64_t(mag);
+                if (!ok && !neg && base != 10 && mag <= umax) {  // hex/bin bit pattern, as fmt="hex"/"bin" shows it
+                    ok = true;
+                    iv = int64_t(pi.size >= 8 ? mag : mag | (~0ull << (pi.size * 8)));
+                }
             } else {
                 uint64_t max = pi.size >= 8 ? ~0ull : (1ull << (pi.size * 8)) - 1;
                 ok = (!neg || mag == 0) && mag <= max;

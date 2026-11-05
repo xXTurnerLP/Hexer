@@ -377,15 +377,13 @@ TEST_CASE("SearchJob: cancel, restart while running, destroy while running") {
     {
         SearchJob job;
         job.start(s, p, 0, SearchJob::Mode::All);
-        // Restart immediately: previous run is cancelled + joined, the new one completes.
+        // Restart immediately: previous run is cancelled (not waited for, and it publishes nothing),
+        // the new one completes.
         Pattern q = pat(SearchKind::Text, "ZZ");
         job.start(s, q, 0, SearchJob::Mode::Next);
-        CHECK(job.generation() >= 1);  // the first (cancelled) run has finished
-        auto t0 = std::chrono::steady_clock::now();
-        while (job.generation() < 2) {
-            REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60));
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        wait_for(job, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(job.generation() == 1);  // only the current run counts
         auto r = job.result();
         CHECK(r.mode == SearchJob::Mode::Next);
         CHECK_FALSE(r.cancelled);
@@ -396,6 +394,58 @@ TEST_CASE("SearchJob: cancel, restart while running, destroy while running") {
         job.start(s, p, 0, SearchJob::Mode::Prev);
     }  // destructor cancels + joins
     CHECK(true);
+}
+
+TEST_CASE("search: unreadable bytes stop the scan instead of matching as zeros") {
+    // Snapshot whose middle piece references a missing add chunk: those bytes read as 0x00 but are
+    // reported as unreadable (same path as a FileSource I/O error).
+    auto base = snap_of(Bytes(size_t(kBlk), 0x11));
+    auto s = std::make_shared<Snapshot>(*base);
+    const uint64_t good = 1000, bad = 5000;
+    s->pieces = {Piece{Piece::Add, 0, 0, good}, Piece{Piece::Add, 99, 0, bad}, Piece{Piece::Add, 0, 0, 3000}};
+    s->starts = {0, good, good + bad};
+    s->size_ = good + bad + 3000;
+    std::vector<uint8_t> buf(size_t(s->size()));
+    CHECK(s->read(0, buf.data(), buf.size()) == buf.size());  // zero-filled as before
+    CHECK(buf[size_t(good)] == 0);
+    CHECK(s->read_valid(0, buf.data(), buf.size()) == good);
+    CHECK(s->read_valid(10, buf.data(), 100) == 100);
+
+    Pattern zeros = pat(SearchKind::Hex, "00 00");
+    bool io = false;
+    CHECK(find_in(*s, zeros, 0, true, nullptr, nullptr, &io) == std::nullopt);
+    CHECK(io);
+    CHECK(find_in(*s, pat(SearchKind::Hex, "11 11"), 500, true, nullptr, nullptr, &io) == 500u);
+    CHECK_FALSE(io);
+
+    SearchJob job;
+    auto r = run_job(job, s, zeros, 0, SearchJob::Mode::All);
+    CHECK(r.hits.empty());
+    CHECK(r.io_error);
+    r = run_job(job, s, pat(SearchKind::Hex, "11 11"), 0, SearchJob::Mode::All);
+    CHECK(r.hits.size() == good / 2);  // matches before the unreadable bytes are still found
+    CHECK(r.io_error);
+    r = run_job(job, s, pat(SearchKind::Hex, "11"), 0, SearchJob::Mode::Next);
+    CHECK(r.hits == std::vector<uint64_t>{0});
+    CHECK_FALSE(r.io_error);
+}
+
+TEST_CASE("SearchJob: rapid restarts publish only the last run") {
+    Bytes d(size_t(32) << 20, 0x5A);
+    plant(d, 12345, {'Q'});
+    auto s = snap_of(d);
+    Pattern never = pat(SearchKind::Text, "ZZZZY");
+    SearchJob job;
+    for (int i = 0; i < 20; ++i) job.start(s, never, 0, SearchJob::Mode::All);  // never waits for a run
+    job.start(s, pat(SearchKind::Text, "Q"), 0, SearchJob::Mode::Next);
+    wait_for(job, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(job.generation() == 1);
+    auto r = job.result();
+    CHECK(r.mode == SearchJob::Mode::Next);
+    CHECK_FALSE(r.cancelled);
+    CHECK(r.hits == std::vector<uint64_t>{12345});
+    CHECK(job.progress() == doctest::Approx(1.0));
 }
 
 TEST_CASE("SearchJob: next / prev wrap across 4 MiB blocks") {

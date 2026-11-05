@@ -105,12 +105,17 @@ bool references_ranges(const std::vector<Piece>& ps, uint32_t cur, const std::ve
 }
 
 // Core read loop shared by Document and Snapshot. Starts at piece `i`, `off` bytes into it; the
-// caller has already clamped len to the document size. Unreadable bytes are zero-filled and
-// reported through *ok.
+// caller has already clamped len to the document size. Unreadable bytes are zero-filled (per
+// FileSource block, so one bad sector does not blank a whole large read) and reported through
+// *ok; *valid (if given, initialised by the caller) is lowered to the index of the first one.
 size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
                    const std::vector<std::shared_ptr<AddBuffer::Chunk>>& chunks,
                    const std::vector<Piece>& pieces, size_t i, uint64_t off, uint8_t* dst, size_t len,
-                   bool* ok) {
+                   bool* ok, size_t* valid = nullptr) {
+    auto bad_at = [&](size_t at) {
+        if (ok) *ok = false;
+        if (valid && at < *valid) *valid = at;
+    };
     size_t done = 0;
     while (done < len && i < pieces.size()) {
         const Piece& p = pieces[i];
@@ -121,14 +126,22 @@ size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
                 std::memcpy(dst + done, c->data.get() + p.start + off, n);
             } else {
                 std::memset(dst + done, 0, n);
-                if (ok) *ok = false;
+                bad_at(done);
             }
         } else {
             const FileSource* s = p.chunk < sources.size() ? sources[p.chunk].get() : nullptr;
-            size_t got = s ? s->read(p.start + off, dst + done, n) : 0;
-            if (got < n) {
-                std::memset(dst + done + got, 0, n - got);
-                if (ok) *ok = false;
+            const uint64_t pos = p.start + off;
+            size_t got = 0;
+            while (got < n) {
+                got += s ? s->read(pos + got, dst + done + got, n - got) : 0;
+                if (got >= n) break;
+                bad_at(done + got);
+                // Unreadable: zero-fill up to the next cache block boundary and continue after it.
+                uint64_t at = pos + got;
+                size_t skip = s ? size_t(std::min<uint64_t>(n - got, FileSource::kBlockSize - at % FileSource::kBlockSize))
+                                : n - got;
+                std::memset(dst + done + got, 0, skip);
+                got += skip;
             }
         }
         done += n;
@@ -138,12 +151,21 @@ size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
     return done;
 }
 
-size_t snapshot_read(const Snapshot& s, uint64_t offset, uint8_t* dst, size_t len, bool* ok) {
+size_t snapshot_read(const Snapshot& s, uint64_t offset, uint8_t* dst, size_t len, bool* ok,
+                     size_t* valid = nullptr) {
     if (offset >= s.size_ || len == 0) return 0;
     len = size_t(std::min<uint64_t>(len, s.size_ - offset));
+    if (valid) *valid = len;
     auto it = std::upper_bound(s.starts.begin(), s.starts.end(), offset);
     size_t i = size_t(it - s.starts.begin()) - 1;
-    return read_pieces(s.sources, s.chunks, s.pieces, i, offset - s.starts[i], dst, len, ok);
+    return read_pieces(s.sources, s.chunks, s.pieces, i, offset - s.starts[i], dst, len, ok, valid);
+}
+
+// Logical size of a piece list.
+uint64_t pieces_size(const std::vector<Piece>& ps) {
+    uint64_t n = 0;
+    for (const Piece& p : ps) n += p.len;
+    return n;
 }
 
 }  // namespace
@@ -183,8 +205,18 @@ const uint8_t* AddBuffer::ptr(uint32_t chunk, uint64_t start) const {
 
 void AddBuffer::clear() { chunks_.clear(); }
 
+void AddBuffer::release(uint32_t chunk) {
+    if (chunk < chunks_.size() && chunks_[chunk]->capacity) chunks_[chunk] = std::make_shared<Chunk>();
+}
+
 size_t Snapshot::read(uint64_t offset, uint8_t* dst, size_t len) const {
     return snapshot_read(*this, offset, dst, len, nullptr);
+}
+
+size_t Snapshot::read_valid(uint64_t offset, uint8_t* dst, size_t len) const {
+    size_t valid = 0;
+    snapshot_read(*this, offset, dst, len, nullptr, &valid);
+    return valid;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -307,7 +339,10 @@ UndoEntry Document::capture() const {
 
 void Document::push_entry(std::vector<UndoEntry>& stack, UndoEntry&& e) {
     stack.push_back(std::move(e));
-    if (stack.size() > kMaxUndo) stack.erase(stack.begin(), stack.begin() + std::ptrdiff_t(stack.size() - kMaxUndo));
+    if (stack.size() > kMaxUndo) {
+        trims_since_reclaim_ += stack.size() - kMaxUndo;
+        stack.erase(stack.begin(), stack.begin() + std::ptrdiff_t(stack.size() - kMaxUndo));
+    }
 }
 
 void Document::push_undo(const char* label, bool coalesce, uint64_t edit_end) {
@@ -322,6 +357,9 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, 
     // release it so its disk space is freed. Rare (undo followed by a new edit), so the O(history)
     // scan is fine.
     if (dropped_redo && sources_.size() > 1) prune_sources();
+    // Same for add-buffer chunks (undone pastes/fills, history trimmed by kMaxUndo). Here the
+    // current state is still in table_ and every other state on a stack, so nothing live is freed.
+    if (dropped_redo || trims_since_reclaim_ >= 1000) reclaim_add();
     if (group_depth_ > 0) {
         coalesce_open_ = false;
         if (group_pushed_) return;
@@ -381,6 +419,23 @@ void Document::apply_pending() {
     pend_undo_.clear();
     pend_redo_.clear();
     pend_ = false;
+    reclaim_add();  // a save may have dropped history entries (and their pasted bytes)
+}
+
+void Document::reclaim_add() {
+    trims_since_reclaim_ = 0;
+    if (busy_) return;  // a save worker may hold history copies that reference new chunks
+    const auto& chunks = add_.chunks();
+    std::vector<bool> used(chunks.size(), false);
+    auto mark = [&](const std::vector<Piece>& ps) {
+        for (const Piece& p : ps)
+            if (p.src == Piece::Add && p.chunk < used.size()) used[p.chunk] = true;
+    };
+    mark(table_.pieces());
+    for (const auto* stack : {&undo_, &redo_, &pend_undo_, &pend_redo_})
+        for (const UndoEntry& e : *stack) mark(e.pieces);
+    for (uint32_t c = 0; c < uint32_t(used.size()); ++c)
+        if (!used[c]) add_.release(c);
 }
 
 void Document::prune_sources() {
@@ -607,7 +662,7 @@ bool Document::dirty() const {
 // ---------------------------------------------------------------------------------------------
 // Saving
 // ---------------------------------------------------------------------------------------------
-bool Document::save(Progress* progress, std::string* err) {
+bool Document::save(Progress* progress, std::string* err, bool force) {
     bool expected = false;
     if (!busy_.compare_exchange_strong(expected, true)) return fail(err, "A save is already in progress");
     BusyGuard guard{busy_};
@@ -626,13 +681,29 @@ bool Document::save(Progress* progress, std::string* err) {
     FileStat known = disk_stat_;
     auto snap = make_snapshot();
     bool inplace = src && table_.is_inplace_compatible(cur, src->size());
+    const std::string name = name_locked();
     lk.unlock();
 
-    if (inplace) {
-        // Only patch in place when the file is still exactly the version our pieces refer to.
-        FileStat now = os_stat(path);
-        inplace = now.exists && now.size == src->size() && now.mtime_ns == known.mtime_ns;
+    if (known.is_device || (src && src->stat_at_open().is_device)) {
+        // Devices have no meaningful size/mtime and cannot be replaced by a rewritten copy.
+        if (!inplace)
+            return fail(err, "Size-changing edits cannot be saved to a device (" + name +
+                                 "); only overwrites can. Use Save As to write an image file.");
+        return save_inplace(path, src, cur, *snap, progress, err);
     }
+    FileStat now = os_stat(path);
+    // Replaced by another file (atomic save of another program): our handle still reads the version
+    // our pieces refer to, so the rewrite path produces exactly what the user sees.
+    const bool replaced = os_identity_differs(now, known);
+    const bool modified = src && now.exists && !replaced && (now.size != known.size || now.mtime_ns != known.mtime_ns);
+    if (modified) {
+        if (!force)
+            return fail(err, name + " was modified on disk by another program since it was opened; save aborted "
+                                    "(the result would mix both versions). Reload it, or use Save As.");
+        src->invalidate();  // forced: at least consistent with what is on disk now
+    }
+    // Only patch in place when the file is still exactly the version our pieces refer to.
+    inplace = inplace && now.exists && !replaced && !modified && now.size == src->size();
     return inplace ? save_inplace(path, src, cur, *snap, progress, err)
                    : save_rewrite(path, true, *snap, progress, err);
 }
@@ -645,7 +716,9 @@ bool Document::save_as(const std::string& path, Progress* progress, std::string*
         std::lock_guard<std::mutex> lk(mu_);
         same = !path_.empty() && (path_ == target || os_same_file(path_, target));
     }
-    if (same) return save(progress, err);
+    if (same) return save(progress, err, true);  // explicitly chosen to overwrite this file
+    if (os_stat(target).is_device)
+        return fail(err, "Cannot Save As onto a device; open the device and overwrite bytes instead");
 
     bool expected = false;
     if (!busy_.compare_exchange_strong(expected, true)) return fail(err, "A save is already in progress");
@@ -781,7 +854,9 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
 // Rewrite: stream everything to "<target>.hexer-tmp", then atomically replace the target.
 bool Document::save_rewrite(const std::string& target, bool same_file, const Snapshot& snap,
                             Progress* progress, std::string* err) {
-    const std::string tmp = target + ".hexer-tmp";
+    // Write the file a symlink points to instead of replacing the link by a regular file.
+    const std::string real = os_resolve_symlinks(target);
+    const std::string tmp = real + ".hexer-tmp";
     {
         std::string e;
         auto f = OsFile::open(tmp, OsFile::Mode::CreateTruncate, &e);
@@ -815,7 +890,7 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
             return fail(err, why);
         }
     }
-    if (os_stat(target).exists) os_copy_permissions(target, tmp);
+    if (os_stat(real).exists) os_copy_permissions(real, tmp);
 
     std::shared_ptr<FileSource> old_cur;
     {
@@ -823,12 +898,12 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
         old_cur = sources_.back();
     }
     std::string rerr;
-    if (!os_replace_file(tmp, target, &rerr)) {
+    if (!os_replace_file(tmp, real, &rerr)) {
         // Some filesystems cannot replace a file we still hold open: release ours and retry.
         bool ok = false;
         if (same_file && old_cur) {
             old_cur->close_file();
-            ok = os_replace_file(tmp, target, &rerr);
+            ok = os_replace_file(tmp, real, &rerr);
             if (!ok) old_cur->reopen_file(nullptr);
         }
         if (!ok) {
@@ -904,8 +979,15 @@ bool Document::changed_on_disk() const {
         path = path_;
         known = disk_stat_;
     }
+    if (known.is_device) return false;  // no meaningful size/mtime
     FileStat now = os_stat(path);
-    return !now.exists || now.size != known.size || now.mtime_ns != known.mtime_ns;
+    return !now.exists || now.size != known.size || now.mtime_ns != known.mtime_ns ||
+           os_identity_differs(now, known);
+}
+
+FileStat Document::disk_stat() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return disk_stat_;
 }
 
 bool Document::reload(std::string* err) {
@@ -986,9 +1068,11 @@ PersistedDoc Document::persist() const {
             }
         } else {
             // Too large to inline: fall back to the last saved state of the current version.
+            // The session warns about this on restore; hot_exit_safe() lets the UI ask first.
             if (has_src && sources_.back()->size())
                 d.pieces.push_back(Piece{Piece::Original, 0, 0, sources_.back()->size()});
             d.dirty = false;
+            d.edits_dropped = true;
         }
     }
     for (const UndoEntry& u : eff_undo())
@@ -1024,7 +1108,18 @@ PersistedDoc Document::persist() const {
     return d;
 }
 
-std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* changed_on_disk, std::string* err) {
+bool Document::hot_exit_safe() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (state_id_ == saved_state_id_) return true;
+    const uint32_t cur = current_source();
+    uint64_t old_bytes = 0;
+    for (const Piece& p : table_.pieces())
+        if (p.src == Piece::Original && p.chunk != cur) old_bytes += p.len;
+    return old_bytes <= kMaxMaterialize;
+}
+
+std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* changed_on_disk, std::string* err,
+                                            std::string* note) {
     if (changed_on_disk) *changed_on_disk = false;
     std::unique_ptr<Document> d(new Document());
     d->path_ = st.path;
@@ -1053,7 +1148,7 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
             d->display_name_ = (st.display_name.empty() ? path_filename(st.path) : st.display_name) + " (recovered)";
         } else {
             FileStat now = src->stat_at_open();
-            file_changed = now.size != st.file_stat.size || now.mtime_ns != st.file_stat.mtime_ns;
+            file_changed = !now.is_device && (now.size != st.file_stat.size || now.mtime_ns != st.file_stat.mtime_ns);
             d->disk_stat_ = now;
         }
     }
@@ -1085,7 +1180,39 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
         return true;
     };
 
-    const bool clean_but_changed = file_changed && !st.dirty;
+    // Our own save already wrote this exact content (the process ended before the session was
+    // rewritten): replaying the pieces on top of it would corrupt it. Size plus every added byte
+    // (up to a budget) at its offset must match; Original bytes cannot be checked (old version).
+    bool already_saved = false;
+    if (file_changed && st.dirty && src && pieces_size(st.pieces) == src_size) {
+        already_saved = true;
+        uint64_t at = 0, budget = 64ull << 20;
+        std::vector<uint8_t> buf;
+        for (const Piece& p : st.pieces) {
+            if (p.src == Piece::Add && budget) {
+                if (p.chunk >= chunks.size() || p.start > chunks[p.chunk]->used ||
+                    p.len > chunks[p.chunk]->used - p.start) {
+                    already_saved = false;
+                    break;
+                }
+                size_t n = size_t(std::min(p.len, budget));
+                buf.resize(n);
+                if (src->read(at, buf.data(), n) != n ||
+                    std::memcmp(buf.data(), chunks[p.chunk]->data.get() + p.start, n) != 0) {
+                    already_saved = false;
+                    break;
+                }
+                budget -= n;
+            }
+            at += p.len;
+        }
+        if (already_saved && note)
+            *note = (st.display_name.empty() ? path_filename(st.path) : st.display_name) +
+                    " was saved just before the last session ended; it was opened from disk and undo history "
+                    "from before that save was dropped";
+    }
+
+    const bool clean_but_changed = file_changed && (!st.dirty || already_saved);
     if (clean_but_changed) {
         d->table_.reset(0, src_size);  // nothing of ours to keep: show the new contents
     } else {
@@ -1112,7 +1239,7 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
         load_stack(st.redo, d->redo_);
     }
 
-    if (!st.dirty && !recovered) {
+    if ((!st.dirty || already_saved) && !recovered) {
         d->state_id_ = d->saved_state_id_ = 1;
     } else {
         d->state_id_ = max_id + 1;
@@ -1125,7 +1252,7 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
         d->base_last_used_ = chunks.empty() ? 0 : chunks.back()->used;
     }
     d->clamp_view();
-    if (changed_on_disk) *changed_on_disk = file_changed;
+    if (changed_on_disk) *changed_on_disk = file_changed && !already_saved;
     return d;
 }
 

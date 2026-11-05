@@ -30,15 +30,26 @@ public:
 private:
     OsFile() = default;
     intptr_t h_ = -1;  // HANDLE on Windows, fd on POSIX
+#ifdef _WIN32
+    bool device_ = false;  // raw disk/volume: I/O is bounced through sector-aligned buffers
+#endif
 };
 
 struct FileStat {
     bool exists = false;
     bool is_dir = false;
+    bool is_device = false;  // block/char device or Windows "\\.\" path: size/mtime are meaningless
     uint64_t size = 0;
     int64_t mtime_ns = 0;
+    // File identity (st_dev/st_ino; Windows volume serial + file index). 0/0 = unknown.
+    uint64_t dev = 0, ino = 0;
 };
+// True when both stats carry an identity and it differs (the path now names another file).
+inline bool os_identity_differs(const FileStat& a, const FileStat& b) {
+    return (a.ino || a.dev) && (b.ino || b.dev) && (a.dev != b.dev || a.ino != b.ino);
+}
 
+// Follows symbolic links (the stat of the link target).
 FileStat os_stat(const std::string& path);
 // Atomically replace `dst` with `src` (src disappears). Must work while `dst` is open by this process
 // with share-delete semantics. Windows: POSIX-semantics rename (FileRenameInfoEx) so existing handles
@@ -58,8 +69,26 @@ bool os_read_whole(const std::string& path, std::string& out, std::string* err =
 bool os_write_whole_atomic(const std::string& path, const void* data, size_t len, std::string* err = nullptr);
 bool os_same_file(const std::string& a, const std::string& b);  // both exist and are the same file
 std::string os_absolute_path(const std::string& p);            // absolute + lexically normalised
+// If `p` is a symbolic link (possibly chained), the path of the file it finally points to;
+// otherwise `p` unchanged. Saves replace that file instead of the link itself.
+std::string os_resolve_symlinks(const std::string& p);
 // POSIX: copy permission bits from `from` to `to` (used when a save replaces a file). Windows: no-op.
 bool os_copy_permissions(const std::string& from, const std::string& to);
+
+// Exclusive inter-process lock on `path` (created if missing), held until the object is destroyed
+// and released by the OS if the process dies. Returns null if it cannot be taken; *held_elsewhere
+// tells whether that is because someone else holds it (vs. e.g. an unsupported filesystem).
+class OsLock {
+public:
+    static std::unique_ptr<OsLock> acquire(const std::string& path, bool* held_elsewhere = nullptr);
+    ~OsLock();
+    OsLock(const OsLock&) = delete;
+    OsLock& operator=(const OsLock&) = delete;
+
+private:
+    OsLock() = default;
+    intptr_t h_ = -1;
+};
 
 std::string path_join(const std::string& a, const std::string& b);
 std::string path_filename(const std::string& p);   // "c:/x/y.bin" -> "y.bin"

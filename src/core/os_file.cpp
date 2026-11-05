@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -70,6 +71,84 @@ std::wstring win_path(const std::string& p) {
 }
 
 HANDLE as_handle(intptr_t h) { return reinterpret_cast<HANDLE>(h); }
+
+// "\\.\PhysicalDrive0", "\\.\C:" ...: raw disks/volumes need sector-aligned I/O and have no
+// meaningful file attributes.
+bool is_device_path(const std::string& p) {
+    auto sep = [](char c) { return c == '\\' || c == '/'; };
+    return p.size() >= 4 && sep(p[0]) && sep(p[1]) && p[2] == '.' && sep(p[3]);
+}
+
+// Plain positional ReadFile/WriteFile loop (1 GiB per call). Returns bytes transferred (short only
+// at EOF for reads), -1 on error.
+int64_t raw_io(HANDLE h, uint64_t offset, uint8_t* buf, size_t len, bool write) {
+    size_t done = 0;
+    while (done < len) {
+        DWORD chunk = DWORD(std::min<size_t>(len - done, 0x40000000u));
+        OVERLAPPED ov{};
+        uint64_t pos = offset + done;
+        ov.Offset = DWORD(pos & 0xFFFFFFFFu);
+        ov.OffsetHigh = DWORD(pos >> 32);
+        DWORD n = 0;
+        BOOL ok = write ? WriteFile(h, buf + done, chunk, &n, &ov) : ReadFile(h, buf + done, chunk, &n, &ov);
+        if (!ok) {
+            if (!write && GetLastError() == ERROR_HANDLE_EOF) break;
+            return -1;
+        }
+        if (n == 0) {
+            if (write) return -1;
+            break;
+        }
+        done += n;
+    }
+    return int64_t(done);
+}
+
+// Raw disk handles only accept sector-aligned offsets, lengths and buffers: bounce every request
+// through a page-aligned buffer (read-modify-write for writes). 4096 is a multiple of every common
+// sector size; the end is clamped to the device size, which is a multiple of 512.
+constexpr uint64_t kDevAlign = 4096;
+constexpr size_t kDevBounce = 1u << 20;
+
+int64_t device_io(HANDLE h, uint64_t dev_size, uint64_t offset, uint8_t* buf, size_t len, bool write) {
+    const uint64_t end = offset + len;
+    const uint64_t a = offset & ~(kDevAlign - 1);
+    uint64_t ae = (end + kDevAlign - 1) & ~(kDevAlign - 1);
+    if (dev_size && ae > dev_size) ae = std::max<uint64_t>((end + 511) & ~uint64_t(511), dev_size);
+    void* mem = VirtualAlloc(nullptr, kDevBounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem) return -1;
+    uint8_t* bounce = static_cast<uint8_t*>(mem);
+    int64_t result = 0;
+    for (uint64_t pos = a; pos < ae;) {
+        size_t n = size_t(std::min<uint64_t>(kDevBounce, ae - pos));
+        int64_t got = raw_io(h, pos, bounce, n, false);
+        if (got < 0) {
+            result = -1;
+            break;
+        }
+        // The part of [offset, end) this block covers (as far as it could be read).
+        uint64_t s = std::max(pos, offset), t = std::min(pos + uint64_t(got), end);
+        if (write) {
+            if (size_t(got) < n && pos + uint64_t(got) < std::min<uint64_t>(pos + n, end)) {
+                result = -1;  // would write past the device end
+                break;
+            }
+            n = size_t(got);
+            std::memcpy(bounce + (s - pos), buf + (s - offset), size_t(t - s));
+            if (raw_io(h, pos, bounce, n, true) != int64_t(n)) {
+                result = -1;
+                break;
+            }
+        } else if (t > s) {
+            std::memcpy(buf + (s - offset), bounce + (s - pos), size_t(t - s));
+        }
+        if (t > s) result = int64_t(t - offset);
+        if (size_t(got) < size_t(std::min<uint64_t>(kDevBounce, ae - pos))) break;  // EOF
+        pos += n;
+    }
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return result;
+}
 #else
 std::string posix_error(int e) { return std::strerror(e); }
 #endif
@@ -150,6 +229,7 @@ std::unique_ptr<OsFile> OsFile::open(const std::string& path, Mode mode, std::st
     }
     std::unique_ptr<OsFile> f(new OsFile());
     f->h_ = reinterpret_cast<intptr_t>(h);
+    f->device_ = is_device_path(path);
     return f;
 }
 
@@ -171,39 +251,14 @@ uint64_t OsFile::size() const {
 
 int64_t OsFile::read_at(uint64_t offset, void* dst, size_t len) const {
     uint8_t* out = static_cast<uint8_t*>(dst);
-    size_t done = 0;
-    while (done < len) {
-        DWORD chunk = DWORD(std::min<size_t>(len - done, 0x40000000u));  // 1 GiB per call
-        OVERLAPPED ov{};
-        uint64_t pos = offset + done;
-        ov.Offset = DWORD(pos & 0xFFFFFFFFu);
-        ov.OffsetHigh = DWORD(pos >> 32);
-        DWORD got = 0;
-        if (!ReadFile(as_handle(h_), out + done, chunk, &got, &ov)) {
-            DWORD e = GetLastError();
-            if (e == ERROR_HANDLE_EOF) break;
-            return -1;
-        }
-        if (got == 0) break;
-        done += got;
-    }
-    return int64_t(done);
+    if (device_ && len) return device_io(as_handle(h_), size(), offset, out, len, false);
+    return raw_io(as_handle(h_), offset, out, len, false);
 }
 
 bool OsFile::write_at(uint64_t offset, const void* src, size_t len) {
-    const uint8_t* in = static_cast<const uint8_t*>(src);
-    size_t done = 0;
-    while (done < len) {
-        DWORD chunk = DWORD(std::min<size_t>(len - done, 0x40000000u));
-        OVERLAPPED ov{};
-        uint64_t pos = offset + done;
-        ov.Offset = DWORD(pos & 0xFFFFFFFFu);
-        ov.OffsetHigh = DWORD(pos >> 32);
-        DWORD put = 0;
-        if (!WriteFile(as_handle(h_), in + done, chunk, &put, &ov) || put == 0) return false;
-        done += put;
-    }
-    return true;
+    uint8_t* in = static_cast<uint8_t*>(const_cast<void*>(src));  // only read from when writing
+    if (device_ && len) return device_io(as_handle(h_), size(), offset, in, len, true) == int64_t(len);
+    return raw_io(as_handle(h_), offset, in, len, true) == int64_t(len);
 }
 
 bool OsFile::truncate(uint64_t new_size) {
@@ -313,20 +368,52 @@ bool OsFile::flush() {
 FileStat os_stat(const std::string& path) {
     FileStat st;
 #ifdef _WIN32
+    const std::wstring wp = win_path(path);
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    auto to_ns = [](const FILETIME& t) {  // 100 ns ticks since 1601 -> ns since 1970
+        int64_t ft = int64_t((uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime);
+        return (ft - 116444736000000000LL) * 100;
+    };
+    if (is_device_path(path)) {
+        HANDLE h = CreateFileW(wp.c_str(), 0, share, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return st;
+        CloseHandle(h);
+        st.exists = st.is_device = true;
+        return st;
+    }
+    // Through a handle, so symlinks are followed and the file identity is known. FILE_READ_ATTRIBUTES
+    // does not conflict with other processes' share modes.
+    HANDLE h = CreateFileW(wp.c_str(), FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        BY_HANDLE_FILE_INFORMATION fi{};
+        BOOL ok = GetFileInformationByHandle(h, &fi);
+        CloseHandle(h);
+        if (ok) {
+            st.exists = true;
+            st.is_dir = (fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            st.size = (uint64_t(fi.nFileSizeHigh) << 32) | fi.nFileSizeLow;
+            st.mtime_ns = to_ns(fi.ftLastWriteTime);
+            st.dev = fi.dwVolumeSerialNumber;
+            st.ino = (uint64_t(fi.nFileIndexHigh) << 32) | fi.nFileIndexLow;
+            return st;
+        }
+    }
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(win_path(path).c_str(), GetFileExInfoStandard, &data)) return st;
+    if (!GetFileAttributesExW(wp.c_str(), GetFileExInfoStandard, &data)) return st;
     st.exists = true;
     st.is_dir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     st.size = (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    int64_t ft = int64_t((uint64_t(data.ftLastWriteTime.dwHighDateTime) << 32) |
-                         data.ftLastWriteTime.dwLowDateTime);
-    st.mtime_ns = (ft - 116444736000000000LL) * 100;  // 100 ns ticks since 1601 -> ns since 1970
+    st.mtime_ns = to_ns(data.ftLastWriteTime);
 #else
     struct stat s {};
     if (::stat(path.c_str(), &s) != 0) return st;
     st.exists = true;
     st.is_dir = S_ISDIR(s.st_mode);
+    st.is_device = S_ISBLK(s.st_mode) || S_ISCHR(s.st_mode);
     st.size = uint64_t(s.st_size);
+    st.dev = uint64_t(s.st_dev);
+    st.ino = uint64_t(s.st_ino);
 #ifdef __APPLE__
     st.mtime_ns = int64_t(s.st_mtimespec.tv_sec) * 1000000000LL + s.st_mtimespec.tv_nsec;
 #else
@@ -592,6 +679,20 @@ std::string os_absolute_path(const std::string& p) {
     return from_fs(abs.lexically_normal());
 }
 
+std::string os_resolve_symlinks(const std::string& p) {
+    if (p.empty()) return p;
+    std::error_code ec;
+    fs::path cur = to_fs(p);
+    bool changed = false;
+    for (int hop = 0; hop < 40 && fs::is_symlink(cur, ec) && !ec; ++hop) {
+        fs::path target = fs::read_symlink(cur, ec);
+        if (ec || target.empty()) break;
+        cur = target.is_absolute() ? target : cur.parent_path() / target;
+        changed = true;
+    }
+    return changed ? from_fs(cur.lexically_normal()) : p;
+}
+
 bool os_copy_permissions(const std::string& from, const std::string& to) {
 #ifdef _WIN32
     (void)from;
@@ -601,6 +702,50 @@ bool os_copy_permissions(const std::string& from, const std::string& to) {
     struct stat s {};
     if (::stat(from.c_str(), &s) != 0) return false;
     return ::chmod(to.c_str(), s.st_mode & 07777) == 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// OsLock
+// ---------------------------------------------------------------------------------------------
+std::unique_ptr<OsLock> OsLock::acquire(const std::string& path, bool* held_elsewhere) {
+    if (held_elsewhere) *held_elsewhere = false;
+#ifdef _WIN32
+    HANDLE h = CreateFileW(win_path(path).c_str(), GENERIC_READ | GENERIC_WRITE, 0 /* exclusive */, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (held_elsewhere) *held_elsewhere = GetLastError() == ERROR_SHARING_VIOLATION;
+        return nullptr;
+    }
+    std::unique_ptr<OsLock> l(new OsLock());
+    l->h_ = reinterpret_cast<intptr_t>(h);
+    return l;
+#else
+    int fd;
+    do {
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) return nullptr;
+    int r;
+    do {
+        r = ::flock(fd, LOCK_EX | LOCK_NB);
+    } while (r != 0 && errno == EINTR);
+    if (r != 0) {
+        if (held_elsewhere) *held_elsewhere = errno == EWOULDBLOCK || errno == EAGAIN;
+        ::close(fd);
+        return nullptr;
+    }
+    std::unique_ptr<OsLock> l(new OsLock());
+    l->h_ = fd;
+    return l;
+#endif
+}
+
+OsLock::~OsLock() {
+#ifdef _WIN32
+    if (h_ != -1) CloseHandle(as_handle(h_));
+#else
+    if (h_ != -1) ::close(int(h_));  // releases the flock
 #endif
 }
 

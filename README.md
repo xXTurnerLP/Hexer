@@ -40,7 +40,7 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   parsers and recent files.
 - **Lua console** (REPL), script commands, and hot reload: save a `.lua` file and it reloads.
 - Tabs, drag and drop, recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
-  banner when the file changes on disk, a read-only mode, and zoom (`Ctrl +/-`, `Ctrl+wheel`).
+  banner when the file changes on disk, a read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
 
 ## Building
 
@@ -111,14 +111,14 @@ hexer [options] [files...]
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` or `Ctrl+Shift+Z` | Redo |
-| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Cut / copy / paste |
-| `Ctrl+Shift+C` | Copy as (hex, C array, Python, Base64, escaped) |
+| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Cut / copy / paste (in overwrite mode a paste overwrites from the selection start and keeps the size) |
+| `Ctrl+Shift+C` | Copy as (hex, C array, Python, Base64, escaped; `1`-`7` picks a format) |
 | `Ctrl+A` | Select all |
 | `Ins` | Toggle insert / overwrite |
-| `Delete` / `Backspace` | Delete the selection or byte (`Backspace` only moves left in overwrite mode) |
+| `Delete` / `Backspace` | Delete the selection, else the byte at / before the cursor (without a selection, `Backspace` only moves left in overwrite mode) |
 | `Tab` | Switch between the hex and text columns |
 | Arrows, `PgUp` / `PgDn` | Move the cursor (hold `Shift` to select) |
-| `Home` / `End` | Start / end of row |
+| `Home` / `End` | Start / end of row (`Shift+End` selects to the end of the row) |
 | `Ctrl+Home` / `Ctrl+End` | Start / end of file |
 | `Ctrl+Up` / `Ctrl+Down` | Scroll without moving the cursor |
 | `Ctrl+F` | Find bar (`Enter` next, `Shift+Enter` previous, `Esc` closes) |
@@ -128,7 +128,7 @@ hexer [options] [files...]
 | `F2` / `Shift+F2` | Next / previous bookmark |
 | `Ctrl+Shift+P` | Command palette |
 | `F5` | Re-parse structure |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Zoom in / out / reset |
+| `Ctrl+=` or `Ctrl++` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Zoom in / out / reset |
 | `Ctrl+L` (in the console) | Clear console |
 
 Mouse: click and drag to select, `Shift+click` extends the selection, double-click selects the
@@ -145,6 +145,8 @@ after each change, so a crash loses almost nothing. The next launch restores eve
   original bytes from the file on disk.
 - If a file changed on disk in the meantime, Hexer warns you. If a file is gone but the session
   still has every byte the document needs, it comes back as a "(recovered)" untitled tab.
+- If the session cannot be written (e.g. the disk is full), quitting asks Save / Discard / Cancel
+  for the unsaved documents instead of losing them.
 - Closing a single **tab** with unsaved changes still asks Save / Discard / Cancel. A discarded
   tab can be brought back with `Ctrl+Shift+T` until you quit.
 - `<config>` is `%APPDATA%\Hexer` on Windows and `~/.config/hexer` on Linux (or

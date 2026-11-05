@@ -38,10 +38,12 @@ struct HexViewEvents {
 // One instance per open tab (keeps drag/scrollbar interaction state).
 //
 // Input handled by the view while focused (everything else - copy/paste/undo/find/goto - is the
-// app's job): arrows, PgUp/PgDn, Home/End (row), Ctrl+Home/End (file), Shift+nav extends selection,
+// app's job): arrows, PgUp/PgDn, Home/End (row: End puts the caret on the row's last byte,
+// Shift+End selects through it), Ctrl+Home/End (file), Shift+nav extends selection,
 // Tab switches hex/text column, typing 0-9a-f (hex column) or printable chars (text column) edits
-// (overwrite or insert per config; read-only docs ignore typing), Backspace/Delete remove bytes
-// (selection first) in insert mode and when a selection exists, mouse click/drag selects,
+// (overwrite or insert per config; read-only docs ignore typing), Delete removes the selection or
+// the byte at the caret in both modes, Backspace removes the selection, else the previous byte in
+// insert mode (in overwrite mode it only moves left), mouse click/drag selects,
 // Shift+click extends, double-click selects the highlight (field) under the mouse, wheel scrolls
 // 3 rows (Ctrl+wheel is left to the app for zoom), dragging the custom scrollbar maps linearly to
 // the 64-bit row range.

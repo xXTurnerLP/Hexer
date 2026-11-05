@@ -67,6 +67,9 @@ Script commands can be driven from `--exec` with `hx.run("<command name>")`.
 - Tests: add doctest cases for any core/util/script behaviour you change. Use temp dirs, never the
   real user config dir (`paths::set_config_dir_override`).
 - Commit messages: imperative, short subject; mention the module (`core:`, `ui:`, `script:`).
+- Commit regularly at meaningful milestones (a feature or fix round lands, tests green, before a risky
+  refactor) to keep a readable timeline — not every small edit. Only commit a building, test-passing
+  tree; in parallel sessions commit only your own files (`git add <paths>`, never `git add -A` blindly).
 
 ## Roadmap
 See `TODO.md`.

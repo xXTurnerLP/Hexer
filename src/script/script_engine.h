@@ -7,7 +7,10 @@
 // shared Lua state. Any change to any of those files triggers a full reload (fresh state).
 // Subfolders are scanned too (sorted by relative path), except <dir>/lib/: files there are
 // modules for require("name") (package.path includes <dir>/lib/?.lua) and are not run directly.
-// os.exit and io.read are disabled (no killing the editor, no stdin).
+// os.exit and stdin are disabled (no killing the editor): io.read, io.lines(), io.stdin:read,
+// io.input():read, loadfile() and dofile() without a file name raise. File names passed to
+// io.open/io.lines/loadfile/dofile/require are UTF-8, also on Windows.
+// __gc finalizers set through setmetatable run under a 1 s limit each (also at reload / exit).
 // Global table `hexer` (also aliased as `hx`):
 //
 //   hx.version                          "0.1.0"
@@ -15,7 +18,8 @@
 //   hx.command{ name=, description=, run=function(doc) }   -- shown in palette + Scripts menu
 //   hx.run(name)                        -- run a registered command (as the palette does)
 //   print(...) / hx.log(...) / hx.warn(...) / hx.error(...)  -- to the console; tables pretty-printed
-//   hx.inspect(v) -> string            -- pretty-printer used by print
+//   hx.inspect(v, depth?) -> string    -- pretty-printer used by print (depth 1..64, default 6;
+//                                         output stops at ~1 MiB of keys/values)
 //   hx.clear_console()
 //   hx.doc() -> active Doc or nil
 //   hx.new_doc(name, bytes) -> Doc     -- open bytes (e.g. a serialized packet) in a new tab
@@ -33,7 +37,8 @@
 //       u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)  -> number (nil past EOF)
 //       (also u24le/u24be/i24le/i24be)
 //   doc:write(off, bytes)   doc:insert(off, bytes)   doc:erase(off, len)   doc:replace(off, len, bytes)
-//   doc:transaction(fn, label?)          -- all edits inside fn become ONE undo step
+//   doc:transaction(fn, label?)          -- all edits inside fn become ONE undo step (label is
+//                                           ignored inside a command: it already is one step)
 //   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:goto(off)
 //       (`goto` is a Lua keyword: write doc:jump(off), the same function, or doc["goto"](doc, off))
 //   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")
@@ -46,6 +51,7 @@
 //     p:u8/i8/u16/i16/u24/i24/u32/i32/u64/i64/f32/f64(name, opts?)  (+ "le"/"be" suffixed variants,
 //                                                                 e.g. p:u32be("length"))
 //     p:read(fmt, name, opts?)          -- any string.unpack format, e.g. p:read(">I3", "len24")
+//                                          (variable-length values such as s4 / z: up to 16 MiB)
 //     p:bytes(name, n, opts?) -> string|nil  (returns the bytes when n <= 64 KiB, else nil)
 //     p:str(name, n, opts?) -> string       p:cstr(name, opts?) -> string (NUL-terminated, max 64 KiB)
 //     p:uleb(name, opts?) / p:sleb(name, opts?)  -- LEB128 varints
@@ -61,7 +67,8 @@
 //          (enum may also be written name->value: {HELLO=1}; a struct's color is inherited by its
 //           fields that have no color of their own)
 //   Numeric fields (typed readers / p:read) are EDITABLE in the Structure panel: the new value is
-//   encoded with the field's own pack format and written back (enum names accepted).
+//   range-checked, encoded with the field's own pack format and written back (enum names, char
+//   literals like 'IHDR', and hex/bin bit patterns for signed fields accepted).
 //   Limits: 200,000 fields; a parse is aborted after ~2 s (instruction-count hook) - the partial
 //   tree is kept and the error (with script file:line) is shown in the console.
 //
@@ -69,6 +76,7 @@
 // Predefined each time: `doc` (active Doc or nil), `cur` (cursor), `sel` = {start=, len=}.
 // A command's edits to the active document form ONE undo step ("Script: <name>"). Script load,
 // commands and console lines are stopped after 10 s, detect() after 1 s (same hook as parse).
+// The time limit cannot be caught: once it fires, every further Lua instruction raises again.
 // ===========================================================================================
 #include <cstdint>
 #include <deque>

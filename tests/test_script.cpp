@@ -1318,3 +1318,200 @@ TEST_CASE("identical parse errors are logged once until reload") {
     fx.eng.parse(*d, "bad");
     CHECK(fx.errors() > n);
 }
+
+TEST_CASE("time limit is sticky: pcall / coroutine loops cannot swallow it") {
+    Fixture fx;
+    fx.load(R"LUA(
+hx.parser { name = "pcall loop", parse = function(p)
+    p:u8("before")
+    while true do pcall(function() while true do end end) end
+end }
+hx.parser { name = "xpcall loop", parse = function(p)
+    while true do xpcall(function() while true do end end, function(e) return e end) end
+end }
+hx.parser { name = "coroutine loop", parse = function(p)
+    while true do
+        coroutine.resume(coroutine.create(function() while true do end end))
+        pcall(coroutine.wrap(function() while true do end end))
+    end
+end }
+)LUA");
+    Document* d = fx.host.add("abc");
+    for (const char* name : {"pcall loop", "xpcall loop", "coroutine loop"}) {
+        INFO(name);
+        auto t0 = std::chrono::steady_clock::now();
+        ParseResult r = fx.eng.parse(*d, name);
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(s < 6.0);
+        CHECK(r.error.find("time limit") != std::string::npos);
+    }
+    // The flag is cleared afterwards: normal code (incl. pcall) runs to completion again.
+    fx.eng.exec("local s = 0 for i = 1, 1000000 do s = s + i end return select(2, pcall(function() return s end))");
+    CHECK(fx.last_result() == "500000500000 (0x746A5A2920)");
+}
+
+TEST_CASE("__gc finalizers run under a time limit (also when the state is closed)") {
+    Fixture fx;
+    fx.load("");
+    fx.eng.exec("setmetatable({}, { __gc = function() gc_ran = (gc_ran or 0) + 1 end }) collectgarbage() collectgarbage()");
+    fx.eng.exec("gc_ran");
+    CHECK(fx.last_result() == "1");
+
+    auto t0 = std::chrono::steady_clock::now();
+    fx.eng.exec("setmetatable({}, { __gc = function() while true do end end }) collectgarbage() collectgarbage() return 7");
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(s < 5.0);
+    CHECK(fx.last_result() == "7");  // the console line itself was not timed out
+    CHECK(fx.console_has("error in __gc", ConsoleLine::Warn));
+    CHECK(fx.console_has("time limit", ConsoleLine::Warn));
+
+    // A looping finalizer that is still pending when the state closes (reload / exit).
+    fx.eng.exec("keep = debug.setmetatable({}, { __gc = function() while true do end end })");
+    t0 = std::chrono::steady_clock::now();
+    fx.eng.reload();
+    s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(s < 5.0);
+    fx.eng.exec("1 + 1");
+    CHECK(fx.last_result() == "2");
+}
+
+TEST_CASE("hx.inspect: depth is clamped and total output is bounded") {
+    Fixture fx;
+    fx.load("");
+    // Deep chain with a huge depth: used to recurse until the C++ stack overflowed.
+    fx.eng.exec("local t = {} local c = t for i = 1, 100000 do c.x = {} c = c.x end "
+                "local s = hx.inspect(t, 1000000) return #s < 100000, s:find('{...}', 1, true) ~= nil");
+    CHECK(fx.eng.console()[fx.eng.console().size() - 2].text == "true");
+    CHECK(fx.last_result() == "true");
+    CHECK(fx.errors() == 0);
+    // Shared subtables (40^5 leaf entries when expanded): stops at the budget instead of running ~40 s.
+    auto t0 = std::chrono::steady_clock::now();
+    fx.eng.exec("local leaf = {} for i = 1, 40 do leaf[i] = i end local t = leaf "
+                "for l = 1, 4 do local n = {} for i = 1, 40 do n[i] = t end t = n end "
+                "local s = hx.inspect(t) return #s < 64 * 1024 * 1024, s:find('more entries', 1, true) ~= nil");
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(s < 5.0);
+    CHECK(fx.errors() == 0);
+    CHECK(fx.eng.console()[fx.eng.console().size() - 2].text == "true");
+    CHECK(fx.last_result() == "true");
+}
+
+TEST_CASE("stdin is unreachable: io.lines(), io.stdin, io.input(), loadfile(), dofile()") {
+    Fixture fx;
+    fx.load("");
+    for (const char* code : {"io.read('l')", "io.lines()", "for l in io.lines() do end", "io.stdin:read('l')",
+                             "io.input():read('l')", "dofile()", "assert(loadfile())"}) {
+        INFO(code);
+        int before = fx.errors();
+        fx.eng.exec(code);
+        CHECK(fx.errors() > before);
+    }
+    CHECK(fx.console_has("io.lines: there is no stdin", ConsoleLine::Error));
+    CHECK(fx.console_has("loadfile: there is no stdin", ConsoleLine::Error));
+    // Files still work.
+    fx.dir.write("data.txt", "one\ntwo\n");
+    fx.eng.exec("local n = 0 for l in io.lines(" + std::string("'") + fx.dir.str() + "/data.txt') do n = n + 1 end return n");
+    CHECK(fx.last_result() == "2");
+}
+
+TEST_CASE("UTF-8 paths: require from a non-ASCII scripts dir, io.open, loadfile, dofile, io.lines") {
+    Fixture fx;
+    const std::string sub = "cfg\xC3\xA9";  // "cfgé" (UTF-8)
+    fs::path root = fx.dir.path / fs::path(std::u8string(sub.begin(), sub.end()));
+    fs::create_directories(root / "lib");
+    {
+        std::ofstream(root / "lib" / "mymod.lua", std::ios::binary) << "return { v = 42 }";
+        std::ofstream(root / "main.lua", std::ios::binary) << "mod_v = require('mymod').v";
+        std::ofstream(root / "chunk.txt", std::ios::binary) << "#!shebang\nreturn ...";
+        std::ofstream(root / "lines.txt", std::ios::binary) << "a\nb\nc\n";
+    }
+    std::string rs = fx.dir.str() + "/" + sub;
+    fx.eng.set_script_dirs({rs});
+    fx.eng.reload();
+    CHECK(fx.errors() == 0);
+    fx.eng.exec("mod_v");
+    CHECK(fx.last_result() == "42 (0x2A)");
+    fx.eng.exec("root = '" + rs + "'");
+    fx.eng.exec("assert(loadfile(root .. '/chunk.txt'))(5)");
+    CHECK(fx.last_result() == "5");
+    fx.eng.exec("dofile(root .. '/chunk.txt')");
+    CHECK(fx.errors() == 0);
+    fx.eng.exec("local n = 0 for l in io.lines(root .. '/lines.txt') do n = n + 1 end return n");
+    CHECK(fx.last_result() == "3");
+    fx.eng.exec("local f = assert(io.open(root .. '/out\xC3\xA9.txt', 'wb')) f:write('xyz') f:close() "
+                "local g = assert(io.open(root .. '/out\xC3\xA9.txt', 'rb')) local s = g:read('a') g:close() return s");
+    CHECK(fx.last_result() == "\"xyz\"");
+    CHECK(fs::exists(root / fs::path(u8"outé.txt")));
+    fx.eng.exec("select(2, pcall(require, 'nope'))");
+    CHECK(fx.last_result().find("no file '") != std::string::npos);
+    fx.eng.exec("(io.open(root .. '/missing.txt'))");
+    CHECK(fx.last_result() == "nil");
+    CHECK(fx.errors() == 0);
+}
+
+TEST_CASE("edit_field: every fmt round-trips its own display text; char literals; f32 range") {
+    Fixture fx;
+    fx.load(R"LUA(
+hx.parser { name = "fmts", parse = function(p)
+    p:endian("be")
+    p:u32("plain")
+    p:u32("hex", { fmt = "hex" })
+    p:u32("dec", { fmt = "dec" })
+    p:u32("bin", { fmt = "bin" })
+    p:u32("tag", { fmt = "char" })
+    p:u32("kind", { enum = { [3] = "THREE" } })
+    p:i8("neg_hex", { fmt = "hex" })
+    p:i16("neg_bin", { fmt = "bin" })
+    p:i16("neg_char", { fmt = "char" })
+    p:f32("flt")
+end }
+)LUA");
+    std::string data = be32(13) + be32(0xDEADBEEF) + be32(7) + be32(5) + "IHDR" + be32(3) + "\xFF" +
+                       std::string("\xFF\xFE", 2) + std::string("\xFF\x01", 2) + std::string("\x3F\xC0\x00\x00", 4);
+    Document* d = fx.host.add(data);
+    ParseResult r = fx.eng.parse(*d, "fmts");
+    REQUIRE(r.error.empty());
+    CHECK(fld(r, "tag").value == "'IHDR' (1229472850)");
+    std::string err;
+    for (const char* name : {"plain", "hex", "dec", "bin", "tag", "kind", "neg_hex", "neg_bin", "neg_char", "flt"}) {
+        INFO(name, " = ", fld(r, name).value);
+        CHECK(fx.eng.edit_field(*d, fld(r, name), fld(r, name).value, &err));
+        INFO(err);
+        CHECK(bytes_of(*d) == data);
+    }
+    REQUIRE(fx.eng.edit_field(*d, fld(r, "tag"), "'ABCD'", &err));
+    CHECK(bytes_of(*d).substr(16, 4) == "ABCD");
+    REQUIRE(fx.eng.edit_field(*d, fld(r, "tag"), "'\\x01\\n'", &err));  // short literal: low bytes
+    CHECK(bytes_of(*d).substr(16, 4) == std::string("\0\0\x01\n", 4));
+    CHECK_FALSE(fx.eng.edit_field(*d, fld(r, "tag"), "'ABCDE'", &err));
+    CHECK(err.find("char literal") != std::string::npos);
+    CHECK_FALSE(fx.eng.edit_field(*d, fld(r, "neg_hex"), "0x100", &err));  // still range-checked
+
+    CHECK_FALSE(fx.eng.edit_field(*d, fld(r, "flt"), "1e39", &err));
+    CHECK(err.find("out of range for f32") != std::string::npos);
+    CHECK(fx.eng.edit_field(*d, fld(r, "flt"), "-3e38", &err));
+    CHECK(fx.eng.edit_field(*d, fld(r, "flt"), "inf", &err));
+    CHECK(fld(fx.eng.parse(*d, "fmts"), "flt").value == "inf");
+}
+
+TEST_CASE("p:read: variable-length formats longer than 64 KiB") {
+    Fixture fx;
+    fx.load(R"LUA(
+hx.parser { name = "blob", parse = function(p)
+    local s = p:read("<s4", "blob")
+    blob_len = #s
+    local z = p:read("z", "text")
+    z_len = #z
+    p:read("<s4", "short")
+end }
+)LUA");
+    std::string data = std::string("\x70\x11\x01\x00", 4) + std::string(70000, 'a') + std::string(70000, 'b') +
+                       std::string(1, '\0') + std::string("\x10\x00\x00\x00", 4) + "abc";
+    Document* d = fx.host.add(data);
+    ParseResult r = fx.eng.parse(*d, "blob");
+    CHECK(fld(r, "blob").size == 70004);
+    CHECK(fld(r, "text").size == 70001);
+    fx.eng.exec("blob_len, z_len");
+    CHECK(fx.console_has("70000 (0x11170)", ConsoleLine::Result));
+    CHECK(r.error.find("read past end of data") != std::string::npos);  // a real EOF is still reported
+}
