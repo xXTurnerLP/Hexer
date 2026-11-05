@@ -20,6 +20,9 @@ core_lib = static_library('hexer_core',
   'core/bitmap.cpp',         # bytes -> pixels (bitmap view)
   'core/diff.cpp',           # compare two documents
   'core/pcap.cpp',           # pcap/pcapng packet index
+  'core/procmem.cpp',        # process memory as a byte source
+  'core/devices.cpp',        # enumerate processes / disks
+  'core/xorscan.cpp',        # XOR / ADD / ROL brute force
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [threads_dep],
@@ -60,6 +63,9 @@ ui_lib = static_library('hexer_ui',
   'ui/panel_bitmap.cpp',
   'ui/view_diff.cpp',
   'ui/panel_packets.cpp',
+  'ui/dialog_targets.cpp',
+  'ui/panel_history.cpp',
+  'ui/panel_xor.cpp',
   include_directories : inc,
   cpp_args : conf_args,
   link_with : ui_view_lib,
