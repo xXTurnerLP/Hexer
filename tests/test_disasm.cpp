@@ -4,17 +4,22 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "core/disasm.h"
 #include "core/document.h"
 #include "core/exe_map.h"
+#include "core/session.h"
+#include "core/symbols.h"
 #include "imgui.h"
 #include "script/script_engine.h"
 #include "ui/panel_disasm.h"
+#include "symbol_fixture.h"
 
 using namespace hx;
 
@@ -655,14 +660,20 @@ struct PanelUi {
     uint64_t sel_off = 0, sel_len = 0, jump_off = 0;
     float w = 900.0f, h = 600.0f;
 
-    explicit PanelUi(const Bytes& data) {
+    explicit PanelUi(const Bytes& data) : PanelUi(Document::create_from_bytes("code", data.data(), data.size())) {}
+    // `restore`: Follow cursor off + the document's "disasm.*" extras before the first draw.
+    explicit PanelUi(std::unique_ptr<Document> d, bool restore = false) {
         ctx = ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         io.LogFilename = nullptr;
         io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
         io.Fonts->AddFontDefault();
-        doc = Document::create_from_bytes("code", data.data(), data.size());
+        doc = std::move(d);
+        if (restore) {
+            panel.follow = false;
+            panel.restore_extras(*doc);
+        }
         // The host's callbacks, like the app's: select moves the caret / selection, jump too.
         cb.select = [this](uint64_t off, uint64_t len) {
             ++selects;
@@ -731,6 +742,17 @@ struct PanelUi {
         frame();
         frame();
     }
+    void key(ImGuiKey k) {
+        ImGui::GetIO().AddKeyEvent(k, true);
+        frame();
+        ImGui::GetIO().AddKeyEvent(k, false);
+        frame();
+    }
+    void type(const char* s) {
+        ImGui::GetIO().AddInputCharactersUTF8(s);
+        frame();
+    }
+    std::vector<std::string> lines() const { return panel.listing_lines(doc->id()); }
 };
 }  // namespace
 
@@ -846,4 +868,250 @@ TEST_CASE("disasm panel: empty document") {
     PanelUi ui(Bytes{});
     CHECK(ui.rows().empty());
     CHECK(ui.panel.layer(ui.doc->id()) == nullptr);
+}
+
+// ---- symbols in the Disassembly panel (core/symbols.h) ----------------------------------------------
+
+TEST_CASE("disasm panel: symbol labels, IAT / branch annotations, clicks under label rows") {
+    PanelUi ui(symfix::make_pe());
+    const SymbolTable* syms = ui.panel.symbols(*ui.doc, true);
+    REQUIRE(syms);
+    CHECK(syms->symbols.size() == 5);
+    uint64_t off = 0;
+    REQUIRE(ui.panel.entry_offset(*ui.doc, off));
+    CHECK(off == 0x200);
+    ui.panel.show_at(*ui.doc, off, true);
+    ui.frame();
+    const std::vector<std::string> l = ui.lines();
+    REQUIRE(l.size() >= 12);
+    CHECK(l[0] == "test.dll!Alpha:");
+    CHECK(l[1] == "call qword ptr [rip+0x12fa]  ; KERNEL32.dll!GetProcAddress");
+    CHECK(l[2] == "ret");
+    CHECK(l[3] == "nop");
+    CHECK(l[8] == "test.dll!#6:");
+    CHECK(l[9] == "jmp 0x140001000  ; test.dll!Alpha");
+    CHECK(l[10] == "jnz 0x140001006  ; test.dll!Alpha+0x6");  // nearest symbol + offset
+    // Label rows take a row each: listed instruction 0 is drawn below "test.dll!Alpha:".
+    const std::vector<Insn> r = ui.rows();
+    REQUIRE(r.size() >= 8);
+    CHECK(r[0].offset == 0x200);
+    ui.click(ui.row(0));
+    CHECK(ui.sel_off == 0x200);
+    CHECK(ui.sel_len == 6);
+    ui.click(ui.row(7));  // the jmp (below the second label)
+    CHECK(ui.sel_off == 0x210);
+    CHECK(ui.sel_len == 2);
+    CHECK(ui.jumps == 0);
+    // Following the call's IAT slot (data in .rdata) still works.
+    CHECK(ui.panel.follow_at(*ui.doc, 0x200, ui.cb));
+    CHECK(ui.jump_off == 0x700);
+
+    // 32-bit: call dword ptr [abs] through the IAT.
+    PanelUi u32(symfix::make_pe(false));
+    REQUIRE(u32.panel.symbols(*u32.doc, true));
+    u32.panel.show_at(*u32.doc, 0x200, true);
+    u32.frame();
+    REQUIRE(u32.lines().size() > 2);
+    CHECK(u32.lines()[1] == "call dword ptr [0x402300]  ; KERNEL32.dll!GetProcAddress");
+}
+
+TEST_CASE("disasm panel: PageDown / PageUp skip no instruction when label rows take space") {
+    // Two labels (Alpha @ 0x200, #6 @ 0x210) on the first page: it lists two instructions fewer
+    // than it has rows, so paging by the row count would jump over instructions never shown.
+    PanelUi ui(symfix::make_pe());
+    REQUIRE(ui.panel.symbols(*ui.doc, true));
+    ui.panel.show_at(*ui.doc, 0x200, true);
+    ui.frame();
+    const std::vector<Insn> p1 = ui.rows();
+    REQUIRE(p1.size() > 10);
+    REQUIRE(ui.lines()[0] == "test.dll!Alpha:");
+    ui.key(ImGuiKey_PageDown);
+    const std::vector<Insn> p2 = ui.rows();
+    REQUIRE(!p2.empty());
+    CHECK(p2.front().offset > p1.front().offset);
+    CHECK(p2.front().offset <= p1.back().offset);  // overlaps the previous page: nothing skipped
+    ui.key(ImGuiKey_PageUp);
+    const std::vector<Insn> p3 = ui.rows();
+    REQUIRE(!p3.empty());
+    CHECK(p3.front().offset < p2.front().offset);
+    CHECK(p3.back().offset + p3.back().length >= p2.front().offset);  // reaches the old top
+
+    // PageUp onto a page that holds both labels (nops around the code so that decoding backwards
+    // is unambiguous): that page also ends at the old top instead of one instruction before it.
+    Bytes b = symfix::make_pe();
+    for (size_t i = 0x1C0; i < 0x200; ++i) b[i] = 0x90;
+    for (size_t i = 0x208; i < 0x210; ++i) b[i] = 0x90;
+    for (size_t i = 0x214; i < 0x400; ++i) b[i] = 0x90;
+    PanelUi nu(b);
+    REQUIRE(nu.panel.symbols(*nu.doc, true));
+    nu.panel.show_at(*nu.doc, 0x200, true);
+    nu.frame();
+    const std::vector<Insn> q1 = nu.rows();
+    REQUIRE(q1.size() > 10);
+    nu.panel.show_at(*nu.doc, q1.back().offset, true);
+    nu.frame();
+    const uint64_t top = nu.rows().front().offset;
+    nu.key(ImGuiKey_PageUp);
+    const std::vector<Insn> q2 = nu.rows();
+    REQUIRE(!q2.empty());
+    CHECK(q2.front().offset < top);
+    CHECK(q2.back().offset + q2.back().length >= top);
+    CHECK(q2.front().offset == 0x200);
+}
+
+TEST_CASE("disasm panel: ELF function labels, @plt / @got annotations") {
+    PanelUi ui(symfix::make_elf());
+    REQUIRE(ui.panel.symbols(*ui.doc, true));
+    ui.panel.show_at(*ui.doc, 0x200, true);
+    ui.frame();
+    const std::vector<std::string> l = ui.lines();
+    REQUIRE(l.size() >= 4);
+    CHECK(l[0] == "main:");
+    CHECK(l[1] == "call 0x400300  ; puts@plt");
+    CHECK(l[2] == "mov rax, qword ptr [rip+0x204]  ; puts@got");
+    CHECK(l[3] == "ret");
+    // The PLT stub itself is labelled.
+    ui.panel.show_at(*ui.doc, 0x300, true);
+    ui.frame();
+    REQUIRE(!ui.lines().empty());
+    CHECK(ui.lines()[0] == "puts@plt:");
+}
+
+TEST_CASE("disasm panel: Go to Symbol list filters and jumps") {
+    PanelUi ui(symfix::make_pe());
+    REQUIRE(ui.panel.symbols(*ui.doc, true));
+    ui.panel.open_symbol_list();
+    ui.frame();
+    ui.frame();
+    REQUIRE(ui.panel.symbol_list_open());
+    ui.type("TEST.dll");  // case-insensitive: Alpha, #6
+    ui.key(ImGuiKey_DownArrow);
+    ui.key(ImGuiKey_Enter);
+    CHECK_FALSE(ui.panel.symbol_list_open());
+    CHECK(ui.jumps == 1);
+    CHECK(ui.jump_off == 0x210);
+    REQUIRE(!ui.rows().empty());
+    CHECK(ui.rows().front().offset == 0x210);
+    CHECK(ui.lines()[0] == "test.dll!#6:");
+
+    ui.panel.open_symbol_list();
+    ui.frame();
+    ui.frame();
+    ui.type("messagebox");
+    ui.key(ImGuiKey_Enter);
+    CHECK(ui.jumps == 2);
+    CHECK(ui.jump_off == 0x740);  // the delay-load IAT slot
+
+    ui.panel.open_symbol_list();  // Escape closes without a jump
+    ui.frame();
+    ui.frame();
+    ui.key(ImGuiKey_Escape);
+    CHECK_FALSE(ui.panel.symbol_list_open());
+    CHECK(ui.jumps == 2);
+}
+
+TEST_CASE("disasm panel: symbols are rebuilt after an edit of the header tables") {
+    PanelUi ui(symfix::make_pe());
+    REQUIRE(ui.panel.symbols(*ui.doc, true));
+    CHECK(ui.panel.symbols(*ui.doc)->at(0x140001000ull)->name == "Alpha");
+    const uint8_t b = 'O';  // "Alpha" -> "Olpha" (.rdata RVA 0x2110 = file 0x510)
+    REQUIRE(ui.doc->overwrite(0x510, &b, 1));
+    const SymbolTable* t = ui.panel.symbols(*ui.doc, true);
+    REQUIRE(t);
+    CHECK(t->at(0x140001000ull)->name == "Olpha");
+}
+
+namespace {
+struct TmpDir {
+    std::filesystem::path dir;
+    TmpDir() {
+        std::random_device rd;
+        dir = std::filesystem::temp_directory_path() / ("hexer-test-disasm-" + std::to_string(rd()) + std::to_string(rd()));
+        std::filesystem::create_directories(dir);
+    }
+    ~TmpDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+}  // namespace
+
+TEST_CASE("disasm panel: map choice, manual base and pinned start survive a session round trip") {
+    TmpDir tmp;
+    const Bytes pe = symfix::make_pe();
+    {
+        auto doc = Document::create_from_bytes("code", pe.data(), pe.size());
+        DisasmPanel p;
+        p.save_extras(*doc);  // defaults: nothing stored
+        CHECK(doc->extras().empty());
+        p.set_map_choice(*doc, DisasmMapChoice::Manual, 0x8000);
+        p.show_at(*doc, 0x210, true);  // pins: Follow cursor off
+        p.save_extras(*doc);
+        CHECK(doc->extra("disasm.map") == "manual");
+        CHECK(doc->extra("disasm.base") == "8000");
+        CHECK(doc->extra("disasm.top") == "528");
+        Session s(tmp.dir.string());
+        REQUIRE(s.save({doc.get()}, 0));
+    }
+    Session s(tmp.dir.string());
+    auto r = s.load();
+    REQUIRE(r.docs.size() == 1);
+    PanelUi ui(std::move(r.docs[0]), true);
+    CHECK(ui.panel.address_map(*ui.doc).kind == AddressMap::Manual);
+    CHECK(ui.panel.address_map(*ui.doc).base == 0x8000);
+    REQUIRE(!ui.rows().empty());
+    CHECK(ui.rows().front().offset == 0x210);
+    CHECK(ui.rows().front().address == 0x8210);
+
+    // Following the caret again: no pinned start is stored; Auto erases the map keys.
+    ui.panel.follow = true;
+    ui.panel.set_map_choice(*ui.doc, DisasmMapChoice::Auto);
+    ui.panel.save_extras(*ui.doc);
+    CHECK(ui.doc->extras().empty());
+    ui.panel.set_map_choice(*ui.doc, DisasmMapChoice::None);
+    ui.panel.save_extras(*ui.doc);
+    CHECK(ui.doc->extra("disasm.map") == "none");
+}
+
+TEST_CASE("lua: doc:symbols") {
+    Host host;
+    host.doc = doc_of(symfix::make_pe());
+    ScriptEngine eng(&host);
+    eng.set_script_dirs({});
+    eng.reload();
+    std::string err;
+    CHECK(eng.run_source(R"(
+        local s = hx.doc():symbols()
+        assert(#s == 6, #s)
+        local by = {}
+        for _, x in ipairs(s) do by[(x.module ~= "" and x.module .. "!" or "") .. x.name] = x end
+        local a = by["test.dll!Alpha"]
+        assert(a.kind == "export" and a.address == 0x140001000 and a.offset == 0x200 and a.ordinal == 5)
+        local g = by["KERNEL32.dll!GetProcAddress"]
+        assert(g.kind == "import" and g.address == 0x140002300 and g.offset == 0x700 and g.ordinal == nil)
+        assert(by["KERNEL32.dll!#16"].ordinal == 16)
+        assert(by["USER32.dll!MessageBoxW"].address == 0x140002340)
+        local f = s[#s]
+        assert(f.name == "Fwd" and f.forward == "NTDLL.RtlFoo" and f.address == nil and f.offset == nil)
+        assert(f.kind == "export" and f.module == "test.dll" and f.ordinal == 8)
+        for i = 2, #s - 1 do assert(s[i - 1].address <= s[i].address) end
+    )", "symbols_pe", &err));
+    CHECK(err.empty());
+    if (!err.empty()) MESSAGE(err);
+
+    host.doc = doc_of(symfix::make_elf());
+    CHECK(eng.run_source(R"(
+        local s = hx.doc():symbols()
+        assert(#s == 7, #s)
+        assert(s[1].name == "main" and s[1].kind == "function" and s[1].module == "" and s[1].offset == 0x200)
+        local plt = 0
+        for _, x in ipairs(s) do if x.name:find("@plt$") then plt = plt + 1 end end
+        assert(plt == 2)
+    )", "symbols_elf", &err));
+    CHECK(err.empty());
+    if (!err.empty()) MESSAGE(err);
+
+    host.doc = doc_of(Bytes(64, 0x90));
+    CHECK(eng.run_source("assert(#hx.doc():symbols() == 0)", "symbols_none", &err));
+    CHECK(err.empty());
 }

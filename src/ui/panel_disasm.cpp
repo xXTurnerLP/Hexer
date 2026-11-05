@@ -1,6 +1,8 @@
 #include "ui/panel_disasm.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cfloat>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -20,6 +22,10 @@ namespace {
 
 const ImVec4 kWarnColor(1.0f, 0.78f, 0.35f, 1.0f);
 constexpr uint32_t kCurrentTint = rgba(70, 170, 255);  // current instruction in the hex view
+constexpr uint32_t kLabelColor = rgba(120, 220, 160);  // label rows
+constexpr uint32_t kSymbolColor = rgba(150, 205, 170); // symbol annotations
+constexpr uint64_t kTooltipDelta = 1 << 20;            // "In name+0x..": nearest symbol this close
+constexpr uint64_t kInlineDelta = 0x1000;              // "; name+0x.." after a branch: closer still
 constexpr int kMaxRows = 400;
 constexpr size_t kShownBytes = 8;                      // bytes column: longer ones end in ".."
 
@@ -94,8 +100,14 @@ struct DisasmPanel::DocState {
     int l_rows = 0;
     DisasmOptions l_opt;
 
+    size_t shown = 0;                  // instructions drawn by the last draw (labels take rows)
+
     HighlightSet layer;                // the current instruction's bytes
     uint64_t layer_off = UINT64_MAX, layer_len = 0;
+
+    SymbolJob sym_job;                 // builds `syms` in the background
+    std::shared_ptr<const SymbolTable> syms;
+    uint64_t sym_mapv = UINT64_MAX;    // map_version the job was started for
 };
 
 DisasmPanel::DisasmPanel() = default;
@@ -113,13 +125,30 @@ std::vector<Insn> DisasmPanel::listing(uint64_t doc_id) const {
     auto it = docs_.find(doc_id);
     if (it == docs_.end() || !it->second->list_valid) return {};
     const std::vector<Insn>& v = it->second->insns;
-    return std::vector<Insn>(v.begin(), v.begin() + std::ptrdiff_t(std::min(v.size(), size_t(rows_))));
+    return std::vector<Insn>(v.begin(), v.begin() + std::ptrdiff_t(std::min(v.size(), it->second->shown)));
+}
+
+std::vector<std::string> DisasmPanel::listing_lines(uint64_t doc_id) const {
+    auto it = docs_.find(doc_id);
+    if (it == docs_.end() || !it->second->list_valid) return {};
+    const DocState& st = *it->second;
+    std::vector<std::string> out;
+    for (size_t k = 0; k < std::min(st.insns.size(), st.shown); ++k) {
+        const Insn& in = st.insns[k];
+        const Symbol* s = st.syms && in.mapped ? st.syms->at(in.address) : nullptr;
+        if (s) out.push_back(s->label() + ":");
+        std::string t = in.text;
+        const size_t c = t.find(syntax == DisasmSyntax::Att ? "  # " : "  ; ");
+        if (c != std::string::npos) t.resize(c);
+        out.push_back(t + insn_comment(st, in));
+    }
+    return out;
 }
 
 bool DisasmPanel::row_pos(int row, float& x, float& y) const {
-    if (row < 0 || row >= drawn_rows_) return false;
+    if (row < 0 || row >= drawn_rows_ || size_t(row) >= row_ys_.size()) return false;
     x = rows_x_ + row_w_ * 0.5f;
-    y = rows_y_ + (float(row) + 0.5f) * row_h_;
+    y = row_ys_[size_t(row)];
     return true;
 }
 
@@ -150,6 +179,84 @@ const AddressMap& DisasmPanel::address_map(const Document& doc) {
     DocState& st = state(doc);
     ensure_map(st, doc);
     return st.map;
+}
+
+void DisasmPanel::set_map_choice(const Document& doc, DisasmMapChoice choice, uint64_t base) {
+    DocState& st = state(doc);
+    st.choice = choice;
+    st.manual_base = base;
+    st.base_input = fmt_hex(base);
+    st.base_bad = false;
+}
+
+void DisasmPanel::ensure_symbols(DocState& st, const Document& doc) {
+    if (st.sym_mapv != st.map_version) {
+        st.sym_mapv = st.map_version;
+        st.sym_job.start(doc.snapshot(), st.map);
+    }
+    st.syms = st.sym_job.result();
+}
+
+const SymbolTable* DisasmPanel::symbols(const Document& doc, bool wait) {
+    DocState& st = state(doc);
+    ensure_map(st, doc);
+    ensure_symbols(st, doc);
+    if (wait) {
+        st.sym_job.wait();
+        st.syms = st.sym_job.result();
+    }
+    return st.syms.get();
+}
+
+std::string DisasmPanel::symbol_text(const DocState& st, uint64_t va, uint64_t max_delta) const {
+    if (!st.syms) return {};
+    if (const Symbol* s = st.syms->at(va)) return s->label();
+    if (!max_delta) return {};
+    uint64_t delta = 0;
+    const Symbol* s = st.syms->nearest(va, &delta);
+    if (!s || delta >= max_delta || st.map.section_at_va(s->address) != st.map.section_at_va(va)) return {};
+    return s->label() + "+0x" + fmt_hex(delta, 0, uppercase);
+}
+
+std::string DisasmPanel::insn_comment(const DocState& st, const Insn& insn, bool* is_symbol) const {
+    if (is_symbol) *is_symbol = false;
+    const char* mark = syntax == DisasmSyntax::Att ? "  # " : "  ; ";
+    std::string zydis;  // the formatter's own comment (RIP-relative operand address)
+    if (const size_t c = insn.text.find(mark); c != std::string::npos) zydis = insn.text.substr(c);
+    if (insn.has_target) {
+        const std::string sym = symbol_text(st, insn.target, kInlineDelta);
+        if (!sym.empty()) {
+            if (is_symbol) *is_symbol = true;
+            return mark + sym;
+        }
+    }
+    const std::string note = target_note(st, insn);
+    return note.empty() ? zydis : zydis + "  <" + note + ">";
+}
+
+void DisasmPanel::save_extras(Document& doc) const {
+    auto it = docs_.find(doc.id());
+    const DocState* st = it != docs_.end() ? it->second.get() : nullptr;
+    const DisasmMapChoice c = st ? st->choice : DisasmMapChoice::Auto;
+    doc.set_extra("disasm.map", c == DisasmMapChoice::Manual ? "manual" : c == DisasmMapChoice::None ? "none" : "");
+    doc.set_extra("disasm.base", st && (st->manual_base || c == DisasmMapChoice::Manual) ? fmt_hex(st->manual_base) : "");
+    doc.set_extra("disasm.top", st && st->have_top && !follow ? std::to_string(st->top) : "");
+}
+
+void DisasmPanel::restore_extras(const Document& doc) {
+    const std::string m = doc.extra("disasm.map"), b = doc.extra("disasm.base"), t = doc.extra("disasm.top");
+    if (m.empty() && b.empty() && t.empty()) return;
+    DocState& st = state(doc);
+    st.choice = m == "manual" ? DisasmMapChoice::Manual : m == "none" ? DisasmMapChoice::None : DisasmMapChoice::Auto;
+    uint64_t v = 0;
+    if (parse_hex_u64(b, v)) st.manual_base = v;
+    st.base_input = b.empty() ? std::string() : fmt_hex(st.manual_base);
+    uint64_t top = 0;
+    auto [p, ec] = std::from_chars(t.data(), t.data() + t.size(), top);
+    if (!t.empty() && ec == std::errc() && p == t.data() + t.size()) {
+        st.top = std::min(top, doc.size());
+        st.have_top = true;
+    }
 }
 
 DisasmOptions DisasmPanel::options_for(const Document& doc) {
@@ -217,7 +324,7 @@ bool DisasmPanel::follow_target(DocState& st, const Document& doc, const Insn& i
     }
     // A listed instruction start: just move the caret there. Else (also a target in the middle of
     // a listed instruction: the listing is misaligned there) list it a few rows from the top.
-    const size_t shown = std::min(st.insns.size(), size_t(std::max(rows_, 1)));
+    const size_t shown = st.list_valid ? std::min(st.insns.size(), st.shown) : 0;
     bool listed = false;
     for (size_t r = 0; r < shown && !listed; ++r) listed = st.insns[r].offset == off;
     if (!listed) {
@@ -232,7 +339,7 @@ bool DisasmPanel::follow_target(DocState& st, const Document& doc, const Insn& i
 bool DisasmPanel::follow_at(const Document& doc, uint64_t at, const DisasmPanelCallbacks& cb) {
     DocState& st = state(doc);
     ensure_map(st, doc);
-    const size_t shown = st.list_valid ? std::min(st.insns.size(), size_t(rows_)) : 0;
+    const size_t shown = st.list_valid ? std::min(st.insns.size(), st.shown) : 0;
     for (size_t r = 0; r < shown; ++r) {
         const Insn& in = st.insns[r];
         if (at >= in.offset && at < in.offset + std::max<uint64_t>(in.length, 1)) {
@@ -257,8 +364,10 @@ void DisasmPanel::draw(Document* doc, uint64_t caret, const DisasmPanelCallbacks
     }
     DocState& st = state(*doc);
     ensure_map(st, *doc);
+    ensure_symbols(st, *doc);
     draw_toolbar(st, *doc, caret, cb);
     draw_listing(st, *doc, caret, cb);
+    draw_symbol_list(st, *doc, cb);
 }
 
 void DisasmPanel::draw_toolbar(DocState& st, const Document& doc, uint64_t caret, const DisasmPanelCallbacks& cb) {
@@ -314,6 +423,12 @@ void DisasmPanel::draw_toolbar(DocState& st, const Document& doc, uint64_t caret
     ImGui::SetItemTooltip(has_entry ? "Go to the entry point (0x%s)" : "No entry point (not a PE / ELF file?)",
                           fmt_hex(st.map.entry).c_str());
 
+    same_line_if_fits(button_width("Symbols"));
+    if (ImGui::Button("Symbols")) open_symbols_ = true;
+    if (!st.syms) ImGui::SetItemTooltip("Go to Symbol... (reading the symbol tables)");
+    else ImGui::SetItemTooltip("Go to Symbol... (%zu symbols: PE exports / imports, ELF symtab / PLT)",
+                               st.syms->symbols.size());
+
     same_line_if_fits(button_width("Options"));
     if (ImGui::Button("Options")) ImGui::OpenPopup("##disopt");
     if (ImGui::BeginPopup("##disopt")) {
@@ -359,7 +474,7 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
 
     // ---- follow the caret / first show ----
     {
-        const size_t shown = st.list_valid ? std::min(st.insns.size(), size_t(rows_)) : 0;
+        const size_t shown = st.list_valid ? std::min(st.insns.size(), st.shown) : 0;
         const bool inside = shown && caret >= st.insns.front().offset &&
                             caret < st.insns[shown - 1].offset + std::max<uint64_t>(st.insns[shown - 1].length, 1);
         if (!st.have_top || (follow && caret != st.last_caret && !inside)) {
@@ -372,7 +487,7 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
     // ---- keyboard / wheel scrolling ----
     const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput;
     int delta = 0;
-    bool follow_enter = false;
+    bool follow_enter = false, page_up = false;
     if (ImGui::IsWindowHovered() && !ImGui::GetIO().KeyCtrl) {  // Ctrl+wheel is the app's zoom
         wheel_accum_ -= double(ImGui::GetIO().MouseWheel) * 3.0;
         const int whole = int(wheel_accum_);
@@ -382,8 +497,13 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
     if (focused) {
         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) delta += 1;
         if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) delta -= 1;
-        if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) delta += std::max(1, rows_ - 1);
-        if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) delta -= std::max(1, rows_ - 1);
+        // A page = the instructions the last draw listed (label rows take rows too), so paging
+        // never jumps over instructions that were not shown.
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) {
+            const size_t listed = st.list_valid ? std::min(st.insns.size(), st.shown) : size_t(rows_);
+            delta += std::max(1, int(std::min(listed, size_t(rows_))) - 1);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) page_up = true;
         if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))
             follow_enter = true;
         if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
@@ -391,6 +511,29 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
         }
     }
     if (delta) scroll(st, doc, delta);
+    if (page_up) {
+        // Back one page so that the old first instruction is the last listed one: go back a row
+        // count of instructions, then drop from the front what the label rows push off the page.
+        const uint64_t old_top = st.top;
+        scroll(st, doc, -std::max(1, rows_ - 1));
+        std::vector<Insn> back;
+        disasm_range(doc, st.top, size_t(std::max(1, rows_)), st.map, opt, back);
+        auto cost = [&](const Insn& in) { return st.syms && in.mapped && st.syms->at(in.address) ? 2 : 1; };
+        int used = 0;
+        for (const Insn& in : back)
+            if (in.offset >= old_top) {
+                used = cost(in);  // the old top itself (+ its label) ends the page
+                break;
+            }
+        size_t first = back.size();
+        for (size_t k = back.size(); k-- > 0;) {
+            if (back[k].offset >= old_top) continue;
+            if (used + cost(back[k]) > rows_) break;
+            used += cost(back[k]);
+            first = k;
+        }
+        if (first < back.size()) st.top = back[first].offset;
+    }
 
     // ---- decode the visible rows (only when something changed) ----
     if (!st.list_valid || st.l_gen != doc.generation() || st.l_top != st.top || st.l_rows != rows_ ||
@@ -404,7 +547,27 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
         st.l_mapv = st.map_version;
         st.l_opt = opt;
     }
-    const size_t nrows = std::min(st.insns.size(), size_t(rows_));
+    // ---- layout: a label row above each instruction at a symbol address ----
+    std::vector<const Symbol*> labels;  // per listed instruction (nullptr: none)
+    {
+        int used = 0;
+        for (size_t k = 0; k < st.insns.size() && used < rows_; ++k) {
+            const Insn& in = st.insns[k];
+            const Symbol* sym = st.syms && in.mapped ? st.syms->at(in.address) : nullptr;
+            if (sym && used + 2 > rows_) {
+                if (used) break;  // no room for label + instruction: list it on the next page
+                sym = nullptr;    // a one-row panel: the instruction only
+            }
+            labels.push_back(sym);
+            used += sym ? 2 : 1;
+        }
+    }
+    const size_t nrows = labels.size();
+    st.shown = nrows;
+    // Instruction text without the formatter's comment + the comment drawn after it.
+    const char* mark = syntax == DisasmSyntax::Att ? "  # " : "  ; ";
+    auto plain_len = [&](const Insn& in) { return std::min(in.text.find(mark), in.text.size()); };
+    auto full_text = [&](const Insn& in) { return in.text.substr(0, plain_len(in)) + insn_comment(st, in); };
 
     // ---- columns ----
     uint64_t max_addr = 0;
@@ -435,6 +598,7 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
     dl->AddLine(ImVec2(origin.x, rows_y - 1.0f), ImVec2(origin.x + avail.x, rows_y - 1.0f),
                 ImGui::GetColorU32(ImGuiCol_Separator));
 
+    row_ys_.clear();
     if (nrows == 0) {
         drawn_rows_ = 0;
         ImGui::SetCursorScreenPos(ImVec2(addr_x, rows_y + 2.0f));
@@ -458,9 +622,18 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
     }
     const Insn* follow_req = nullptr;
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(style.ItemSpacing.x, 0.0f));
+    int line = 0;
     for (size_t r = 0; r < nrows; ++r) {
         const Insn& in = st.insns[r];
-        const float y = rows_y + float(r) * row_h;
+        if (labels[r]) {  // "kernel32.dll!CreateFileW:"
+            const float ly = rows_y + float(line++) * row_h;
+            const std::string label = labels[r]->label() + ":";
+            const ImVec4 clip(origin.x, ly, origin.x + avail.x, ly + row_h);
+            dl->AddText(font, font_size, ImVec2(addr_x, ly + (row_h - font_size) * 0.5f), kLabelColor, label.data(),
+                        label.data() + label.size(), 0.0f, &clip);
+        }
+        const float y = rows_y + float(line++) * row_h;
+        row_ys_.push_back(y + row_h * 0.5f);
         ImGui::SetCursorScreenPos(ImVec2(origin.x, y));
         ImGui::PushID(int(r));
         bool clicked = ImGui::Selectable("##row", int(r) == current, ImGuiSelectableFlags_AllowDoubleClick,
@@ -481,25 +654,31 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
                 cb.select(in.offset, in.length);
             st.last_caret = in.offset;  // the caret lands inside the listing: no re-anchor
         }
-        if (hov && in.has_target && ImGui::BeginItemTooltip()) {  // the full text (the row may clip it)
-            ImGui::TextUnformatted(in.text.c_str());
-            const std::string note = target_note(st, in);
-            ImGui::TextDisabled("Target 0x%s%s%s  -  double-click / Ctrl+click / Enter follows it",
-                                fmt_hex(in.target).c_str(), note.empty() ? "" : "  ", note.c_str());
+        const std::string where = hov && in.mapped ? symbol_text(st, in.address, kTooltipDelta) : std::string();
+        if (hov && (in.has_target || !where.empty()) && ImGui::BeginItemTooltip()) {
+            ImGui::TextUnformatted(full_text(in).c_str());  // the full text (the row may clip it)
+            if (!where.empty()) ImGui::TextDisabled("In %s", where.c_str());
+            if (in.has_target) {
+                std::string note = symbol_text(st, in.target, kTooltipDelta);
+                if (note.empty()) note = target_note(st, in);
+                ImGui::TextDisabled("Target 0x%s%s%s  -  double-click / Ctrl+click / Enter follows it",
+                                    fmt_hex(in.target).c_str(), note.empty() ? "" : "  ", note.c_str());
+            }
             ImGui::EndTooltip();
         }
         if (ImGui::BeginPopupContextItem("##ctx")) {
             const std::string addr = fmt_hex(in.address, addr_digits);
-            if (ImGui::MenuItem("Copy instruction") && cb.copy) cb.copy(in.text);
+            if (ImGui::MenuItem("Copy instruction") && cb.copy) cb.copy(full_text(in));
             if (ImGui::MenuItem("Copy address") && cb.copy) cb.copy("0x" + addr);
             if (ImGui::MenuItem("Copy bytes") && cb.copy) cb.copy(insn_bytes_hex(in));
             if (ImGui::MenuItem("Copy visible listing") && cb.copy) {
                 std::string all;
                 for (size_t k = 0; k < nrows; ++k) {
                     const Insn& i = st.insns[k];
+                    if (labels[k]) all += labels[k]->label() + ":\n";
                     std::string b = insn_bytes_hex(i);
                     b.resize(std::max<size_t>(b.size(), Insn::kMaxLength * 3), ' ');
-                    all += fmt_hex(i.address, addr_digits) + "  " + b + " " + i.text + "\n";
+                    all += fmt_hex(i.address, addr_digits) + "  " + b + " " + full_text(i) + "\n";
                 }
                 cb.copy(all);
             }
@@ -528,10 +707,10 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
             if (!in.readable) b = "??";
             dl->AddText(font, font_size, ImVec2(bytes_x, ty), dim, b.c_str());
         }
-        // Instruction: mnemonic in its flow color, operands, the RIP comment dim, then the target note.
+        // Instruction: mnemonic in its flow color, operands, then the comment (symbol / RIP address /
+        // target section).
         const std::string& t = in.text;
-        size_t comment = t.find(syntax == DisasmSyntax::Att ? "  # " : "  ; ");
-        if (comment == std::string::npos) comment = t.size();
+        const size_t comment = plain_len(in);
         size_t sp = t.find(' ');
         if (sp == std::string::npos || sp > comment) sp = comment;
         float x = text_x;
@@ -542,12 +721,9 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
         };
         put(t.data(), t.data() + sp, flow_color(in));
         put(t.data() + sp, t.data() + comment, in.valid ? normal : dim);
-        put(t.data() + comment, t.data() + t.size(), dim);
-        const std::string note = target_note(st, in);
-        if (!note.empty()) {
-            const std::string n = "  <" + note + ">";
-            put(n.data(), n.data() + n.size(), dim);
-        }
+        bool is_sym = false;
+        const std::string c = insn_comment(st, in, &is_sym);
+        put(c.data(), c.data() + c.size(), is_sym ? kSymbolColor : dim);
     }
     ImGui::PopStyleVar();
     ImGui::EndChild();
@@ -568,6 +744,130 @@ void DisasmPanel::draw_listing(DocState& st, const Document& doc, uint64_t caret
         const Insn target = *follow_req;  // follow_target may re-decode st.insns
         follow_target(st, doc, target, cb);
     }
+}
+
+// ---- Go to Symbol ----------------------------------------------------------------------------------
+
+void DisasmPanel::goto_symbol(DocState& st, const Document& doc, const Symbol& s, const DisasmPanelCallbacks& cb) {
+    uint64_t off = 0;
+    if (!st.map.va_to_offset(s.address, off) || off >= doc.size()) {
+        if (cb.notify) cb.notify(s.label() + " (0x" + fmt_hex(s.address) + ") is not in the file");
+        return;
+    }
+    st.top = off;  // the label on the first row
+    st.have_top = true;
+    st.last_caret = off;
+    if (cb.jump) cb.jump(off);
+    if (cb.notify) cb.notify(s.label() + " at 0x" + fmt_hex(s.address));
+}
+
+void DisasmPanel::draw_symbol_list(DocState& st, const Document& doc, const DisasmPanelCallbacks& cb) {
+    const char* title = "Go to Symbol";
+    // Opened once the panel was drawn two frames in a row: a docked tab that just came to the
+    // front settles first (it is hidden for a frame, which would close a popup opened before).
+    const int frame = ImGui::GetFrameCount();
+    const bool settled = last_draw_frame_ == frame - 1;
+    last_draw_frame_ = frame;
+    if (open_symbols_ && settled) {
+        open_symbols_ = false;
+        ImGui::OpenPopup(title);
+        sym_filter_.clear();
+        sym_sel_ = 0;
+        sym_matched_.reset();
+        symbols_focus_ = true;
+    }
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(640.0f * ui_scale, vp->Size.x * 0.9f), std::min(480.0f * ui_scale, vp->Size.y * 0.8f)),
+                             ImGuiCond_Appearing);
+    symbols_open_ = ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_NoSavedSettings);
+    if (!symbols_open_) return;
+    const SymbolTable* t = st.syms.get();
+    if (symbols_focus_) {
+        ImGui::SetKeyboardFocusHere();
+        symbols_focus_ = false;
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool edited = ImGui::InputTextWithHint("##symfilter", "filter (part of the name, any case)", &sym_filter_);
+    // Matches: recomputed when the filter or the table changes (a linear pass, also for 1M symbols).
+    if (edited || sym_matched_ != st.syms || sym_matched_filter_ != sym_filter_) {
+        sym_matched_ = st.syms;
+        sym_matched_filter_ = sym_filter_;
+        sym_matches_.clear();
+        sym_sel_ = 0;
+        std::string f = sym_filter_;
+        for (char& c : f) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (t) {
+            for (size_t i = 0; i < t->symbols.size(); ++i) {
+                if (!f.empty()) {
+                    std::string l = t->symbols[i].label();
+                    for (char& c : l) c = char(std::tolower(static_cast<unsigned char>(c)));
+                    if (l.find(f) == std::string::npos) continue;
+                }
+                sym_matches_.push_back(uint32_t(i));
+            }
+        }
+    }
+    const int n = int(sym_matches_.size());
+    bool go = false;
+    int step = 0;
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) step = 1;
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) step = -1;
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) step = 10;
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) step = -10;
+    if (step) {
+        sym_sel_ += step;
+        sym_scroll_ = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) go = n > 0;
+    sym_sel_ = std::clamp(sym_sel_, 0, std::max(n - 1, 0));
+    if (!t) ImGui::TextDisabled(st.sym_job.running() ? "Reading the symbol tables..." : "No symbols");
+    else if (t->symbols.empty()) ImGui::TextDisabled("No symbols (PE exports / imports, ELF symtab / PLT)");
+    else ImGui::TextDisabled("%d of %zu symbols%s", n, t->symbols.size(), t->truncated ? " (truncated)" : "");
+    if (t && !t->note.empty()) ImGui::TextColored(kWarnColor, "%s", t->note.c_str());
+
+    const float foot = ImGui::GetFrameHeightWithSpacing();
+    if (ImGui::BeginChild("##symlist", ImVec2(0, -foot), ImGuiChildFlags_Borders)) {
+        if (mono) ImGui::PushFont(mono, 0.0f);
+        const float addr_w = ImGui::CalcTextSize("0000000000000000").x;
+        ImGuiListClipper clip;
+        clip.Begin(n);
+        if (sym_scroll_) {
+            clip.IncludeItemByIndex(sym_sel_);
+        }
+        while (clip.Step()) {
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                const Symbol& s = t->symbols[sym_matches_[size_t(i)]];
+                ImGui::PushID(i);
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                if (ImGui::Selectable("##s", i == sym_sel_, ImGuiSelectableFlags_AllowDoubleClick)) {
+                    sym_sel_ = i;
+                    go = true;
+                }
+                if (sym_scroll_ && i == sym_sel_) {
+                    ImGui::SetScrollHereY(0.5f);
+                    sym_scroll_ = false;
+                }
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddText(p, ImGui::GetColorU32(ImGuiCol_TextDisabled), fmt_hex(s.address, 8).c_str());
+                const std::string text = s.label() + "  (" + symbol_kind_name(s.kind) + ")";
+                dl->AddText(ImVec2(p.x + addr_w, p.y), s.kind == Symbol::Import ? kSymbolColor : kLabelColor,
+                            text.c_str());
+                ImGui::PopID();
+            }
+        }
+        if (mono) ImGui::PopFont();
+    }
+    ImGui::EndChild();
+    if (ImGui::Button("Go") && n > 0) go = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+    if (go && t && sym_sel_ < n) {
+        const Symbol s = t->symbols[sym_matches_[size_t(sym_sel_)]];
+        ImGui::CloseCurrentPopup();
+        goto_symbol(st, doc, s, cb);
+    }
+    ImGui::EndPopup();
 }
 
 }  // namespace hx

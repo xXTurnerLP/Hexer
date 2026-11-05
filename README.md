@@ -81,17 +81,20 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   buttons walk the history.
 - **Strings panel.** ASCII, UTF-16LE and UTF-16BE strings of the file or the selection, with a
   minimum length, scanned in the background (progress, Cancel), up to a million results with a
-  live filter. Click a row to select the string.
+  live filter (a UTF-16 string is listed once, not again as its one-byte-shifted reading in the
+  other byte order). Click a row to select the string.
 - **XOR / ADD / ROL search** (Search > XOR / ADD / ROL Search..., View > XOR Search): finds
   copies of a known plaintext (`This program`, `MZ`, `PE\0\0`, `http`, or your own text / hex)
   hidden by a 1-byte XOR, ADD/SUB or rotate, or by a repeating XOR key of 2..16 bytes, in the whole
   file or the selection, in the background. Each hit shows its transform, key and the decoded
   bytes; click it to select the match and choose its key. *Guess key* ranks likely XOR keys of a
   zero- or space-heavy selection. **Decode selection** applies the chosen key as one undo step.
+  Scripts get the same with `hx.xor_scan` / `hx.xor_guess_key`.
 - **Minimap.** A strip right of the hex view shows the whole file top to bottom as an entropy
   heat map (dark = zeros, blue/teal = structured data and text, orange/red = compressed or
   random) or as the byte-class mix of each row (View > Minimap). It is scanned in the
-  background (sampled, so a 3 TiB file takes seconds), rescanned a second after edits, and a
+  background (sampled, so a 3 TiB file takes seconds), rescanned a second after edits (only
+  where the bytes changed), and a
   click or drag scrolls there. Hover it for the range, entropy and class percentages.
 - **Byte-class colors** (View > Color Bytes by Class): hex digits and text in the color of their
   class: zero, whitespace, printable, control, high (0x80-0xFE) and 0xFF.
@@ -114,6 +117,14 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   `F7` / `Shift+F7` for the next / previous difference. A **shift** lines up files where one has
   an extra header: put the caret on the same content in both and run *Compare: Align at Cursors*,
   or type it (`0x200`, `-16`). Runs in the background; edits recompare automatically.
+  **Find Shift** finds it for you: after the first difference it looks for the next distinctive
+  64-byte block of either file within +-16 MiB of the other (padding is skipped), sets the shift
+  and shows the match ("B has 512 bytes more at B 0x0"). Compare With > **File on Disk** compares
+  the document with its saved file ("name (on disk)"): exactly your unsaved edits.
+- **Restore from .backup** (File menu, when `<file>.backup` exists): *Compare with Backup* shows
+  the original side by side; *Revert to Backup* replaces the content with the backup as one
+  undoable edit (nothing is read into memory, the file on disk changes only when you save, and the
+  `.backup` stays the original).
 - **Packets panel** for pcap / pcapng captures (opens by itself for a capture): every packet
   with time, length, protocol and a summary (Ethernet, VLAN, IPv4/IPv6, TCP, UDP, ICMP, ARP, ...),
   a live filter, and **Parse with**: pick a parser (e.g. your protocol's) and each packet you

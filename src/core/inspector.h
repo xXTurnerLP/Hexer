@@ -49,4 +49,15 @@ bool insp_int_type(InspType type, int& width, bool& is_signed);
 // The integer row of a width / signedness; InspType::Count if there is none.
 InspType insp_type_of_int(int width, bool is_signed);
 
+// ---- Bits grid (one toggle per bit of the integer at the focus offset) ----------------------
+// Byte (0-based from the decode position) and mask of bit `bit` (0 = least significant) of a
+// `width`-byte integer (1..8) in the given byte order. False if width or bit is out of range.
+bool insp_bit_location(int width, bool big_endian, int bit, int& byte_index, uint8_t& mask);
+
+class Document;
+// Flips bit `bit` of the `width`-byte integer at `at` in `d`: one undoable overwrite of the byte
+// holding it (undo label "Toggle bit N"). False with *err for a read-only / busy document, a bit
+// outside the integer, a byte past the end or an unreadable byte (process memory holes).
+bool inspector_toggle_bit(Document& d, uint64_t at, int width, bool big_endian, int bit, std::string* err = nullptr);
+
 }  // namespace hx

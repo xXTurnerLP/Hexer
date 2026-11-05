@@ -5,7 +5,9 @@
 // built as C), which skip C++ destructors. So a C function must never raise a Lua error (luaL_check*,
 // luaL_error, lua_call of user code, ...) while a local with a non-trivial destructor (std::string,
 // std::vector, ...) is alive. Compute into such objects inside an inner scope / helper, keep the error
-// text in a plain char buffer, and raise only after the scope ends.
+// text in a plain char buffer, and raise only after the scope ends. Safest: do the C++ work in a
+// separate HX_NOINLINE helper (lua_api.cpp) - on MSVC (/EHsc) a Lua error raised BEFORE an inner
+// scope of the same function was seen to crash while unwinding (hx.xor_scan).
 #include <chrono>
 #include <cstdint>
 #include <string>

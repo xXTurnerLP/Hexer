@@ -428,7 +428,8 @@ const char* const kAlignHelper =
 
 const char* const kBitfieldHelper =
     "-- Bit field: `width` bits at bit `shift` of a storage unit (`unit` = its value, read with\n"
-    "-- p:peek), shown as a field over the unit's `size` bytes. Returns the value.\n"
+    "-- p:peek), shown as a field over the unit's `size` bytes (opts.bitfield tells the C header\n"
+    "-- export which bits). Returns the value.\n"
     "local function bitfield(p, name, unit, size, shift, width, opts)\n"
     "    opts = opts or {}\n"
     "    local v = (unit >> shift) & ((1 << width) - 1)\n"
@@ -443,7 +444,8 @@ const char* const kBitfieldHelper =
     "    end\n"
     "    local bits = width == 1 and string.format(\"bit %d\", shift)\n"
     "        or string.format(\"bits %d..%d\", shift, shift + width - 1)\n"
-    "    p:field(name, p:tell(), size, text, { comment = bits })\n"
+    "    p:field(name, p:tell(), size, text,\n"
+    "        { comment = bits, bitfield = { shift = shift, width = width, be = opts.be, signed = opts.signed } })\n"
     "    return v\n"
     "end\n\n";
 
@@ -1501,6 +1503,7 @@ private:
                     uses_bool_ = true;
                 }
                 if (pr.is_signed && pr.kind == Prim::Int) opts += std::string(opts.empty() ? "" : ", ") + "signed = true";
+                if (unit_endian == 'b') opts += std::string(opts.empty() ? "" : ", ") + "be = true";
                 std::string call = "bitfield(p, " + lua_quote(m.name) + ", " + unit_var + ", " + S(sz) + ", " +
                                    S(shift) + ", " + S(m.bits) + (opts.empty() ? "" : ", { " + opts + " }") + ")";
                 if (!m.lua_local.empty()) call = "local " + m.lua_local + " = " + call;

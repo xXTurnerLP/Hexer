@@ -114,6 +114,8 @@ The cursor starts at offset 0. Typed readers read at the cursor, advance it, **e
 | `comment` | shown next to the field |
 | `enum` | `{ [1] = "HELLO", [2] = "BYE" }` (or `{ HELLO = 1 }`): value shown as `1 = HELLO` |
 | `fmt` | integer display: `"hex"` (`0x0D`), `"dec"` (`13`), `"bin"` (`0b00001101`), `"char"` (`'A' (65)`) |
+| `flags` | integer fields: bit number -> name, `{ [0] = "READ", [1] = "WRITE", [11] = "UTF8" }` (or `{ READ = 0 }`); the value gets the set bits' names, `5 (0x5) = READ|EXEC` (an unnamed set bit shows as `bit9`); edits also take `READ|WRITE`. The Inspector's Bits row shows the names under its grid, the C header export lists them in a comment. See `zip.lua` |
+| `bitfield` | `{ shift = 3, width = 2, be = true?, signed = true? }` on a `p:field` over a bit-field storage unit: which bits it is (from the least significant). Only used by the C header export (`uint16_t name : 2;`); parsers from C structs set it |
 
 Default integer display is `13 (0xD)`; values below 10 show as plain `7`. u64 values are shown
 unsigned. (In Lua they are plain integers, so values >= 2^63 come out negative.) Bytes show
@@ -193,6 +195,30 @@ What it understands:
 
 Errors name the line: `line 7: unknown type 'uint9_t'`.
 
+### Parse tree -> C header
+
+The other way round: the Structure panel's **C Header** button (also its row context menu and
+Scripts > Copy / Export Structure as C Header, palette *Structure: Copy as C Header*) turns the
+parsed tree into packed C structs, copied to the clipboard or saved as a `.h` file. A struct row's
+context menu exports just that struct. It describes **this parsed instance** (a dynamic array has
+the length it had here):
+
+* every struct field becomes a `typedef struct name_t {...} name_t;` (the root keeps its own
+  name; several top-level fields are wrapped into a struct named after the parser); structs with
+  identical layouts share one typedef
+* typed readers -> `uint8_t`..`int64_t`, `float`, `double`; `enum` -> `enum name_e : uint16_t
+  {...}` (the `{false, true}` enum -> `bool`; constants the field's type cannot hold, e.g. 300 on
+  a `u8` sharing an enum table with wider fields, become comments); `flags` -> the bit names in a comment
+* arrays of one layout -> `T name[N]` (`T name[N][M]` for nested ones), `p:str` -> `char[N]`,
+  bytes / LEB128 / `p:field` / other arrays -> `uint8_t[N]`; `bitfield` fields -> `T name : w;`
+  (unused bits of a unit -> unnamed `T : k;`, so MSVC and GCC / Clang lay it out alike)
+* gaps -> `uint8_t _padN[k];`, overlapping fields (unions, re-reads) -> a comment
+* `#pragma pack(push, 1)`, a `static_assert(sizeof(...))` per struct, `/* +0x0004, BE */` offset
+  comments; a mostly big-endian struct gets `// @be`, so the header pasted back into the C struct
+  window gives a parser with the same tree (padding members aside).
+
+Enums with an underlying type need C23 or C++.
+
 ### Editing (serializer for free)
 
 Every field from a typed reader, or from `p:read` with a single numeric format, is **editable**
@@ -236,6 +262,11 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | `doc:find(needle, start?, {hex=bool, backward=bool})` | offset or `nil`; `hex=true` takes patterns like `"DE ?? AD"` |
 | `doc:hash(algo, off?, len?)` | lowercase hex digest of the range (default: the whole document; clamped to the end). It blocks, so at most 256 MiB per call; the Hashes panel hashes any size in the background |
 | `doc:disasm(off, count?, mode?)` | x86-64 disassembly of `count` instructions (default 16, at most 10000) from file offset `off`, as a list like `hx.disasm`'s. `address` / `target` are virtual addresses from the document's address map (PE and ELF headers; process memory and other files: the offset), `section` names the PE section / ELF section when known. `mode` defaults to the header's (32 for PE32 / ELF32), else 64. Unreadable bytes are 1-byte `"??"` entries |
+| `doc:view_range()` → first, last | the first and last byte (inclusive) the document's hex view showed in the last drawn frame (the active pane of a split view), or `nil` when it has no drawn view (headless, empty document) |
+| `doc:bookmarks()` | list of `{offset, length, name, color, note}` (`color` is a packed color, `0` = default) |
+| `doc:add_bookmark(off, len?, name?, color?, note?)` → index | adds a bookmark (`len` default 1, clamped to the end; `color` as `hx.color` takes it); returns its 1-based index. An undo step ("Add bookmark"; inside a command or `doc:transaction` part of that step); works on read-only documents too |
+| `doc:remove_bookmark(i)` | removes bookmark `i` (1-based, as in `doc:bookmarks()`; an error if there is none). Undoable like adding |
+| `doc:symbols()` | Symbols of a PE / ELF executable, sorted by address (forwarded exports last), each `{name, address, offset, kind, module, ordinal?, forward?}`: `kind` is `"export"`, `"import"`, `"function"` or `"object"`; `module` the export / import DLL (`"KERNEL32.dll"`, ELF: `""`); imports are one entry per IAT slot (`address` = the slot, `name` = `"GetProcAddress"` or `"#12"` by ordinal) and on ELF `"puts@got"` (GOT slot) / `"puts@plt"` (PLT stub); `offset` is the file offset (nil when the address is not in the file); a forwarded export has `forward = "NTDLL.RtlAllocateHeap"` and no `address`. Sources: PE export / import / delay-import directories, ELF `.symtab` / `.dynsym` (FUNC / OBJECT) and JUMP_SLOT / GLOB_DAT relocations, plus function `"entry"` at an unnamed entry point; `{}` for other files and process memory. Capped at 1M symbols / ~3 s |
 
 All edits are undoable. They fail with an error on read-only documents (`document is read-only`)
 and while a save is running.
@@ -262,6 +293,8 @@ and while a save is running.
 | `hx.hash(algo, s)` | lowercase hex digest of a string: `hx.hash("sha256", data)`. Names ignore case and punctuation (`"CRC-32C"`, `"crc32c"`, `"md5"`) |
 | `hx.hash_algorithms()` | the names, in display order: Sum-8, XOR-8, CRC-8, CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-16/XMODEM, CRC-32, CRC-32C, Adler-32, Fletcher-16, FNV-1a/32, FNV-1a/64, MD5, SHA-1, SHA-256, SHA-512 |
 | `hx.disasm(bytes, address?, mode?)` | disassembles a string as x86-64 (`mode` 64, the default) or 32-bit x86 (`32` / `"x86"`), the first byte at `address` (default 0); at most 10000 instructions. Each entry: `address`, `offset` (0-based position in `bytes`), `length`, `text`, `bytes`, `valid`, and when present `target` (branch target or RIP-relative / absolute memory address) and `flow` (`"call"`, `"jmp"`, `"jcc"`, `"ret"`, `"int"`). Text is Intel syntax: `mov rax, qword ptr [rip+0x2a]  ; 0x1031` (the comment is the resolved address), `call 0x1105`; an invalid byte is `db 0x06` with `valid = false` |
+| `hx.xor_scan(doc, plaintext, opts?)` | where `plaintext` (raw bytes; `hx.unhex` for hex text) occurs XOR / ADD / ROL-encoded, like the XOR Search panel. A list by offset of `{offset, transform, key, phase, text}`: `transform` is `"xor"`, `"add"`, `"rol"` or `"xor_key"`, `key` the raw key bytes (`rol`: one byte, the bit count), `phase` the key index of `offset` (key byte `key[x % #key]` applies to absolute offset `x`), `text` e.g. `"XOR 0x5A"`. `opts`: `start` (0), `length` (to the end), `xor` / `add` / `rol` (true), `multi` (false: 2..16-byte XOR keys), `max_key_len` (16), `max` (10000 hits). The plaintext itself (key 0) is not reported. It blocks: at most 256 MiB per call (pass `start` / `length` or use the panel) and stopped at the script time limit |
+| `hx.xor_guess_key(doc, off, len, opts?)` | XOR key candidates for the range, best first: `{key, score}` (`score` 0..1 = share of bytes that decode to `plain`). `opts`: `plain` (0; a byte value or a 1-character string, `" "` for text), `max_len` (16). At most 16 MiB per call |
 | `string.pack` / `string.unpack` | standard Lua, the recommended way to (de)serialize |
 
 `os.exit` and stdin are disabled: Hexer has no stdin (`io.read`, `io.lines()`, `io.stdin`,
@@ -333,6 +366,10 @@ See "Selection: XOR with key" in `scripts/examples/commands.lua`.
 * `hx.hex(doc:read(sel.start, sel.len))` dumps the selection; `doc:find("IDAT")` finds bytes.
 * `for _, i in ipairs(doc:disasm(cur, 8)) do print(("%X  %s"):format(i.address, i.text)) end`
   lists eight instructions at the caret (the Disassembly panel does the same interactively).
+* `for _, h in ipairs(hx.xor_scan(doc, "This program")) do print(("%X  %s"):format(h.offset, h.text)) end`
+  finds an XOR- / ADD- / ROL-obfuscated PE stub; `doc:add_bookmark(h.offset, 12, h.text)` marks one.
+* `for _, s in ipairs(doc:symbols()) do if s.kind == "import" then print(("%X  %s!%s"):format(s.address, s.module, s.name)) end end`
+  prints every IAT slot with its DLL and function.
 * Tables print readably: `{ a = 1, list = { 1, 2, 3 } }`.
 * Prototype a parser in a file and keep it open in your editor: every save hot-reloads it.
 * Commands and console code are stopped after 10 s (time waiting in `hx.prompt` doesn't count),

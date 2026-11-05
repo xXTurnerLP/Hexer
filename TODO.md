@@ -33,7 +33,7 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Keyboard shortcut routing while text fields have focus (Ctrl+Tab, Ins, F2/F3)
 - [ ] Double-click editing in Inspector / Structure / Bookmarks, tab drag reordering, Ctrl+wheel zoom
 - [ ] Native file dialogs, drag & drop, long saves with Cancel, the external-change banner
-- [ ] Linux build (POSIX code paths are written but have never been compiled)
+- [x] Linux build (CI compiles and tests linux-gcc + linux-clang on every push, 0 warnings)
 
 ### User feedback fixes
 - [x] App icon consistent at every size (16/24/32 px hand-drawn pixel art of the same pointy-top
@@ -52,17 +52,28 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Custom hash algorithms registered from Lua (`hx.hash_algorithm{...}`)
 - [x] Entropy / byte-class minimap next to the scrollbar (View > Minimap: Off / Entropy / Byte Classes;
       background sampled scan, rescanned 1 s after edits; click / drag scrolls)
-- [ ] Minimap: rescan only the buckets an edit touched (today every edit rescans the whole map,
-      bounded at 1024 x 256 KiB reads); small regions inside huge sampled buckets can be missed
-- [ ] Structure → C header export (turn a parsed tree into `struct` definitions)
-- [ ] Bit-field / flags display in the Inspector (named bits, editable)
+- [x] Minimap: rescan only the buckets an edit touched (`EntropyJob::rescan`: the piece lists of
+      the last scan and the new snapshot are compared; overwrites rescan their buckets, an insert /
+      delete rescans from the edit on, a new bucket layout / process memory / a save rescans all)
+- [ ] Minimap: small regions inside huge sampled buckets can be missed (sampling); rescan
+      process memory incrementally (its bytes change underneath, today it is always rescanned)
+- [x] Structure → C header export (Structure panel "C Header" / row context menu: packed typedefs,
+      deduped layouts, arrays, enums, bit fields, padding, static_asserts, `// @be`; converts back
+      through C struct → parser to the same tree)
+- [x] Bit-field / flags display in the Inspector (Bits row: a 0/1 toggle per bit at the selected
+      integer row's width, undoable flips; Lua `opts.flags` names bits: "3 = READ|WRITE")
+- [ ] C header export: emit `#define` masks for flags; char fields (`fmt = "char"`) as `char`;
+      mixed-endianness structs (today: majority wins, the rest only get a BE comment)
 - [x] Diff/compare two files with synced scrolling (File > Compare With: a Compare tab, F7 / Shift+F7,
       shift for inserted headers, "Align at Cursors")
 - [x] Compare: keep the Compare tab (documents + shift) in the session
-- [ ] Compare: find the shift automatically (align on the first matching block); compare a
-      document with its version on disk
-- [ ] Headless tests for DiffView / PacketsPanel / BitmapPanel (view_diff.cpp etc. live in hexer_ui,
-      which test_ui does not link; move them to hexer_ui_view or add a test exe)
+- [x] Compare: find the shift automatically ("Compare: Find Shift": a distinctive 64-byte block
+      after the first difference, rolling-hash search within +-16 MiB, background job); compare a
+      document with its version on disk (Compare With > File on Disk, reloads after saves; session)
+- [ ] Compare: Find Shift for the next misalignment too (today it aligns at the first difference;
+      a change followed by an insertion reports "no shift found")
+- [x] Headless tests for DiffView / PacketsPanel / BitmapPanel (view_diff, panel_packets and
+      panel_bitmap moved to hexer_ui_view; test_diffview, test_panels)
 - [x] Open process memory and raw disks/devices (File > Open Process... / Open Disk..., Regions
       panel, read-only unless asked, in-place saves of overwrites, `doc:target()` / `doc:pid()`)
 - [x] Process memory: Search / Strings / XOR search / minimap / Hash skip unreadable holes
@@ -83,8 +94,8 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Follow pointer: Ctrl+click / Ctrl+Enter, width + base + byte order settings, Inspector /
       Structure buttons; jump history (Alt+Left / Alt+Right, mouse back / forward)
 - [x] Strings panel (ASCII / UTF-16, min length, background scan, click to jump, live filter)
-- [ ] Strings: deduplicate an ASCII-in-UTF-16 string found again shifted by one byte when both
-      UTF-16LE and UTF-16BE are on
+- [x] Strings: deduplicate an ASCII-in-UTF-16 string found again shifted by one byte when both
+      UTF-16LE and UTF-16BE are on (the shorter reading is dropped; equal length: LE is kept)
 - [ ] Verify by hand: Ctrl+hover underline / tooltip and mouse X1/X2 (headless tests only)
 - [x] Bitmap view: render bytes as pixels (adjustable width / pixel format) to spot tables & images
       (View > Bitmap; format / width / zoom remembered in settings.ini)
@@ -94,8 +105,13 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Disassembly at cursor: x86-64 / x86-32 (Zydis), Disassembly panel following the caret,
       PE / ELF / manual address maps, resolved branch + RIP-relative targets (follow = jump
       history), Go to Entry Point, backward scrolling (disasm_sync_back), `hx.disasm` / `doc:disasm`
-- [ ] Disassembly: symbol names (PE exports / imports, ELF symtab) for targets and as labels;
-      branch arrows; a "Find references to" scan; remember the map choice / base per tab (session)
+- [x] Disassembly: symbol names (PE exports / imports / delay imports, ELF symtab / dynsym,
+      @plt / @got from JUMP_SLOT relocations) as labels and for branch / call / IAT targets,
+      nearest symbol + offset in the tooltip, Go to Symbol list, `doc:symbols()`; map choice / base /
+      pinned start per tab in the session; panel options are real Settings members (checked
+      against dumpbin on kernel32.dll: 1698 exports / 211 forwarded / 1292 imports, all equal)
+- [ ] Disassembly: branch arrows; a "Find references to" scan; PDB / DWARF names; i386 PIC PLT
+      (jmp [ebx+X]) @plt names; symbols for a Manual base over a PE / ELF image (today: none)
 - [ ] Disassembly: other architectures (ARM / AArch64) only if asked (Zydis is x86 only)
 - [x] Live tail mode for growing files (captures, logs): View > Live Tail, follows the end while the
       caret is there, a rewrite falls back to the "changed on disk" banner
@@ -103,16 +119,24 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Live tail: rescan the Packets index incrementally while a capture grows
 - [x] XOR / rotate brute-force helpers to find simple obfuscation (XOR Search panel: known
       plaintext with 1-byte XOR / ADD / ROL and 2..16-byte XOR keys, key guess, undoable decode)
-- [ ] XOR search: Lua API (`hx.xor_scan`, key guess); multi-byte ADD keys
-- [ ] Script API: `doc:view_range()` (visible bytes); bookmark access from Lua
-- [ ] "Restore from .backup" command (swap the file with its `.backup`, or open the backup side by side)
+- [x] XOR search: Lua API (`hx.xor_scan(doc, plaintext, opts)` up to 256 MiB per call,
+      `hx.xor_guess_key(doc, off, len, opts)` up to 16 MiB)
+- [ ] XOR search: multi-byte ADD keys; a Lua binding for the undoable decode (`apply_transform`)
+- [x] Script API: `doc:view_range()` (visible bytes); bookmark access from Lua (`doc:bookmarks()`,
+      `doc:add_bookmark`, `doc:remove_bookmark`, undoable)
+- [x] "Restore from .backup" (File menu, when `<file>.backup` exists): Compare with Backup side by
+      side, Revert to Backup = one undoable edit referencing the backup file (nothing copied;
+      disk untouched until Save; the .backup stays the original)
+- [ ] Revert to Backup: hot exit keeps a revert only up to 16 MiB (the session format has no second
+      file source; above that Hexer asks on exit) - store "whole file = <path>" pieces in the session
 - [ ] Live font reload from the Settings window (font file / hinting changes need a restart now)
 - [x] Settings: remember the Bookmarks panel's "All open files" toggle
 - [ ] Headless App-level tests (session extras round trip of split / tail / parse at / Compare,
       the History and XOR panels' clicks): app.cpp is not linked by any test exe yet
-- [ ] Linux CI + AppImage; Windows portable zip
-- [ ] Compile the visual-analysis / compare / capture batch with GCC and Clang (written for
-      -Wall -Wextra but only built with MSVC so far)
+- [x] Linux CI (linux-gcc + linux-clang build and test on every push, 0 warnings)
+- [ ] AppImage; Windows portable zip
+- [x] Compile the visual-analysis / compare / capture batch with GCC and Clang (-Wall -Wextra,
+      green in CI)
 - [ ] Run parsers on a worker thread over a Snapshot (a parse slower than ~50 ms is currently
       not re-run after edits; the Structure panel shows it as stale until F5)
 

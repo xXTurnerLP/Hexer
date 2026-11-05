@@ -8,6 +8,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string>
@@ -429,4 +431,371 @@ TEST_CASE("diff: >4 GiB sparse pair") {
     CHECK(span == std::pair<size_t, size_t>(0, 1));
     CHECK(next_diff(r->ranges, 0) == 0);
     CHECK(next_diff(r->ranges, at) == 1);
+}
+
+// ---- find_shift / ShiftJob ----------------------------------------------------------------------
+
+namespace {
+
+Bytes cat(std::initializer_list<const Bytes*> parts) {
+    Bytes out;
+    for (const Bytes* p : parts) out.insert(out.end(), p->begin(), p->end());
+    return out;
+}
+
+ShiftResult shift_of(const Bytes& a, const Bytes& b, int64_t shift = 0, const ShiftOptions& opt = {}) {
+    return find_shift(*snap_of(a), *snap_of(b), shift, opt);
+}
+
+// The proposed shift really aligns the documents: only the header / the unaligned tails differ.
+void check_aligned(const Bytes& a, const Bytes& b, int64_t shift) {
+    const DiffResult d = diff(a, b, shift);
+    for (const DiffRange& r : d.ranges) CHECK(r.kind != DiffRange::Changed);
+}
+
+}  // namespace
+
+TEST_CASE("find_shift: header inserted in B / deleted from B, various sizes") {
+    const Bytes body = random_bytes(256 * 1024, 21);
+    for (size_t h : {size_t(1), size_t(7), size_t(64), size_t(513), size_t(4096), size_t(100000)}) {
+        CAPTURE(h);
+        Bytes head = random_bytes(h, 100 + h);
+        head[0] = uint8_t(body[0] ^ 0x5A);  // the first byte differs (else the difference starts later)
+        const Bytes with = cat({&head, &body});
+        ShiftResult r = shift_of(body, with);  // B has an extra header
+        REQUIRE(r.status == ShiftResult::Found);
+        CHECK(r.shift == int64_t(h));
+        CHECK(r.delta == int64_t(h));
+        CHECK(r.diff_a == 0);
+        CHECK(std::memcmp(body.data() + r.match_a, with.data() + r.match_b, 64) == 0);
+        check_aligned(body, with, r.shift);
+
+        r = shift_of(with, body);  // A has the extra header (deleted from B)
+        REQUIRE(r.status == ShiftResult::Found);
+        CHECK(r.shift == -int64_t(h));
+        CHECK(r.delta == -int64_t(h));
+        check_aligned(with, body, r.shift);
+    }
+}
+
+TEST_CASE("find_shift: an edit inside the first block after the difference") {
+    const Bytes body = random_bytes(64 * 1024, 25);
+    Bytes head = random_bytes(200, 26);
+    head[0] = uint8_t(body[0] ^ 1);
+    const Bytes b = cat({&head, &body});
+    Bytes a = body;  // A: the original with two edited bytes at 0x10 (what Compare with Backup shows)
+    a[0x10] ^= 0xFF;
+    a[0x11] ^= 0xFF;
+    ShiftResult r = shift_of(a, b);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.shift == 200);
+    CHECK(r.match_a >= 0x12);
+    CHECK(std::memcmp(a.data() + r.match_a, b.data() + r.match_b, 64) == 0);
+    ShiftOptions one;
+    one.probes = 1;
+    CHECK(shift_of(a, b, 0, one).status == ShiftResult::NoMatch);  // why several probes are kept
+}
+
+TEST_CASE("find_shift: insertion / deletion in the middle adds to the current shift") {
+    const Bytes x = random_bytes(10000, 31), y = random_bytes(50000, 32), ins = random_bytes(300, 33);
+    const Bytes hdr = random_bytes(100, 34);
+    const Bytes a = cat({&x, &y});
+    const Bytes b = cat({&hdr, &x, &ins, &y});  // B: a 100-byte header (known shift) + 300 inserted bytes
+    ShiftResult r = shift_of(a, b, 100);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.diff_a == x.size());
+    CHECK(r.diff_b == 100 + x.size());
+    CHECK(r.shift == 400);
+    CHECK(r.delta == 300);
+    CHECK(r.match_a == x.size());
+    CHECK(r.match_b == 400 + x.size());
+
+    r = shift_of(b, a, -100);  // the same seen from the other side: a deletion
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.shift == -400);
+    CHECK(r.delta == -300);
+}
+
+TEST_CASE("find_shift: low-entropy runs are skipped") {
+    const Bytes x = random_bytes(5000, 41), y = random_bytes(20000, 42), zeros(10000, 0), pad(7, 0xAB);
+    // B: zero padding inserted after x. A's probe at the difference is the start of y.
+    {
+        const Bytes a = cat({&x, &y}), b = cat({&x, &zeros, &y});
+        ShiftResult r = shift_of(a, b);
+        REQUIRE(r.status == ShiftResult::Found);
+        CHECK(r.shift == 10000);
+        CHECK(r.match_a >= x.size());
+    }
+    // The difference sits right before an all-zero run on both sides: a probe made of zeros
+    // would match anywhere, so the first distinctive block (in y) is used.
+    {
+        const Bytes a = cat({&x, &zeros, &y}), b = cat({&x, &pad, &zeros, &y});
+        ShiftResult r = shift_of(a, b);
+        REQUIRE(r.status == ShiftResult::Found);
+        CHECK(r.diff_a == x.size());
+        CHECK(r.shift == 7);
+        CHECK(r.match_a > x.size());
+        CHECK(std::memcmp(a.data() + r.match_a, b.data() + r.match_b, 64) == 0);
+    }
+    // Only low-entropy data after the difference: nothing to search with.
+    {
+        const Bytes a = cat({&x, &zeros}), b = cat({&x, &pad, &zeros});
+        ShiftResult r = shift_of(a, b);
+        CHECK(r.status == ShiftResult::NoProbe);
+        CHECK(r.shift == 0);
+        CHECK(r.diff_a == x.size());
+    }
+}
+
+TEST_CASE("find_shift: identical, appended tail, plain change, no match, window bound") {
+    const Bytes a = random_bytes(100000, 51);
+    CHECK(shift_of(a, a).status == ShiftResult::NoDifference);
+    CHECK(shift_of(Bytes{}, Bytes{}).status == ShiftResult::NoDifference);
+    Bytes longer = a;
+    longer.resize(a.size() + 500, 0x11);
+    CHECK(shift_of(a, longer).status == ShiftResult::NoDifference);  // only an appended tail
+
+    // 16 changed bytes: no shift; the bytes after the change already line up.
+    Bytes changed = a;
+    for (size_t i = 1000; i < 1016; ++i) changed[i] ^= 0xFF;
+    ShiftResult r = shift_of(a, changed);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.diff_a == 1000);
+    CHECK(r.delta == 0);
+    CHECK(r.shift == 0);
+    CHECK(r.match_a >= 1016);
+    CHECK(r.match_b == r.match_a);
+    ShiftOptions one;  // a single probe (spanning the change) fails: found by the aligned check
+    one.probes = 1;
+    r = shift_of(a, changed, 0, one);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.delta == 0);
+    CHECK(r.match_a == 1016);
+
+    // Unrelated contents.
+    r = shift_of(a, random_bytes(100000, 52));
+    CHECK(r.status == ShiftResult::NoMatch);
+    CHECK(r.shift == 0);
+
+    // A header longer than the window is not found; a wider window finds it.
+    const Bytes head = random_bytes(5000, 53);
+    const Bytes b = cat({&head, &a});
+    ShiftOptions small;
+    small.window = 4096;
+    CHECK(shift_of(a, b, 0, small).status == ShiftResult::NoMatch);
+    small.window = 5000;
+    r = shift_of(a, b, 0, small);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.shift == 5000);
+    // Nearest match wins: the probe occurs twice in B, at +5000 and at +5000 + 70000.
+    Bytes twice = b;
+    twice.insert(twice.begin() + 75000, a.begin(), a.begin() + 64);
+    r = shift_of(a, twice);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.shift == 5000);
+}
+
+TEST_CASE("find_shift: no overlap under the current shift, huge shifts do not overflow") {
+    const Bytes body = random_bytes(20000, 61), head = random_bytes(3000, 62);
+    const Bytes b = cat({&head, &body});
+    ShiftResult r = shift_of(body, b, 30000);  // B offset 30000 is past B's end: no overlap at all
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.shift == 3000);
+    CHECK(shift_of(body, b, INT64_MAX).status == ShiftResult::NoMatch);
+    CHECK(shift_of(body, b, INT64_MIN).status == ShiftResult::NoMatch);
+}
+
+TEST_CASE("find_shift: job, progress, cancel") {
+    const Bytes body = random_bytes(size_t(6 * kMiB), 71), head = random_bytes(777, 72);
+    const Bytes b = cat({&head, &body});
+    ShiftJob job;
+    CHECK_FALSE(job.result());
+    const uint64_t id = job.start(snap_of(body), snap_of(b), 0);
+    auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto r = job.result();
+    REQUIRE(r);
+    CHECK(r->run == id);
+    CHECK(r->status == ShiftResult::Found);
+    CHECK(r->shift == 777);
+    CHECK(job.progress() == 1.0);
+    CHECK_FALSE(job.running());
+
+    // A cancelled scan of 2 GiB (filled documents share one chunk) stops early.
+    auto da = Document::create_empty("a"), db = Document::create_empty("b");
+    const uint8_t za = 0, zb = 0;
+    REQUIRE(da->fill(0, 2048 * kMiB, &za, 1));
+    REQUIRE(db->fill(0, 2048 * kMiB, &zb, 1));
+    const uint8_t tag = 1;
+    REQUIRE(db->overwrite(2048 * kMiB - 1, &tag, 1));
+    std::atomic<bool> cancel{true};
+    ShiftResult c = find_shift(*da->snapshot(), *db->snapshot(), 0, {}, &cancel);
+    CHECK(c.status == ShiftResult::Cancelled);
+    CHECK(c.shift == 0);
+}
+
+TEST_CASE("find_shift: >4 GiB sparse files, insertion past 4 GiB") {
+    TempDir t;
+    const uint64_t size = (uint64_t(4) << 30) + 2 * kMiB;
+    const std::string p = t.file("a.bin");
+    make_sparse(p, size);
+    auto da = Document::open_file(p), db = Document::open_file(p);
+    REQUIRE(da);
+    REQUIRE(db);
+    const uint64_t at = (uint64_t(4) << 30) + 100;  // beyond 32-bit offsets
+    const Bytes data = random_bytes(4096, 81);
+    Bytes ins = random_bytes(300, 82);
+    ins[0] = uint8_t(data[0] ^ 1);  // the difference starts exactly at `at`
+    REQUIRE(da->overwrite(at, data.data(), data.size()));
+    REQUIRE(db->overwrite(at, data.data(), data.size()));
+    REQUIRE(db->insert(at, ins.data(), ins.size()));
+    auto t0 = std::chrono::steady_clock::now();
+    ShiftResult r = find_shift(*da->snapshot(), *db->snapshot(), 0);
+    MESSAGE("4 GiB sparse find_shift: "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
+            << " ms");
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.diff_a == at);
+    CHECK(r.shift == 300);
+    CHECK(r.match_a == at);
+    CHECK(r.match_b == at + 300);
+}
+
+// ---- Revert to Backup: Document::replace_with_file ----------------------------------------------
+
+namespace {
+
+void write_file(const std::string& p, const Bytes& b) {
+    std::ofstream f(from_u8(p), std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
+}
+
+Bytes read_file(const std::string& p) {
+    std::ifstream f(from_u8(p), std::ios::binary);
+    return Bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+Bytes doc_bytes(const Document& d) {
+    Bytes b(size_t(d.size()));
+    if (!b.empty()) REQUIRE(d.read(0, b.data(), b.size()) == b.size());
+    return b;
+}
+
+}  // namespace
+
+TEST_CASE("replace_with_file: one undo step, references the file, save keeps the .backup") {
+    TempDir t;
+    const std::string p = t.file("data.bin");
+    const Bytes cur = random_bytes(300000, 91), orig = random_bytes(200000, 92);
+    write_file(p, cur);
+    const std::string bak = Document::backup_path_of(p);
+    CHECK(bak == os_absolute_path(p) + ".backup");
+    write_file(bak, orig);
+
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    const uint8_t x = 0x42;
+    REQUIRE(d->overwrite(10, &x, 1));
+    const Bytes edited = doc_bytes(*d);
+    const size_t chunks = d->add_buffer().chunks().size();
+    const size_t undo = d->undo_stack().size();
+
+    std::string err;
+    REQUIRE(d->replace_with_file(bak, "Revert to Backup", &err));
+    CHECK(err.empty());
+    CHECK(doc_bytes(*d) == orig);
+    CHECK(d->dirty());
+    CHECK(d->undo_stack().size() == undo + 1);
+    CHECK(d->undo_stack().back().label == "Revert to Backup");
+    CHECK(d->add_buffer().chunks().size() == chunks);  // nothing copied into memory
+    CHECK(d->table().pieces().size() == 1);
+    CHECK(d->is_modified_range(0, 1));                 // reverted bytes are not the file on disk
+    CHECK(read_file(p) == cur);                        // disk untouched until saved
+
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == edited);
+    CHECK_FALSE(d->is_modified_range(0, 1));           // the current file version again
+    CHECK(d->is_modified_range(10, 1));
+    REQUIRE(d->redo());
+    CHECK(doc_bytes(*d) == orig);
+
+    // Edits on top of the reverted content, then save: a rewrite of the file; the .backup stays.
+    REQUIRE(d->overwrite(5, &x, 1));
+    Bytes want = orig;
+    want[5] = x;
+    CHECK(doc_bytes(*d) == want);
+    REQUIRE(d->save(nullptr, &err));
+    CHECK(read_file(p) == want);
+    CHECK(read_file(bak) == orig);
+    CHECK_FALSE(d->last_save_info().backup_created);
+    CHECK_FALSE(d->dirty());
+    // History survives the save: back to before the revert.
+    REQUIRE(d->undo());
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == edited);
+}
+
+TEST_CASE("replace_with_file: session export inlines small reverts, refusals") {
+    TempDir t;
+    const std::string p = t.file("small.bin");
+    const Bytes cur = random_bytes(5000, 93), orig = random_bytes(7000, 94);
+    write_file(p, cur);
+    const std::string bak = Document::backup_path_of(p);
+    write_file(bak, orig);
+
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    std::string err;
+    CHECK_FALSE(d->replace_with_file(p, "Revert", &err));  // its own file
+    CHECK_FALSE(err.empty());
+    CHECK_FALSE(d->replace_with_file(t.file("missing.bin"), "Revert", &err));
+    d->set_read_only(true);
+    CHECK_FALSE(d->replace_with_file(bak, "Revert", &err));
+    d->set_read_only(false);
+    CHECK(d->undo_stack().empty());
+    CHECK(doc_bytes(*d) == cur);
+
+    REQUIRE(d->replace_with_file(bak, "Revert to Backup", &err));
+    CHECK(d->hot_exit_safe());  // 7000 bytes: inlined into the session
+    PersistedDoc st = d->persist();
+    CHECK_FALSE(st.edits_dropped);
+    auto r = Document::restore(st, nullptr, &err);
+    REQUIRE(r);
+    CHECK(doc_bytes(*r) == orig);
+    REQUIRE(r->undo());
+    CHECK(doc_bytes(*r) == cur);
+
+    // An empty file empties the document (still undoable).
+    const std::string empty = t.file("empty.bin");
+    write_file(empty, {});
+    REQUIRE(d->replace_with_file(empty, "Revert", &err));
+    CHECK(d->size() == 0);
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == orig);
+}
+
+TEST_CASE("replace_with_file: after an undo (redo states dropped) the file stays referenced") {
+    // Regression: the new undo step drops the redo states, which prunes unused sources; the
+    // just-inserted file source was pruned too and the reverted content read as nothing / zeros.
+    TempDir t;
+    const std::string p = t.file("redo.bin");
+    const Bytes cur = random_bytes(4000, 95), orig = random_bytes(6000, 96);
+    write_file(p, cur);
+    const std::string bak = Document::backup_path_of(p);
+    write_file(bak, orig);
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    const uint8_t x = 0x42;
+    REQUIRE(d->overwrite(10, &x, 1));
+    REQUIRE(d->undo());
+    REQUIRE_FALSE(d->redo_stack().empty());
+    std::string err;
+    REQUIRE(d->replace_with_file(bak, "Revert to Backup", &err));
+    CHECK(d->redo_stack().empty());
+    CHECK(doc_bytes(*d) == orig);
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == cur);
+    REQUIRE(d->redo());
+    CHECK(doc_bytes(*d) == orig);
 }

@@ -791,6 +791,49 @@ bool Document::fill(uint64_t offset, uint64_t len, const uint8_t* pattern, size_
     return true;
 }
 
+std::string Document::backup_path_of(const std::string& path) {
+    return backup_path_for(os_resolve_symlinks(os_absolute_path(path)));
+}
+
+bool Document::replace_with_file(const std::string& path, const std::string& label, std::string* err) {
+    const std::string abs = os_absolute_path(path);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!path_.empty() && (path_ == abs || os_same_file(path_, abs)))
+            return fail(err, path_filename(abs) + " is this document's own file");
+    }
+    std::string oerr;
+    auto src = FileSource::open(abs, &oerr);
+    if (!src) return fail(err, "Cannot open " + abs + ": " + oerr);
+    if (src->kind() != SourceKind::File || src->stat_at_open().is_device)
+        return fail(err, abs + " is not a regular file");
+    std::lock_guard<std::mutex> lk(mu_);
+    apply_pending();
+    if (busy_.load()) return fail(err, "A save is in progress");
+    if (read_only_) return fail(err, "Document is read-only");
+    if (sources_.back() && sources_.back()->kind() != SourceKind::File)
+        return fail(err, "The size of a device or process memory cannot change");
+    const uint64_t size = src->size();
+    // Pushed before the file is added: dropping the redo states prunes sources nothing references,
+    // which would release the new one (not referenced yet).
+    push_undo(label.empty() ? "Replace with File" : label.c_str(), false, 0, size);
+    // The file goes in just before the current version (sources_.back() stays the current one),
+    // so every piece of the current version moves up one index (the step just pushed included).
+    const uint32_t cur = current_source();
+    auto remap = [cur](std::vector<Piece>& ps) {
+        for (Piece& p : ps)
+            if (p.src == Piece::Original && p.chunk == cur) p.chunk = cur + 1;
+    };
+    for (auto* stack : {&undo_, &redo_, &pend_undo_, &pend_redo_, &group_redo_})
+        for (UndoEntry& e : *stack) remap(e.pieces);
+    sources_.insert(sources_.end() - 1, src);
+    std::vector<Piece> np;
+    if (size) np.push_back(Piece{Piece::Original, cur, 0, size});
+    table_.assign(std::move(np));
+    after_change();
+    return true;
+}
+
 void Document::begin_group(const std::string& label) {
     std::lock_guard<std::mutex> lk(mu_);
     if (group_depth_ == 0) {

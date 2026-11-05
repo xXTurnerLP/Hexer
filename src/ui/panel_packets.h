@@ -15,6 +15,7 @@
 //     packets re-parses each one (the protocol-analysis loop).
 // State (index, filter, selection, parser choice) is kept per document (by Document::id()); call
 // forget() when a document is closed.
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -61,6 +62,12 @@ struct PacketsPanel {
     // True if `doc` looks like a capture (host: auto-show the panel for such documents).
     static bool is_capture(const Document& doc);
 
+    // The last draw (for headless tests, tests/test_panels.cpp): screen position of the centre of
+    // table row `row`'s "#" cell; false if that row was not drawn. The selected packet (0-based
+    // index, SIZE_MAX = none) of document `doc_id`.
+    bool row_pos(size_t row, float& x, float& y) const;
+    size_t selected_packet(uint64_t doc_id) const;
+
 private:
     struct DocState;
     DocState& state(uint64_t doc_id);
@@ -68,6 +75,11 @@ private:
     bool index_requested_ = false;
     bool wants_frames_ = false;
     float rows_per_page_ = 20.0f;  // from the last table draw (PageUp / PageDown)
+    struct DrawnRow {
+        size_t row;
+        float x, y;
+    };
+    std::vector<DrawnRow> drawn_;  // rows of the last table draw (row_pos)
 };
 
 }  // namespace hx

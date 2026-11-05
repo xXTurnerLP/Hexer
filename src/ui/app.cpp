@@ -305,8 +305,16 @@ void new_document(App& app) {
 
 void end_compare(App& app) {
     app.diff.reset();  // cancels and joins its compare job
+    app.diff_aux.reset();
+    app.diff_aux_backup = false;
     app.diff_a = app.diff_b = 0;
     app.diff_select = false;
+}
+
+// The Compare tab's B side: an open tab, or the read-only file on disk / .backup (App::diff_aux).
+Tab* compare_b(App& app) {
+    if (app.diff_aux) return app.diff_aux->doc->id() == app.diff_b ? app.diff_aux.get() : nullptr;
+    return find_tab(app, app.diff_b);
 }
 
 void close_tab_now(App& app, int index) {
@@ -513,6 +521,19 @@ void open_with_dialog(App& app) {
 }
 
 }  // namespace
+
+bool save_file_dialog(App& app, const std::string& default_name, std::string& out) {
+    const std::string dir = dialog_dir(app);
+    nfdu8char_t* p = nullptr;
+    nfdresult_t r = NFD_SaveDialogU8(&p, nullptr, 0, dir.empty() ? nullptr : dir.c_str(), default_name.c_str());
+    if (r == NFD_OKAY && p) {
+        out = p;
+        NFD_FreePathU8(p);
+        return true;
+    }
+    if (r == NFD_ERROR) report_dialog_error(app);
+    return false;
+}
 
 // =============================================================================================
 // Saving (worker thread) and quitting
@@ -1120,6 +1141,8 @@ void compare_with(App& app, uint64_t other) {
         return;
     }
     if (!app.diff || app.diff_a != a->doc->id() || app.diff_b != other) app.diff = std::make_unique<DiffView>();
+    app.diff_aux.reset();  // B is an open tab now
+    app.diff_aux_backup = false;
     app.diff_a = a->doc->id();
     app.diff_b = other;
     app.diff_select = true;
@@ -1144,7 +1167,105 @@ void compare_with_file(App& app) {
     compare_with(app, b_id);
 }
 
+// Compare tab `a` (A) with its file as saved on disk (exactly the unsaved edits) or, with
+// `backup`, with its "<file>.backup" (the original from before Hexer first saved it). B is a
+// read-only Document of its own (App::diff_aux), labelled "<name> (on disk)" / "<name>.backup".
+bool compare_with_aux(App& app, Tab& a, bool backup) {
+    Document& d = *a.doc;
+    if (d.busy() || !d.has_path() || d.target() != SourceKind::File) {
+        set_status(app, "Only a file can be compared with its version on disk or its backup");
+        return false;
+    }
+    const std::string path = backup ? Document::backup_path_of(d.path()) : d.path();
+    std::string err;
+    std::unique_ptr<Document> doc = Document::open_file(path, &err);
+    if (!doc) {
+        notify(app, "Cannot open " + path + (err.empty() ? "" : ": " + err), true);
+        return false;
+    }
+    doc->set_read_only(true);
+    doc->set_display_name(backup ? path_filename(path) : a.label + " (on disk)");
+    auto t = std::make_unique<Tab>();
+    t->doc = std::move(doc);
+    refresh_tab_cache(*t);
+    app.diff = std::make_unique<DiffView>();
+    app.diff_a = d.id();
+    app.diff_b = t->doc->id();
+    app.diff_aux = std::move(t);
+    app.diff_aux_backup = backup;
+    app.diff_select = true;
+    set_status(app, "Comparing " + a.label + " with " + app.diff_aux->label +
+                        (backup ? "  (Revert to Backup replaces the content, undoable)" : "  (B shows the saved file)"), 6.0);
+    return true;
+}
+
+void compare_with_disk(App& app) {
+    if (Tab* t = active_tab(app)) compare_with_aux(app, *t, false);
+}
+
+void compare_with_backup(App& app) {
+    if (Tab* t = active_tab(app)) compare_with_aux(app, *t, true);
+}
+
+// The "on disk" side follows the file (checked once a second): after a save of A, or a write by
+// another program, it reloads and the compare reruns.
+void refresh_disk_side(App& app) {
+    if (!app.diff_aux || app.diff_aux_backup) return;
+    Tab& t = *app.diff_aux;
+    const double now = ImGui::GetTime();
+    if (now < t.next_disk_check) return;
+    t.next_disk_check = now + 1.0;
+    Tab* ta = find_tab(app, app.diff_a);
+    if ((ta && ta->doc->busy()) || !t.doc->changed_on_disk()) return;
+    std::string err;
+    if (!t.doc->reload(&err)) {
+        t.next_disk_check = now + 5.0;
+        set_status(app, "Cannot re-read " + t.path + (err.empty() ? "" : ": " + err));
+    }
+}
+
+bool has_disk_file(App& a) {
+    Document* d = usable_doc(a);
+    return d && d->has_path() && d->target() == SourceKind::File;
+}
+
+// "Restore from .backup" items: the active file has a "<file>.backup" (one stat per call).
+bool has_backup(App& a) {
+    Document* d = usable_doc(a);
+    return d && d->has_path() && d->target() == SourceKind::File && os_stat(Document::backup_path_of(d->path())).exists;
+}
+
+bool can_revert_to_backup(App& a) {
+    Document* d = usable_doc(a);
+    return d && !d->read_only() && has_backup(a);
+}
+
+// Replaces the active document's content with its .backup as one undoable edit (Document::
+// replace_with_file: references the file, copies nothing). Nothing on disk changes until Save.
+void revert_to_backup(App& app) {
+    Tab* t = active_tab(app);
+    if (!t || t->doc->busy()) return;
+    const std::string bak = Document::backup_path_of(t->doc->path());
+    std::string err;
+    if (!t->doc->replace_with_file(bak, "Revert to Backup", &err)) {
+        notify(app, "Cannot revert to " + path_filename(bak) + (err.empty() ? "" : ": " + err), true);
+        return;
+    }
+    t->doc->view_generation++;
+    set_status(app, "Reverted " + t->label + " to " + path_filename(bak) + " (Undo restores it; Save writes it)", 8.0);
+    if (!t->doc->hot_exit_safe())
+        log_console(app, ConsoleLine::Warn,
+                    t->label + ": the reverted content (" + fmt_size(t->doc->size()) +
+                        ") is too large for the session; save it before quitting (Hexer asks on exit).");
+}
+
 bool has_compare(App& a) { return a.diff != nullptr; }
+
+void compare_find_shift(App& a) {
+    if (!a.diff) return;
+    a.diff->request_find_shift();
+    a.diff_select = true;
+}
 
 void compare_step(App& a, bool next) {
     if (!a.diff) return;
@@ -1157,7 +1278,7 @@ void compare_step(App& a, bool next) {
 // inserted header) and the compare lines them up.
 void compare_align(App& a) {
     Tab* ta = a.diff ? find_tab(a, a.diff_a) : nullptr;
-    Tab* tb = a.diff ? find_tab(a, a.diff_b) : nullptr;
+    Tab* tb = a.diff ? compare_b(a) : nullptr;
     if (!ta || !tb || ta->doc->busy() || tb->doc->busy()) return;
     const uint64_t ca = focus_offset(ta->doc->view()), cb = focus_offset(tb->doc->view());
     const uint64_t d = cb >= ca ? cb - ca : ca - cb;
@@ -1462,6 +1583,10 @@ const Action kActions[] = {
     {"Compare: Previous Difference", {0, 0}, [](App& a) { compare_step(a, false); }, has_compare, true, false},
     {"Compare: Recompare", {0, 0}, [](App& a) { a.diff->request_recompare(); a.diff_select = true; }, has_compare, true, false},
     {"Compare: Align at Cursors", {0, 0}, compare_align, has_compare, true, false},
+    {"Compare: Find Shift", {0, 0}, compare_find_shift, has_compare, true, false},
+    {"Compare with File on Disk", {0, 0}, compare_with_disk, has_disk_file, true, false},
+    {"Compare with Backup", {0, 0}, compare_with_backup, has_backup, true, false},
+    {"Revert to Backup", {0, 0}, revert_to_backup, can_revert_to_backup, true, false},
     {"Close Compare", {0, 0}, [](App& a) { end_compare(a); }, has_compare, true, false},
     {"Exit", {0, 0}, [](App& a) { a.quit_requested = true; }, nullptr, true, false},
     // Edit
@@ -1553,6 +1678,7 @@ const Action kActions[] = {
     {"Bitmap: Show at Cursor", {0, 0}, bitmap_at_cursor, has_doc, true, false},
     {"Disassemble at Cursor", {0, 0}, disasm_at_cursor, has_doc, true, false},
     {"Go to Entry Point", {0, 0}, disasm_go_to_entry, has_doc, true, false},
+    {"Go to Symbol...", {0, 0}, disasm_go_to_symbol, has_doc, true, false},
     {"Disassembly: Follow Target", {0, 0}, disasm_follow_target, has_doc, true, false},
     {"Packets: Index Capture", {0, 0}, [](App& a) {
          a.show_packets = a.focus_packets = true;
@@ -1566,6 +1692,10 @@ const Action kActions[] = {
     {"Structure: Parse from File Start", {0, 0}, [](App& a) {
          if (Tab* t = active_tab(a); t && usable_doc(a)) set_parse_base(a, *t, 0);
      }, [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && (t->st.base != 0 || t->st.length != UINT64_MAX); }, true, false},
+    {"Structure: Copy as C Header", {0, 0}, [](App& a) { structure_copy_c_header(a); },
+     [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && t->st.has_result && !t->st.result.fields.empty(); }, true, false},
+    {"Structure: Export C Header...", {0, 0}, [](App& a) { structure_export_c_header(a); },
+     [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && t->st.has_result && !t->st.result.fields.empty(); }, true, false},
     {"New Parser from C Struct...", {0, 0}, [](App& a) { a.cstruct_dlg.open(); }, nullptr, true, false},
     {"C Struct: Apply at Cursor", {0, 0}, apply_cstruct_at_cursor, has_doc, true, false},
     {"Reload Scripts", {0, 0}, [](App& a) { a.engine->reload(); set_status(a, "Scripts reloaded"); }, idle, true, false},
@@ -1800,6 +1930,8 @@ void draw_scripts_menu(App& app) {
     menu_action(app, "Structure: Parse at Cursor", "Parse at Cursor");
     menu_action(app, "Structure: Parse Selection", "Parse Selection");
     menu_action(app, "Structure: Parse from File Start", "Parse from File Start");
+    menu_action(app, "Structure: Copy as C Header", "Copy Structure as C Header");
+    menu_action(app, "Structure: Export C Header...", "Export Structure as C Header...");
     ImGui::Separator();
     menu_action(app, "New Parser from C Struct...");
     menu_action(app, "Reload Scripts");
@@ -1829,6 +1961,7 @@ void draw_navigate_items(App& app) {
         ImGui::EndMenu();
     }
     menu_action(app, "Go to Entry Point");
+    menu_action(app, "Go to Symbol...");
 }
 
 // File > Compare With: every other open document, or a file to open.
@@ -1847,10 +1980,12 @@ void draw_compare_menu(App& app) {
     if (!any) ImGui::TextDisabled("No other open document");
     ImGui::Separator();
     const bool file = ImGui::MenuItem("File...");
+    menu_action(app, "Compare with File on Disk", "File on Disk (Unsaved Edits)");
     if (app.diff) {
         ImGui::Separator();
         menu_action(app, "Compare: Next Difference", "Next Difference");
         menu_action(app, "Compare: Previous Difference", "Previous Difference");
+        menu_action(app, "Compare: Find Shift", "Find Shift (Align Automatically)");
         menu_action(app, "Compare: Align at Cursors", "Align at Cursors (Set Shift)");
         menu_action(app, "Compare: Recompare", "Recompare");
     }
@@ -1874,6 +2009,11 @@ void draw_main_menu(App& app) {
         ImGui::Separator();
         if (ImGui::BeginMenu("Compare With", has_doc(app))) {
             draw_compare_menu(app);
+            ImGui::EndMenu();
+        }
+        if (has_backup(app) && ImGui::BeginMenu("Restore from .backup")) {  // only when <file>.backup exists
+            menu_action(app, "Compare with Backup", "Compare with Backup (Side by Side)");
+            menu_action(app, "Revert to Backup");
             ImGui::EndMenu();
         }
         menu_action(app, "Close Compare");
@@ -2186,7 +2326,12 @@ void update_entropy(App& app, Tab& t) {
         // of random data (~7.9 instead of 8 bits/byte at 1 KiB), which would show it orange.
         EntropyOptions o;
         o.buckets = uint32_t(std::clamp<uint64_t>(d.size() / 4096, 16, o.buckets));
-        t.entropy.start(d.snapshot(), o);
+        // Edits rescan only the buckets they touched; a save may have patched the file in place
+        // (bytes changed under unchanged pieces), so the first scan after one reads everything.
+        const uint64_t saved = d.saved_state_id();
+        if (first || saved != t.entropy_saved) t.entropy.start(d.snapshot(), o);
+        else t.entropy.rescan(d.snapshot(), o);
+        t.entropy_saved = saved;
         t.entropy_gen = t.entropy_pending_gen = g;
     } else {
         app.wants_poll = true;  // wake up when the debounce expires
@@ -2510,8 +2655,9 @@ void draw_editor(App& app) {
         app.diff_shown = false;
         if (app.diff) {
             Tab* ta = find_tab(app, app.diff_a);
-            Tab* tb = find_tab(app, app.diff_b);
+            Tab* tb = compare_b(app);
             if (ta && tb) {
+                refresh_disk_side(app);
                 ImGuiTabItemFlags flags = app.diff_select ? ImGuiTabItemFlags_SetSelected : 0;
                 app.diff_select = false;
                 const std::string label = "Compare: " + ta->label + " / " + tb->label + "###compare";
@@ -3349,6 +3495,18 @@ void App::reveal(Document& doc, uint64_t offset, uint64_t len) {
     if (Tab* t = find_tab(*this, doc.id())) reveal_range(*this, *t, offset, len, true);
 }
 
+// doc:view_range(): the bytes the tab's (active pane's) hex view showed in its last draw.
+bool App::view_range(Document& doc, uint64_t& first, uint64_t& last) {
+    Tab* t = find_tab(*this, doc.id());
+    const uint64_t size = doc.size();
+    if (!t || size == 0 || t->ev.visible_rows <= 0 || t->ev.bytes_per_row <= 0) return false;
+    const uint64_t bpr = uint64_t(t->ev.bytes_per_row);
+    const uint64_t top = doc.view().top_row;
+    first = top > (size - 1) / bpr ? ((size - 1) / bpr) * bpr : top * bpr;
+    last = first + std::min(size - first, uint64_t(t->ev.visible_rows) * bpr) - 1;
+    return true;
+}
+
 // =============================================================================================
 // Per-frame housekeeping: drops, disk changes, scripts, session, settings, title
 // =============================================================================================
@@ -3494,11 +3652,14 @@ void restore_tab_extras(App& app, Tab& t) {
         t.split_restore = std::min(text_u64(d.extra("split.top2"), 0), d.size());
     }
     if (d.extra("tail.enabled") == "1") start_live_tail(app, t, false);
+    app.disasm_panel.restore_extras(d);  // "disasm.*": map choice, manual base, pinned start
 }
 
 // The Compare tab as session extras "compare.0" = "<docidA>|<docidB>|<shift>" and "active" =
 // "compare.0" while it is the selected tab. Process documents are not in the session: a compare
-// with one is dropped.
+// with one is dropped. A compare with A's file on disk / its .backup (App::diff_aux) is stored as
+// "<docidA>|disk|<shift>" / "<docidA>|backup|<shift>" and reopened from A's path (older versions
+// read the middle field as id 0 and skip it).
 void save_session_extras(App& app) {
     Session& s = *app.session;
     std::vector<std::string> stale;
@@ -3507,9 +3668,11 @@ void save_session_extras(App& app) {
     for (const std::string& k : stale) s.set_extra(k, "");
     std::string cmp;
     Tab* ta = app.diff ? find_tab(app, app.diff_a) : nullptr;
-    Tab* tb = app.diff ? find_tab(app, app.diff_b) : nullptr;
+    Tab* tb = app.diff ? compare_b(app) : nullptr;
     if (ta && tb && ta->doc->persistable() && tb->doc->persistable())
-        cmp = u64_text(app.diff_a) + "|" + u64_text(app.diff_b) + "|" + std::to_string(app.diff->shift);
+        cmp = u64_text(app.diff_a) + "|" +
+              (app.diff_aux ? std::string(app.diff_aux_backup ? "backup" : "disk") : u64_text(app.diff_b)) + "|" +
+              std::to_string(app.diff->shift);
     s.set_extra("compare.0", cmp);
     s.set_extra("active", !cmp.empty() && app.diff_shown ? "compare.0" : "");
 }
@@ -3527,7 +3690,20 @@ void restore_session_extras(App& app, const std::vector<std::pair<uint64_t, uint
     const size_t a = cmp.find('|'), b = a == std::string::npos ? a : cmp.find('|', a + 1);
     if (b == std::string::npos) return;
     const uint64_t ida = map_id(text_u64(cmp.substr(0, a), 0));
-    const uint64_t idb = map_id(text_u64(cmp.substr(a + 1, b - a - 1), 0));
+    const std::string side_b = cmp.substr(a + 1, b - a - 1);
+    if (side_b == "disk" || side_b == "backup") {
+        Tab* ta = find_tab(app, ida);
+        if (!ta || !compare_with_aux(app, *ta, side_b == "backup")) {
+            log_console(app, ConsoleLine::Warn,
+                        "The Compare tab (" + std::string(side_b == "backup" ? "with the .backup" : "with the file on disk") +
+                            ") was not restored: its document or file is gone");
+            return;
+        }
+        app.diff->shift = std::strtoll(cmp.c_str() + b + 1, nullptr, 10);
+        app.diff_select = app.session->extra("active") == "compare.0";
+        return;
+    }
+    const uint64_t idb = map_id(text_u64(side_b, 0));
     if (!ida || !idb || ida == idb) return;
     app.diff = std::make_unique<DiffView>();
     app.diff_a = ida;
@@ -3544,7 +3720,10 @@ bool save_session(App& app, bool force, std::string* err_out) {
         if (err_out) *err_out = "a document is being saved";
         return false;
     }
-    for (auto& t : app.tabs) save_tab_extras(*t);
+    for (auto& t : app.tabs) {
+        save_tab_extras(*t);
+        if (!t->doc->busy()) app.disasm_panel.save_extras(*t->doc);
+    }
     const uint64_t sig = session_signature(app);
     if (!force && sig == app.session_sig) return true;
     save_session_extras(app);

@@ -24,6 +24,7 @@ core_lib = static_library('hexer_core',
   'core/devices.cpp',        # enumerate processes / disks
   'core/xorscan.cpp',        # XOR / ADD / ROL brute force
   'core/exe_map.cpp',        # PE / ELF file offset <-> virtual address
+  'core/symbols.cpp',        # PE exports / imports, ELF symtab / PLT names
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [threads_dep],
@@ -44,6 +45,7 @@ disasm_dep = declare_dependency(link_with : disasm_lib, dependencies : [core_dep
 script_lib = static_library('hexer_script',
   'script/script_engine.cpp',
   'script/lua_api.cpp',
+  'script/cexport.cpp',      # parse tree -> C header, opts.flags names
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [core_dep, disasm_dep, lua_dep],
@@ -56,6 +58,9 @@ ui_view_lib = static_library('hexer_ui_view',
   'ui/hex_view.cpp',
   'ui/minimap.cpp',
   'ui/panel_disasm.cpp',     # Disassembly panel (no App dependency; tests/test_disasm.cpp drives it)
+  'ui/panel_bitmap.cpp',     # Bitmap / Packets panels, Compare view: no App dependency either
+  'ui/panel_packets.cpp',    # (tests/test_panels.cpp drives them headlessly)
+  'ui/view_diff.cpp',
   'ui/third_party/imgui_freetype.cpp',  # vendored from imgui misc/freetype (MIT)
   include_directories : inc,
   cpp_args : conf_args,
@@ -71,9 +76,6 @@ ui_lib = static_library('hexer_ui',
   'ui/panel_strings.cpp',
   'ui/panel_hash.cpp',
   'ui/dialog_cstruct.cpp',
-  'ui/panel_bitmap.cpp',
-  'ui/view_diff.cpp',
-  'ui/panel_packets.cpp',
   'ui/dialog_targets.cpp',
   'ui/panel_history.cpp',
   'ui/panel_xor.cpp',

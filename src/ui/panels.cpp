@@ -4,6 +4,7 @@
 #include "ui/panels.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <climits>
 #include <cstdio>
@@ -18,7 +19,9 @@
 #include "core/highlight.h"
 #include "core/inspector.h"
 #include "core/nav.h"
+#include "core/os_file.h"
 #include "core/util.h"
+#include "script/cexport.h"
 #include "ui/app_internal.h"
 #include "ui/hex_view.h"
 
@@ -263,6 +266,113 @@ void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, 
     ImGui::PopID();
 }
 
+// ---- Bits row: one toggle per bit of the integer at the focus offset ----
+
+constexpr int kBitsRow = int(InspType::Count);  // its row index for g_insp_hover / inspector_mark
+
+// Width in bytes of the Bits row: the selected integer row's (the follow-pointer type), else 1.
+int bits_width(const App& app) {
+    int w = 1;
+    bool sgn = false;
+    if (app.insp_sel >= 0 && app.insp_sel < int(InspType::Count) && insp_int_type(InspType(app.insp_sel), w, sgn))
+        return w;
+    return 1;
+}
+
+// Bit names of the Structure field (opts.flags) that covers exactly these `w` bytes at `at`.
+const std::vector<Field::FlagItem>* flag_names_at(const Tab& t, const Document& d, uint64_t at, int w) {
+    const StructureState& st = t.st;
+    if (!st.has_result || st.gen != d.generation()) return nullptr;
+    const Highlight* h = st.result.highlights.at(at);
+    if (!h || h->field < 0 || h->field >= int(st.result.fields.size())) return nullptr;
+    const Field& f = st.result.fields[size_t(h->field)];
+    return f.flags && f.offset == at && f.size == uint64_t(w) ? f.flags.get() : nullptr;
+}
+
+void draw_bits_row(App& app, Tab& t, Document& d, const uint8_t* buf, const uint8_t* bad, size_t n, bool be) {
+    const int w = bits_width(app);
+    const uint64_t at = focus_offset(d.view());
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("bits%d", w * 8);
+    if (ImGui::IsItemHovered()) {
+        g_insp_hover.row = kBitsRow;
+        g_insp_hover.frame = ImGui::GetFrameCount();
+        ImGui::SetTooltip("%d bits at the cursor, most significant first (%s). Click a bit to flip it (undoable).\n"
+                              "Width: the selected integer row (click uint16 / uint32 / uint64), else 8 bits.",
+                              w * 8, be ? "big endian" : "little endian");
+    }
+    ImGui::TableSetColumnIndex(1);
+    ImGui::PushFont(app.fonts.mono, 0.0f);
+    bool unreadable = false;
+    for (int i = 0; i < w && size_t(i) < n; ++i) unreadable |= bad[i] != 0;
+    if (n < size_t(w)) {
+        ImGui::TextDisabled("-");
+    } else if (unreadable) {
+        ImGui::TextColored(kErrColor, "??");
+    } else {
+        uint64_t v = 0;
+        for (int i = 0; i < w; ++i) v |= uint64_t(buf[be ? w - 1 - i : i]) << (8 * i);
+        const std::vector<Field::FlagItem>* names = flag_names_at(t, d, at, w);
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float pad_x = 3.0f * app.ui_scale;  // compact cells: 16 bits per line fit more often
+        const float cell = ImGui::CalcTextSize("0").x + pad_x * 2.0f;
+        const float gap = 1.0f * app.ui_scale, group_gap = 5.0f * app.ui_scale;
+        const float label_gap = style.ItemSpacing.x;  // read before the PushStyleVar below changes it
+        const float label = ImGui::CalcTextSize("63").x + label_gap;
+        const float line16 = label + 16.0f * (cell + gap) + 4.0f * group_gap;
+        const int per_line = (w >= 2 && ImGui::GetContentRegionAvail().x >= line16) ? 16 : 8;
+        const bool ro = d.read_only();
+        int flip = -1;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(pad_x, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, 2.0f * app.ui_scale));
+        for (int hi = w * 8 - 1; hi >= 0; hi -= per_line) {
+            ImGui::TextDisabled("%2d", hi);
+            ImGui::SameLine(0.0f, label_gap);
+            for (int k = 0; k < per_line && hi - k >= 0; ++k) {
+                const int bit = hi - k;
+                const bool set = (v >> bit) & 1;
+                if (k) ImGui::SameLine(0.0f, k % 8 == 0 ? 2.0f * group_gap : k % 4 == 0 ? group_gap : gap);
+                ImGui::PushID(bit);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetColorU32(set ? ImGuiCol_ButtonActive : ImGuiCol_FrameBg));
+                ImGui::BeginDisabled(ro);
+                if (ImGui::Button(set ? "1" : "0", ImVec2(cell, 0.0f))) flip = bit;
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip)) {
+                    std::string name;
+                    if (names)
+                        for (const Field::FlagItem& it : *names)
+                            if (it.bit == bit) name = "  " + it.name;
+                    ImGui::SetTooltip("bit %d = %d  (mask 0x%llX)%s\n%s", bit, set ? 1 : 0,
+                                      static_cast<unsigned long long>(uint64_t(1) << bit), name.c_str(),
+                                      ro ? "Read-only document" : set ? "Click to clear" : "Click to set");
+                    g_insp_hover.row = kBitsRow;
+                    g_insp_hover.frame = ImGui::GetFrameCount();
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::PopStyleVar(2);
+        if (names) {  // set flags of the Structure field here (Lua opts.flags)
+            const std::string set_names = format_flags(v, w, *names);
+            ImGui::TextDisabled("%s", set_names.empty() ? "(no flags set)" : set_names.c_str());
+        }
+        if (flip >= 0) {
+            std::string err;
+            if (inspector_toggle_bit(d, at, w, be, flip, &err)) {
+                d.view_generation++;
+                set_status(app, "Bit " + std::to_string(flip) + ((v >> flip) & 1 ? " cleared" : " set") + " at " +
+                                    fmt_offset(at) + "  (Ctrl+Z undoes)");
+            } else {
+                set_status(app, "Cannot flip bit " + std::to_string(flip) + ": " + err);
+            }
+        }
+    }
+    ImGui::PopFont();
+}
+
 void draw_selection_info(Document& d) {
     const ViewState& v = d.view();
     if (!v.has_selection()) {
@@ -321,7 +431,10 @@ void draw_inspector_panel(App& app) {
         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 96.0f * app.ui_scale);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
-        for (size_t i = 0; i < rows.size(); ++i) draw_inspector_row(app, *active_tab(app), *d, rows[i], int(i), be);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            draw_inspector_row(app, *active_tab(app), *d, rows[i], int(i), be);
+            if (i == 0) draw_bits_row(app, *active_tab(app), *d, buf, bad, n, be);  // after the binary row
+        }
         ImGui::EndTable();
         g_insp_hover.drawn_frame = ImGui::GetFrameCount();
     }
@@ -338,9 +451,16 @@ bool inspector_mark(App& app, const Tab& t, uint64_t& offset, uint64_t& length) 
         return false;
     int row = g_insp_hover.frame >= frame - 1 ? g_insp_hover.row : -1;
     if (row < 0) row = app.insp_sel;
-    if (row < 0 || row >= int(InspType::Count)) return false;
     const Document& d = *t.doc;
     const uint64_t at = focus_offset(d.view());
+    if (row == kBitsRow) {  // the Bits grid: the integer it shows
+        const uint64_t w = uint64_t(bits_width(app));
+        if (at > d.size() || d.size() - at < w) return false;
+        offset = at;
+        length = w;
+        return true;
+    }
+    if (row < 0 || row >= int(InspType::Count)) return false;
     uint8_t buf[16] = {};
     const size_t n = d.read(at, buf, sizeof buf);
     const std::vector<InspRow> rows = inspect(buf, n, app.settings.big_endian_inspector);
@@ -543,6 +663,17 @@ void draw_parser_combo(App& app, Tab& t, Document& d) {
         st.pending_gen = UINT64_MAX - 1;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run the parser again (F5)");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!st.has_result || st.result.fields.empty());
+    if (ImGui::Button("C Header")) ImGui::OpenPopup("##cheader");
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("The parsed tree as packed C structs (right-click a struct row for just that struct)");
+    if (ImGui::BeginPopup("##cheader")) {
+        if (ImGui::MenuItem("Copy as C Header")) structure_copy_c_header(app);
+        if (ImGui::MenuItem("Export C Header...")) structure_export_c_header(app);
+        close_popup_on_escape();
+        ImGui::EndPopup();
+    }
 }
 
 // "Parse at [offset] [Cursor] [File start]": where the parser starts (e.g. a PNG inside a dump).
@@ -721,6 +852,14 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
             if (ImGui::MenuItem("Follow as pointer", nullptr, false, st.gen == d.generation()))
                 follow_pointer_as(app, t, f.offset, ptr);
         }
+        ImGui::Separator();
+        if (!leaf) {  // just this struct / array
+            if (ImGui::MenuItem("Copy Struct as C Header")) structure_copy_c_header(app, fi);
+            if (ImGui::MenuItem("Export Struct as C Header...")) structure_export_c_header(app, fi);
+        }
+        if (ImGui::MenuItem("Copy as C Header")) structure_copy_c_header(app);
+        ImGui::SetItemTooltip("The whole parse tree as packed C structs");
+        if (ImGui::MenuItem("Export C Header...")) structure_export_c_header(app);
         close_popup_on_escape();
         ImGui::EndPopup();
     }
@@ -867,6 +1006,54 @@ void set_parse_base(App& app, Tab& t, uint64_t base, uint64_t length) {
         set_status(app, "Parsing " + fmt_range(base, std::min(length, d.size() - base)), 3.0);
     else
         set_status(app, base ? "Parsing from " + fmt_offset(base) : std::string("Parsing from the file start"), 3.0);
+}
+
+namespace {
+
+// C header of the active tab's parse tree (field -1 = all of it); "" (and a status) if none.
+// `file_name` gets a suggestion for the export dialog ("PNG_image.h").
+std::string active_c_header(App& app, int field, std::string* file_name) {
+    Tab* t = active_tab(app);
+    if (!t || !usable_doc(app)) return {};
+    const StructureState& st = t->st;
+    if (!st.has_result || st.result.fields.empty()) {
+        set_status(app, "C header: nothing parsed (pick a parser in the Structure panel)");
+        return {};
+    }
+    if (field >= int(st.result.fields.size())) field = -1;
+    const std::string name = field >= 0 ? st.result.fields[size_t(field)].name
+                                        : (st.result.parser.empty() ? st.used_parser : st.result.parser);
+    std::string h = fields_to_c_header(st.result.fields, field, name);
+    if (h.empty()) set_status(app, "C header: the parse tree declares no bytes");
+    if (file_name) {
+        *file_name = name.empty() ? std::string("structure") : name;
+        for (char& c : *file_name)
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) c = '_';
+        *file_name += ".h";
+    }
+    return h;
+}
+
+}  // namespace
+
+void structure_copy_c_header(App& app, int field) {
+    const std::string h = active_c_header(app, field, nullptr);
+    if (h.empty()) return;
+    ImGui::SetClipboardText(h.c_str());
+    const size_t lines = size_t(std::count(h.begin(), h.end(), '\n'));
+    set_status(app, "Copied the C header (" + std::to_string(lines) + " lines) to the clipboard");
+}
+
+void structure_export_c_header(App& app, int field) {
+    std::string name;
+    const std::string h = active_c_header(app, field, &name);
+    if (h.empty()) return;
+    std::string path, err;
+    if (!save_file_dialog(app, name, path)) return;
+    if (!os_write_whole_atomic(path, h.data(), h.size(), &err))
+        notify(app, "Export C header failed: " + (err.empty() ? std::string("write error") : err), true);
+    else
+        set_status(app, "Wrote the C header to " + path, 6.0);
 }
 
 void draw_structure_panel(App& app) {
@@ -1641,34 +1828,20 @@ void draw_status_bar(App& app) {
 
 namespace {
 
-// The panel's options are extra settings.ini keys: Settings keeps keys it does not know
-// (unknown_keys) and writes them back, so they round-trip without a Settings member each.
-std::string disasm_setting(const Settings& s, const char* key) {
-    for (const auto& [k, v] : s.unknown_keys)
-        if (k == key) return v;
-    return {};
-}
-
-bool set_disasm_setting(Settings& s, const char* key, const std::string& value) {
-    for (auto& kv : s.unknown_keys)
-        if (kv.first == key) {
-            if (kv.second == value) return false;
-            kv.second = value;
-            return true;
-        }
-    s.unknown_keys.emplace_back(key, value);
-    return true;
-}
-
+// Writes the panel's options back into app.settings (settings.ini) when one changed.
 void save_disasm_settings(App& app) {
     const DisasmPanel& dp = app.disasm_panel;
     Settings& s = app.settings;
-    bool changed = set_disasm_setting(s, "disasm_mode", dp.mode == 1 ? "64" : dp.mode == 2 ? "32" : "auto");
-    changed |= set_disasm_setting(s, "disasm_syntax", dp.syntax == DisasmSyntax::Att ? "att" : "intel");
-    changed |= set_disasm_setting(s, "disasm_uppercase", dp.uppercase ? "1" : "0");
-    changed |= set_disasm_setting(s, "disasm_follow", dp.follow ? "1" : "0");
-    changed |= set_disasm_setting(s, "disasm_bytes", dp.show_bytes ? "1" : "0");
-    if (changed) mark_settings_dirty(app);
+    const bool att = dp.syntax == DisasmSyntax::Att;
+    if (s.disasm_mode == dp.mode && s.disasm_att == att && s.disasm_uppercase == dp.uppercase &&
+        s.disasm_follow == dp.follow && s.disasm_bytes == dp.show_bytes)
+        return;
+    s.disasm_mode = dp.mode;
+    s.disasm_att = att;
+    s.disasm_uppercase = dp.uppercase;
+    s.disasm_follow = dp.follow;
+    s.disasm_bytes = dp.show_bytes;
+    mark_settings_dirty(app);
 }
 
 }  // namespace
@@ -1676,12 +1849,11 @@ void save_disasm_settings(App& app) {
 void load_disasm_settings(App& app) {
     DisasmPanel& dp = app.disasm_panel;
     const Settings& s = app.settings;
-    const std::string m = disasm_setting(s, "disasm_mode");
-    dp.mode = m == "64" ? 1 : m == "32" ? 2 : 0;
-    dp.syntax = disasm_setting(s, "disasm_syntax") == "att" ? DisasmSyntax::Att : DisasmSyntax::Intel;
-    dp.uppercase = disasm_setting(s, "disasm_uppercase") == "1";
-    dp.follow = disasm_setting(s, "disasm_follow") != "0";
-    dp.show_bytes = disasm_setting(s, "disasm_bytes") != "0";
+    dp.mode = s.disasm_mode;
+    dp.syntax = s.disasm_att ? DisasmSyntax::Att : DisasmSyntax::Intel;
+    dp.uppercase = s.disasm_uppercase;
+    dp.follow = s.disasm_follow;
+    dp.show_bytes = s.disasm_bytes;
 }
 
 void draw_disasm_panel(App& app) {
@@ -1754,6 +1926,12 @@ void disasm_go_to_entry(App& app) {
     app.disasm_panel.show_at(*d, off, false);
     reveal_range(app, *t, off, 0, true);
     set_status(app, "Entry point 0x" + fmt_hex(app.disasm_panel.address_map(*d).entry) + " at offset " + fmt_offset(off));
+}
+
+void disasm_go_to_symbol(App& app) {
+    if (!usable_doc(app)) return;
+    app.show_disasm = app.focus_disasm = true;
+    app.disasm_panel.open_symbol_list();  // the panel's next draw opens it
 }
 
 }  // namespace hx

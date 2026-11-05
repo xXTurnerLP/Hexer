@@ -50,6 +50,17 @@
 //                an invalid byte (valid = false, length 1)
 //         target branch target or RIP-relative / absolute memory address (nil if none)
 //         flow   "call" | "jmp" | "jcc" | "ret" | "int" (int / int3 / syscall) | nil
+//   hx.xor_scan(doc, plaintext, opts?) -> list of hits, by offset: where `plaintext` (raw bytes;
+//       use hx.unhex for hex text) occurs XOR / ADD / ROL-encoded (core/xorscan.h), each
+//       { offset=, transform="xor"|"add"|"rol"|"xor_key", key= (raw key bytes; rol: one byte = the
+//       bit count), phase= (key index of `offset`), text= ("XOR 0x5A", "XOR key 53 45 ...") }.
+//       opts = { start=0, length= (to EOF), xor=true, add=true, rol=true, multi=false (2..16 byte
+//       XOR keys), max_key_len=16, max=10000 (hits) }. Blocking: at most 256 MiB per call (error
+//       beyond; the XOR Search panel scans any size) and stopped at the script time limit.
+//   hx.xor_guess_key(doc, off, len, opts?) -> list of { key=, score= (0..1) }, best first: XOR key
+//       candidates for [off, off+len) assuming the plaintext is mostly `plain` bytes
+//       (opts = { plain=0 (a byte value or a 1-char string, e.g. " " for text), max_len=16 });
+//       keys follow the absolute-offset convention of xor_scan. At most 16 MiB per call.
 //   string.pack / string.unpack       -- standard Lua; the recommended way to serialize
 //
 // Doc (userdata; every call raises "document closed" if its tab was closed):
@@ -73,6 +84,25 @@
 //       address map (PE / ELF headers: virtual addresses, process memory: = offset, else = offset);
 //       entries also get section= (".text") when the map names one. mode defaults to the
 //       header's (PE32 / ELF32: 32), else 64. Unreadable bytes are 1-byte "??" entries.
+//   doc:symbols() -> list of symbols (core/symbols.h), sorted by address, forwarded exports last:
+//       { name=, address=, offset=, kind=, module=, ordinal=?, forward=? }
+//         name     "CreateFileW", "#12" (by ordinal only), "puts@plt" / "puts@got" (ELF imports)
+//         kind     "export" | "import" | "function" | "object"
+//         module   PE: the export / import DLL ("KERNEL32.dll"); ELF: ""
+//         address  virtual address (import: its IAT / GOT slot or PLT stub); nil for a forwarder
+//         offset   file offset of address (nil when not backed by the file)
+//         forward  forwarded export: "NTDLL.RtlAllocateHeap" (then no address)
+//       Sources: PE export / import / delay-import directories, ELF .symtab / .dynsym FUNC and
+//       OBJECT symbols, JUMP_SLOT / GLOB_DAT relocations; an entry point without a name of its
+//       own is function "entry". Built synchronously (capped at 1M symbols / ~3 s); {} for other
+//       files and process memory.
+//   doc:view_range() -> first, last   -- first and last byte visible in the document's hex view
+//       (inclusive; as of the last drawn frame), nil when it has no drawn view (headless, empty doc)
+//   doc:bookmarks() -> list of { offset=, length=, name=, color= (packed int, 0 = default), note= }
+//   doc:add_bookmark(off, len?, name?, color?, note?) -> index   (len default 1, clamped to EOF;
+//       color as hx.color takes it; index 1-based)   doc:remove_bookmark(i)  (1-based; error if
+//       out of range). Both are undo steps ("Add bookmark" / "Remove bookmark"; inside a command
+//       or doc:transaction part of its step) and also work on read-only documents.
 //   All script edits are undoable and respect read-only mode (error "document is read-only").
 //
 // Parser context `p` (argument of parse; reads relative to the parse range, cursor starts at 0):
@@ -102,6 +132,13 @@
 //   opts = { color=, comment=, enum={[1]="HELLO", ...}, fmt="hex"|"dec"|"bin"|"char" }
 //          (enum may also be written name->value: {HELLO=1}; a struct's color is inherited by its
 //           fields that have no color of their own)
+//          flags = {[0]="READ", [1]="WRITE"}  (bit number -> name, also {READ=0}; integer fields:
+//                  value shown as "3 = READ|WRITE", unnamed set bits as "bit9"; edits also take
+//                  "READ|WRITE"; the C header export lists the names in a comment)
+//          bitfield = {shift=, width=, be=?, signed=?}  (p:field over a bit-field storage unit:
+//                  `width` bits from bit `shift` (0 = LSB) of the unit; be = big-endian unit
+//                  (C bits allocated from the top). Only for the C header export, which declares
+//                  it as `uint32_t name : width;`; C struct -> parser emits it)
 //   Numeric fields (typed readers / p:read) are EDITABLE in the Structure panel: the new value is
 //   range-checked, encoded with the field's own pack format and written back (enum names, char
 //   literals like 'IHDR', and hex/bin bit patterns for signed fields accepted).
@@ -154,6 +191,21 @@ struct Field {
         std::string name;
     };
     std::shared_ptr<const std::vector<EnumItem>> enums;
+    // Bit names (sorted by bit) when the field was read with opts.flags; null otherwise. The value
+    // text then ends in " = READ|WRITE" (script/cexport.h format_flags).
+    struct FlagItem {
+        int bit = 0;  // 0 = least significant
+        std::string name;
+    };
+    std::shared_ptr<const std::vector<FlagItem>> flags;
+    // opts.bitfield: the field is `width` bits at bit `shift` of the integer its bytes hold (read
+    // in `big_endian` order). Only used by the C header export (shift -1 = not a bit field).
+    struct BitField {
+        int shift = -1;
+        int width = 0;
+        bool big_endian = false;
+        bool is_signed = false;
+    } bits;
 };
 
 struct ParseResult {
@@ -186,6 +238,9 @@ public:
     virtual Document* find_document(uint64_t id) = 0;  // nullptr if closed
     virtual Document* open_bytes(const std::string& name, const uint8_t* data, size_t len) = 0;
     virtual void reveal(Document& doc, uint64_t offset, uint64_t len) = 0;  // select + scroll into view
+    // First and last (inclusive) byte visible in `doc`'s hex view as last drawn; false if it has
+    // none (doc:view_range() returns nil). Default: no view (headless hosts).
+    virtual bool view_range(Document& /*doc*/, uint64_t& /*first*/, uint64_t& /*last*/) { return false; }
 };
 
 class ScriptEngine {

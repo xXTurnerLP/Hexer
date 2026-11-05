@@ -65,13 +65,16 @@ struct EntropyResult {
     uint64_t doc_size = 0;                     // size of the snapshot scanned
     uint64_t bucket_size = 0;                  // every bucket but the last is this long (>= 1)
     std::vector<EntropyBucket> buckets;        // offsets/lengths set for all; computed in order
-    uint32_t done = 0;                         // buckets[0, done) are computed
+    uint32_t done = 0;                         // buckets[0, done) are computed (and reused ones)
     bool finished = false;                     // the run ended (completed or cancelled)
     bool cancelled = false;
     bool io_error = false;                     // an I/O error made at least one bucket unreadable
     uint64_t io_error_offset = 0;              // with io_error: the first unreadable byte met
                                                // (holes of a sparse source are not I/O errors)
-    uint64_t bytes_read = 0;                   // total bytes read so far (bounded by sampling)
+    uint64_t bytes_read = 0;                   // total bytes read so far by this run (bounded by
+                                               // sampling; reused buckets are not counted)
+    uint32_t reused = 0;                       // buckets copied unchanged from the previous scan
+                                               // (EntropyJob::rescan); they are done from the start
 
     // Index of the bucket holding `offset` (clamped to the last bucket; 0 if there are none).
     size_t bucket_of(uint64_t offset) const;
@@ -86,6 +89,16 @@ EntropyResult entropy_layout(uint64_t size, uint32_t buckets);
 // them is computed yet. sampled / unreadable are or-ed. offset/length span the buckets used.
 EntropyBucket entropy_aggregate(const EntropyResult& r, uint64_t begin, uint64_t end);
 
+// The byte ranges [first, second) of `after` that may differ from `before` (ascending, disjoint,
+// merged). A byte is unchanged when both snapshots reference the same stored byte at the same
+// offset (same file version / add chunk object and position), which is what an edit of one
+// document leaves untouched; snapshots of different documents differ everywhere. Same size: every
+// changed range (two overwrites far apart stay two small ranges); other sizes: one range from the
+// first changed byte to the end (an insert / delete shifts everything after it). O(pieces), never
+// reads bytes. Bytes of a source that changed underneath (a file patched in place by a save or
+// another program, process memory) count as unchanged.
+std::vector<std::pair<uint64_t, uint64_t>> snapshot_changes(const Snapshot& before, const Snapshot& after);
+
 // Background entropy scan (SearchJob pattern). start() cancels any previous run without waiting for
 // it; that run finishes in the background and publishes nothing more. Results are published
 // progressively: result() returns the buckets computed so far, so a minimap can paint while the
@@ -95,6 +108,14 @@ public:
     ~EntropyJob();
 
     void start(std::shared_ptr<const Snapshot> snap, EntropyOptions opts = {});
+    // Like start(), but copies the computed buckets of the latest published result whose bytes did
+    // not change (snapshot_changes against the snapshot that result was computed from) instead of
+    // reading them again: overwrites rescan only the buckets they touched; an insert / delete
+    // rescans from the bucket of the edit to the end. Everything is rescanned when the bucket
+    // layout (bucket size or count, sample_per_bucket) differs, and for process memory (it changes
+    // underneath). The caller must use start() after an in-place save or a reload of the same
+    // file version (its bytes changed under unchanged pieces). EntropyResult::reused counts them.
+    void rescan(std::shared_ptr<const Snapshot> snap, EntropyOptions opts = {});
     void cancel();                 // non-blocking request
     bool running() const;
     double progress() const;       // 0..1 (buckets done)
@@ -109,12 +130,15 @@ public:
 private:
     struct Run;
     std::shared_ptr<Run> current() const;
+    void launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opts, bool incremental);
     std::shared_ptr<Run> run_;     // guarded by mu_
     std::vector<std::pair<std::thread, std::shared_ptr<Run>>> threads_;  // current + superseded runs
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> generation_{0};
     mutable std::mutex mu_;
     std::shared_ptr<const EntropyResult> result_;
+    std::shared_ptr<const Snapshot> result_snap_;  // what result_ was computed from (guarded by mu_)
+    EntropyOptions result_opts_;                   // ... and with which options
 };
 
 }  // namespace hx

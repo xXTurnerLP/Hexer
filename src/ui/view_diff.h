@@ -15,6 +15,8 @@
 //   * Highlights are built only for the visible window of each side (a few HighlightSet entries per
 //     frame, never one per range); scrollbar ticks are subsampled to at most kMaxTicks per side.
 //   * A side whose document is busy (being saved) shows a placeholder and is not read.
+//   * Find Shift (toolbar / request_find_shift()) runs find_shift() on a ShiftJob worker
+//     (progress + Cancel) and applies the proposed shift: both sides then show the matching block.
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -69,10 +71,19 @@ public:
     void request_next() { nav_request_ = 1; }
     void request_prev() { nav_request_ = -1; }
     void request_recompare() { recompare_requested_ = true; }
-    void cancel() { job_.cancel(); }
+    void request_find_shift() { find_shift_requested_ = true; }
+    void cancel() {
+        job_.cancel();
+        shift_job_.cancel();
+    }
 
-    // A compare is running or an automatic one is pending: keep drawing frames.
-    bool wants_frames() const { return job_.running() || pending_since_ >= 0.0; }
+    // A compare / Find Shift is running or an automatic compare is pending: keep drawing frames.
+    bool wants_frames() const {
+        return job_.running() || shift_job_.running() || find_shift_requested_ || pending_since_ >= 0.0;
+    }
+    bool finding_shift() const { return shift_job_.running(); }
+    // The last navigation / Find Shift note shown in the toolbar ("" = none).
+    const std::string& note() const { return note_; }
     // The last finished compare (null before the first). May be stale (see stale()).
     std::shared_ptr<const DiffResult> result() const { return result_; }
     // The result does not match the documents' current contents / the current shift.
@@ -92,6 +103,7 @@ private:
     };
     void start_compare(Document& a, Document& b);
     void poll_job();
+    void poll_shift(Document& a, Document& b, const DiffViewCallbacks& cb);
     void build_ticks();
     void update_layer(Side& s, const Document& d, bool side_b);
     void navigate(Document& a, Document& b, int dir, const DiffViewCallbacks& cb);
@@ -121,6 +133,10 @@ private:
     int64_t shift_shown_ = 0;            // shift value shift_text_ was last synced with
     std::string shift_error_;
     std::string note_;                   // last navigation note ("No more differences")
+    ShiftJob shift_job_;                 // Find Shift
+    uint64_t shift_run_ = 0;             // ShiftJob run id of the last started search (0 = none)
+    uint64_t shift_gen_seen_ = 0;
+    bool find_shift_requested_ = false;
     Side a_, b_;
 };
 

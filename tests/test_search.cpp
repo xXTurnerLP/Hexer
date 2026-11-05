@@ -952,6 +952,53 @@ TEST_CASE("settings: minimap, byte-class colors and bitmap panel fields round tr
     }
 }
 
+TEST_CASE("settings: Disassembly panel options round trip (old 1 / 0 values too), bad values ignored") {
+    TempDir tmp;
+    std::string f = path_join(tmp.path, "settings.ini");
+    Settings def;
+    CHECK(def.disasm_mode == 0);
+    CHECK_FALSE(def.disasm_att);
+    CHECK_FALSE(def.disasm_uppercase);
+    CHECK(def.disasm_follow);
+    CHECK(def.disasm_bytes);
+    for (int mode : {0, 1, 2}) {
+        Settings s;
+        s.disasm_mode = mode;
+        s.disasm_att = mode == 1;
+        s.disasm_uppercase = mode != 0;
+        s.disasm_follow = mode != 2;
+        s.disasm_bytes = mode == 0;
+        REQUIRE(s.save(f));
+        Settings t;
+        REQUIRE(t.load(f));
+        CHECK(t.disasm_mode == mode);
+        CHECK(t.disasm_att == (mode == 1));
+        CHECK(t.disasm_uppercase == (mode != 0));
+        CHECK(t.disasm_follow == (mode != 2));
+        CHECK(t.disasm_bytes == (mode == 0));
+        CHECK(t.unknown_keys.empty());
+    }
+    // Files written while these were unknown keys ("1" / "0", lowercase words).
+    const std::string old = "disasm_mode = 32\ndisasm_syntax = att\ndisasm_uppercase = 1\ndisasm_follow = 0\n"
+                            "disasm_bytes = 0\n";
+    REQUIRE(os_write_whole_atomic(f, old.data(), old.size()));
+    Settings o;
+    REQUIRE(o.load(f));
+    CHECK(o.disasm_mode == 2);
+    CHECK(o.disasm_att);
+    CHECK(o.disasm_uppercase);
+    CHECK_FALSE(o.disasm_follow);
+    CHECK_FALSE(o.disasm_bytes);
+    CHECK(o.unknown_keys.empty());
+    const std::string bad = "disasm_mode = 16\ndisasm_syntax = masm\ndisasm_follow = maybe\n";
+    REQUIRE(os_write_whole_atomic(f, bad.data(), bad.size()));
+    Settings b;
+    REQUIRE(b.load(f));
+    CHECK(b.disasm_mode == 0);
+    CHECK_FALSE(b.disasm_att);
+    CHECK(b.disasm_follow);
+}
+
 TEST_CASE("search: holes of process memory are skipped in both directions, never matched across") {
     hx_test::HoleyMem hm;  // readable page | hole page | readable page
     const uint64_t a = hm.addr(), pg = hm.pg;

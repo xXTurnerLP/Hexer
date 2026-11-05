@@ -24,8 +24,18 @@ test_ui = executable('test_ui', 'test_ui.cpp', test_main,
   dependencies : [ui_view_dep, doctest_dep], cpp_args : conf_args)
 test('ui', test_ui, timeout : 300)
 
+# Headless Compare view (DiffView): next / previous difference, Find Shift, synced scrolling.
+test_diffview = executable('test_diffview', 'test_diffview.cpp', test_main,
+  dependencies : [ui_view_dep, doctest_dep], cpp_args : conf_args)
+test('diffview', test_diffview, timeout : 300)
+
+# Headless Packets + Bitmap panels: row clicks / Up / Down, format change, show at cursor, image clicks.
+test_panels = executable('test_panels', 'test_panels.cpp', test_main,
+  dependencies : [ui_view_dep, doctest_dep], cpp_args : conf_args)
+test('panels', test_panels, timeout : 300)
+
 # Feature suites (one exe each so features can be built/tested independently).
-foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail', 'procmem', 'history', 'xorscan', 'session']
+foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail', 'procmem', 'history', 'xorscan', 'session', 'symbols']
   exe = executable('test_' + t, 'test_' + t + '.cpp', test_main,
     dependencies : [core_dep, doctest_dep], cpp_args : conf_args)
   test(t, exe, timeout : 300)
@@ -33,6 +43,11 @@ endforeach
 test_cstruct = executable('test_cstruct', 'test_cstruct.cpp', test_main,
   dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
 test('cstruct', test_cstruct, timeout : 300)
+
+# Structure -> C header export (+ round trip through cstruct), opts.flags / opts.bitfield, Inspector bit toggles.
+test_cexport = executable('test_cexport', 'test_cexport.cpp', test_main,
+  dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
+test('cexport', test_cexport, timeout : 300)
 
 # Disassembly (Zydis) + PE / ELF address maps + hx.disasm / doc:disasm + the headless Disassembly panel.
 test_disasm = executable('test_disasm', 'test_disasm.cpp', test_main,

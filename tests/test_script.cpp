@@ -38,6 +38,13 @@ struct FakeHost : ScriptHost {
         return active;
     }
     void reveal(Document&, uint64_t, uint64_t) override { ++reveals; }
+    bool has_view = false;           // doc:view_range(): what the "hex view" shows
+    uint64_t view_first = 0, view_last = 0;
+    bool view_range(Document&, uint64_t& first, uint64_t& last) override {
+        first = view_first;
+        last = view_last;
+        return has_view;
+    }
 
     Document* add(const std::string& bytes, const std::string& name = "test.bin") {
         return open_bytes(name, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
@@ -1345,8 +1352,8 @@ TEST_CASE("examples: streamed ZIP with data descriptors") {
     CHECK(tiling_problem(r, zip.size()) == "");
     CHECK(root_names(r) == std::vector<std::string>{"file[0]", "data_descriptor", "file[1]", "data_descriptor",
                                                    "central[0]", "central[1]", "end_of_central_directory"});
-    CHECK(fld(r, "file[0].flags").value == "0b00000000_00001000");
-    CHECK(fld(r, "file[0].flags").comment == "sizes in data descriptor");
+    CHECK(fld(r, "file[0].flags").value == "0x0008 = DATA_DESCRIPTOR");  // opts.flags names the set bits
+    CHECK(fld(r, "file[0].flags").flags != nullptr);
     CHECK(fld(r, "file[0].compressed_size").value == "0");
     CHECK(fld(r, "file[0].data").size == 14);  // found by resynchronising on the descriptor
     CHECK(fld(r, "file[1].data").size == 6);
@@ -1962,4 +1969,123 @@ TEST_CASE("hx.hash, hx.hash_algorithms, doc:hash") {
     CHECK(fx.console_has("at most 256 MiB", ConsoleLine::Error));
     fx.eng.exec("#doc:hash('sha1', 0, 256 * 1024 * 1024)");
     CHECK(fx.last_result() == "40 (0x28)");
+}
+
+TEST_CASE("doc:view_range and bookmarks from Lua (undoable)") {
+    Fixture fx;
+    fx.load(R"LUA(
+hx.command { name = "two marks", run = function(doc) doc:add_bookmark(1) doc:add_bookmark(2, 2, "b") end }
+)LUA");
+    Document* d = fx.host.add(std::string(100, 'a'));
+    fx.eng.exec("doc:view_range() == nil");  // no drawn view (headless host)
+    CHECK(fx.last_result() == "true");
+    fx.host.has_view = true;
+    fx.host.view_first = 16;
+    fx.host.view_last = 79;
+    fx.eng.exec("local a, b = doc:view_range() return a .. ' ' .. b");
+    CHECK(fx.last_result() == "\"16 79\"");
+
+    fx.eng.exec("doc:add_bookmark(10, 4, 'hdr', 'red', 'a note')");
+    CHECK(fx.last_result() == "1");
+    REQUIRE(d->view().bookmarks.size() == 1);
+    CHECK(d->view().bookmarks[0].offset == 10);
+    CHECK(d->view().bookmarks[0].length == 4);
+    CHECK(d->view().bookmarks[0].name == "hdr");
+    CHECK(d->view().bookmarks[0].note == "a note");
+    CHECK(d->view().bookmarks[0].color != 0);
+    fx.eng.exec("doc:add_bookmark(98, 50)");  // length clamped to EOF
+    CHECK(fx.last_result() == "2");
+    fx.eng.exec("local b = doc:bookmarks() return #b .. ' ' .. b[1].name .. ' ' .. b[1].offset .. ' ' .. b[1].length "
+                ".. ' ' .. b[1].note .. ' ' .. b[2].length .. ' ' .. b[2].color .. '|' .. b[2].name .. '|'");
+    CHECK(fx.last_result() == "\"2 hdr 10 4 a note 2 0||\"");
+    fx.eng.exec("doc:add_bookmark(100)");
+    CHECK(fx.console_has("doc:add_bookmark failed", ConsoleLine::Error));
+    fx.eng.exec("doc:add_bookmark(0, 1, 'x', {})");
+    CHECK(fx.console_has("color expected", ConsoleLine::Error));
+    fx.eng.exec("doc:remove_bookmark(1)");
+    REQUIRE(d->view().bookmarks.size() == 1);
+    CHECK(d->view().bookmarks[0].offset == 98);
+    fx.eng.exec("doc:remove_bookmark(5)");
+    CHECK(fx.console_has("no bookmark #5", ConsoleLine::Error));
+    CHECK(d->view().bookmarks.size() == 1);
+
+    // Every change is an undo step.
+    CHECK(d->undo());
+    CHECK(d->view().bookmarks.size() == 2);
+    CHECK(d->undo());
+    CHECK(d->view().bookmarks.size() == 1);
+    CHECK(d->undo());
+    CHECK(d->view().bookmarks.empty());
+    // A command's bookmarks are one step; read-only documents still take bookmarks.
+    d->set_read_only(true);
+    const int errors = fx.errors();
+    fx.eng.run_command("two marks");
+    CHECK(fx.errors() == errors);
+    CHECK(d->view().bookmarks.size() == 2);
+    d->set_read_only(false);  // (undo is refused while read-only)
+    CHECK(d->undo());
+    CHECK(d->view().bookmarks.empty());
+}
+
+TEST_CASE("hx.xor_scan and hx.xor_guess_key") {
+    Fixture fx;
+    fx.load("");
+    std::string data(200, '\x11');
+    const std::string secret = "SECRET!!", plain = "PLAINTEXT", text = "This is a test", key = "KEY";
+    for (size_t i = 0; i < secret.size(); ++i) data[50 + i] = char(uint8_t(secret[i]) ^ 0x5A);
+    for (size_t i = 0; i < plain.size(); ++i) data[120 + i] = char(uint8_t(plain[i]) + 3);
+    for (size_t i = 0; i < text.size(); ++i) data[151 + i] = char(uint8_t(text[i]) ^ uint8_t(key[(151 + i) % 3]));
+    fx.host.add(data);
+
+    fx.eng.exec("local h = hx.xor_scan(doc, 'SECRET!!') return #h .. ' ' .. h[1].offset .. ' ' .. h[1].transform .. "
+                "' ' .. hx.hex(h[1].key) .. ' ' .. h[1].phase .. ' ' .. h[1].text");
+    CHECK(fx.last_result() == "\"1 50 xor 5A 0 XOR 0x5A\"");
+    fx.eng.exec("local h = hx.xor_scan(doc, 'PLAINTEXT', { xor = false, rol = false }) "
+                "return #h .. ' ' .. h[1].offset .. ' ' .. h[1].transform .. ' ' .. hx.hex(h[1].key)");
+    CHECK(fx.last_result() == "\"1 120 add 03\"");
+    fx.eng.exec("#hx.xor_scan(doc, 'PLAINTEXT', { start = 0, length = 125 })");  // range ends inside it
+    CHECK(fx.last_result() == "0");
+    fx.eng.exec("#hx.xor_scan(doc, 'PLAINTEXT', { add = false })");
+    CHECK(fx.last_result() == "0");
+    fx.eng.exec("local h = hx.xor_scan(doc, 'This is a test', { multi = true, xor = false, add = false, rol = false, "
+                "max_key_len = 4 }) return #h .. ' ' .. h[1].offset .. ' ' .. h[1].transform .. ' ' .. h[1].key .. ' ' "
+                ".. h[1].phase");
+    CHECK(fx.last_result() == "\"1 151 xor_key KEY 1\"");
+    CHECK(fx.errors() == 0);
+    fx.eng.exec("(pcall(hx.xor_scan, doc, ''))");  // a Lua error raised before the scan
+    CHECK(fx.last_result() == "false");
+    fx.eng.exec("hx.xor_scan(doc, '')");
+    CHECK(fx.console_has("hx.xor_scan: empty plaintext", ConsoleLine::Error));
+    fx.eng.exec("hx.xor_scan(doc, 'abc', { max_key_len = 40 })");
+    CHECK(fx.console_has("max_key_len must be 2..16", ConsoleLine::Error));
+
+    // Key guess: zeros XORed with "AB" (absolute offsets: a range starting at an odd offset too).
+    std::string ab(256, '\0');
+    for (size_t i = 0; i < ab.size(); ++i) ab[i] = i % 2 ? 'B' : 'A';
+    fx.host.add(ab);
+    fx.eng.exec("local c = hx.xor_guess_key(doc, 0, doc:size()) return c[1].key .. ' ' .. string.format('%.3f', c[1].score)");
+    CHECK(fx.last_result() == "\"AB 0.998\"");
+    fx.eng.exec("hx.xor_guess_key(doc, 1, 100)[1].key");
+    CHECK(fx.last_result() == "\"AB\"");
+    fx.eng.exec("hx.xor_guess_key(doc, 0, 256, { plain = 'A', max_len = 1 })[1].key:byte()");  // 'A' ^ 'A' = 0
+    CHECK(fx.last_result() == "0");
+    fx.eng.exec("hx.xor_guess_key(doc, 0, 4, { plain = 'ab' })");
+    CHECK(fx.console_has("plain must be a byte value", ConsoleLine::Error));
+
+    // Bounded: a sparse 300 MiB file is refused as a whole, scanned in a range.
+    const std::string big = path_join(fx.dir.str(), "big.bin");
+    {
+        auto f = OsFile::open(big, OsFile::Mode::CreateTruncate);
+        REQUIRE(f);
+        REQUIRE(f->truncate(300ull << 20));
+    }
+    fx.host.docs.push_back(Document::open_file(big));
+    REQUIRE(fx.host.docs.back());
+    fx.host.active = fx.host.docs.back().get();
+    fx.eng.exec("hx.xor_scan(doc, 'MZ\\144\\0')");
+    CHECK(fx.console_has("at most 256 MiB", ConsoleLine::Error));
+    fx.eng.exec("#hx.xor_scan(doc, 'MZ\\144\\0', { start = 1024, length = 1 << 20 })");
+    CHECK(fx.last_result() == "0");
+    fx.eng.exec("hx.xor_guess_key(doc, 0, doc:size())");
+    CHECK(fx.console_has("at most 16 MiB", ConsoleLine::Error));
 }

@@ -31,26 +31,35 @@ src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device 
              (bytes -> pixels), diff (DiffJob: compare two Snapshots with a shift), pcap (pcap/pcapng
              PcapIndexJob + packet dissector); document also has refresh_appended() (live tail);
              exe_map (AddressMap: PE / ELF / manual file offset <-> VA, entry point, sections);
+             symbols (SymbolTable: PE exports / imports, ELF symtab / PLT / GOT names, bounded
+             reads; SymbolJob builds it on a worker thread);
              disasm (x86-64 / x86 via Zydis, disasm_range / disasm_sync_back; its own static lib
              hexer_disasm so only its users link Zydis)
 src/script/  script_engine.h (Lua API contract — the header comment is the API spec),
-             script_engine.cpp, lua_api.cpp
+             script_engine.cpp, lua_api.cpp, cexport (parse tree -> C header, opts.flags names;
+             no Lua, but on Field so it lives here)
 src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
              menus, shortcuts, tabs, Compare tab, live tail, split view, minimap wiring, session
              extras, ScriptHost impl); self-contained feature UIs without App dependency:
              panel_strings, panel_hash, dialog_cstruct, panel_bitmap, panel_packets, panel_history,
              panel_xor, dialog_targets (Open Process / Open Disk + RegionsPanel) (App owns one of
              each), minimap (one per tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
-             panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly)
+             panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly);
+             panel_bitmap, panel_packets and view_diff are in hexer_ui_view too (headless tests)
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
 tests/       doctest; one exe per module: test_core, test_util, test_script, test_search,
              test_ui (headless ImGui: drives HexView + Minimap with simulated mouse/keyboard),
+             test_diffview (headless Compare view: next / prev, Find Shift, synced scroll),
+             test_panels (headless Packets + Bitmap panels: row clicks / keys, decode, image clicks),
              test_nav, test_strings, test_hash, test_cstruct, test_entropy, test_bitmap,
              test_diff, test_pcap, test_tail (growing files), test_procmem (reads and writes the
-             test process's own memory), test_history, test_xorscan, test_session, test_disasm
-             (encodings, sync_back, PE / ELF maps incl. malformed headers, Lua, headless panel)
+             test process's own memory), test_history, test_xorscan, test_session,
+             test_symbols (PE / ELF fixtures in symbol_fixture.h, malformed tables, kernel32.dll
+             when present), test_disasm (encodings, sync_back, PE / ELF maps incl. malformed
+             headers, Lua, headless panel incl. labels / Go to Symbol / session extras),
+             test_cexport (C header export + round trip through cstruct, opts.flags, bit toggles)
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
              make_pcap.py (demo pcapng with HXP packets for the Packets panel)
@@ -84,11 +93,13 @@ Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`
 `"Show All Bookmarks"`, `"Jump to Bookmark..."`, `"Strings: Scan File"`, `"Hash Selection"`,
 `"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`, `"Minimap: Byte Classes"`,
 `"Color Bytes by Class"`, `"Toggle Bitmap"`, `"Bitmap: Show at Cursor"`, `"Toggle Packets"`,
-`"Structure: Parse Selection"`, `"Toggle Live Tail"`, `"Compare with: <tab name>"`,
-`"Compare: Align at Cursors"`, `"Show History"`, `"XOR: Scan File"`, `"XOR: Guess Key from
+`"Structure: Parse Selection"`, `"Structure: Copy as C Header"` (clipboard), `"Structure: Export C
+Header..."` (native dialog), `"Toggle Live Tail"`, `"Compare with: <tab name>"`,
+`"Compare: Align at Cursors"`, `"Compare: Find Shift"`, `"Compare with File on Disk"`, `"Compare with
+Backup"`, `"Revert to Backup"` (the last two need `<file>.backup`), `"Show History"`, `"XOR: Scan File"`, `"XOR: Guess Key from
 Selection"`, `"Open Process..."`, `"Open Disk..."`, `"Toggle Regions"`, `"Split Horizontally"`,
 `"Split Vertically"`, `"Split View: Switch Pane"`, `"Undo"`, `"Toggle Disassembly"`, `"Go to Entry
-Point"`, `"Disassemble at Cursor"`, `"Disassembly: Follow Target"`; any palette
+Point"`, `"Disassemble at Cursor"`, `"Disassembly: Follow Target"`, `"Go to Symbol..."`; any palette
 label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable; all
 actions of one run execute in the same frame, so e.g. "Compare: Next Difference" right after
 "Compare with: ..." finds no result yet). A process opens from the command line as
@@ -110,11 +121,15 @@ Use `Document::set_clock_for_tests` for undo-merge timing.
 Follow pointer type: `Settings::pointer_type()` (width / signed / relative / base + the Inspector's
 LE/BE) is the one source; clicking an integer Inspector row sets it, `follow_pointer_as()`
 (panels.h) follows it, `inspector_mark()` outlines the Inspector row's bytes in the hex view.
+The Inspector's Bits row (after "binary") has the selected integer row's width, else 8 bits; a
+click flips one bit through `inspector_toggle_bit()` (core/inspector.h, one undo step).
 
 Session extras: per-tab view state (Parse at, live tail, split) goes to `Document::set_extra` in
 `save_tab_extras()` (app.cpp) and comes back in `restore_tab_extras()`; state spanning tabs (the
 Compare tab) goes to `Session::set_extra`. Process documents are not persistable: the session
-skips them (hot exit drops them with a console line).
+skips them (hot exit drops them with a console line). The Disassembly panel keeps its per-doc
+state ("disasm.map" / "disasm.base" / "disasm.top") itself: `DisasmPanel::save_extras` /
+`restore_extras`, called next to the tab extras.
 
 Jump history: `reveal_range()` (app_internal.h) is the one "big jump" helper: it pushes the
 position it leaves onto the tab's `NavHistory`. Use it for new jump sources (not for caret moves).
@@ -124,7 +139,9 @@ Compare tab: the DiffView sides draw the documents' own ViewState (caret, select
 shared with their tabs; only one of them is drawn per frame). `top_row` is a row index, so
 `Tab::top_bpr` records the row width it is expressed in and `adopt_top_units()` converts before a
 view with another width draws. Jumps aimed at a tab's HexView while the Compare tab is shown are
-handed over with `HexView::take_scroll_request()`.
+handed over with `HexView::take_scroll_request()`. A B side that is not a tab (the file on disk,
+the `.backup`) is `App::diff_aux` (a read-only Document; `compare_b()` finds either kind); Find
+Shift is `core/diff.h find_shift` on DiffView's own `ShiftJob`.
 
 Selection convention (one for the whole UI, see `ui/hex_view.h`): `ViewState` selection is
 half-open `[sel_begin, sel_end)`; the caret is drawn on `caret_byte()` (inside the selection);

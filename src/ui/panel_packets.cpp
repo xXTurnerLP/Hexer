@@ -135,8 +135,24 @@ void activate(const PcapIndexJob::Result& res, size_t idx, bool payload_only, co
 
 }  // namespace
 
+bool PacketsPanel::row_pos(size_t row, float& x, float& y) const {
+    for (const DrawnRow& r : drawn_)
+        if (r.row == row) {
+            x = r.x;
+            y = r.y;
+            return true;
+        }
+    return false;
+}
+
+size_t PacketsPanel::selected_packet(uint64_t doc_id) const {
+    auto it = docs_.find(doc_id);
+    return it == docs_.end() ? SIZE_MAX : it->second->selected;
+}
+
 void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_names, const PacketsPanelCallbacks& cb) {
     wants_frames_ = false;
+    drawn_.clear();
     if (!doc) {
         index_requested_ = false;
         ImGui::TextDisabled("No document open.");
@@ -339,6 +355,10 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
             if (ImGui::Selectable(buf, st.selected == i, ImGuiSelectableFlags_SpanAllColumns)) {
                 st.selected = i;
                 activate(res, i, st.payload_only, st.parser, cb);
+            }
+            {
+                const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
+                drawn_.push_back(DrawnRow{size_t(row), r0.x + 10.0f * s, (r0.y + r1.y) * 0.5f});
             }
             if (ImGui::IsItemHovered() && ImGui::BeginTooltip()) {
                 ImGui::Text("Record at %s, data at %s", fmt_off(p.record_off).c_str(), fmt_off(p.data_off).c_str());

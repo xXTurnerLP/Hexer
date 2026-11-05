@@ -69,6 +69,76 @@ size_t prev_diff(const std::vector<DiffRange>& ranges, uint64_t a_off, bool side
 std::pair<size_t, size_t> ranges_in(const std::vector<DiffRange>& ranges, uint64_t begin, uint64_t end,
                                     bool side_b = false);
 
+// ---- automatic shift (Compare: Find Shift) -------------------------------------------------------
+// Finds the shift that lines A and B up again after their first difference under `shift` (an
+// insertion or deletion such as an extra header): from the first differing position (scanned like
+// diff_snapshots), the first `probes` distinctive `block`-byte blocks of EACH side (at least
+// `min_distinct` different byte values, so all-zero padding and short repeats are skipped; not
+// overlapping; starting at most `probe_scan` bytes past the difference) are searched within
+// +-`window` bytes of their aligned position on the other side, all in one rolling-hash pass per
+// side, every hash hit verified by memcmp. Per side the first probe that is found counts (an edit
+// inside the first block only costs that probe) with its nearest match; of the two sides the
+// smaller change of the shift wins. When no probe is found (the bytes at the difference were
+// changed, not inserted), a distinctive block equal on both sides at the current shift within
+// probe_scan bytes reports Found with delta 0. Bounded work after the first difference: about
+// 2 * (2 * window + 4 * probe_scan) bytes read, whatever the file sizes.
+struct ShiftOptions {
+    uint64_t window = uint64_t(16) << 20;     // +-16 MiB around the aligned position
+    uint32_t block = 64;                      // probe length (bytes)
+    uint32_t min_distinct = 8;                // distinct byte values a probe needs
+    uint64_t probe_scan = uint64_t(1) << 20;  // how far past the difference a probe may start
+    uint32_t probes = 16;                     // probes per side
+};
+
+struct ShiftResult {
+    enum Status : uint8_t {
+        Found,         // shift / delta / match_* are set (delta 0: the bytes after the difference
+                       // already line up - a change, not an insertion)
+        NoDifference,  // the aligned overlap is identical: nothing to align
+        NoProbe,       // no distinctive block after the difference on either side
+        NoMatch,       // no probe found within the window of the other side
+        Cancelled,
+        IoError,       // a read failed while looking for the first difference (at A diff_a)
+    };
+    uint8_t status = NoDifference;
+    int64_t shift = 0;          // Found: the new total shift; else the input shift
+    int64_t delta = 0;          // shift - input shift: > 0 B has delta extra bytes there (inserted
+                                // in B), < 0 A has -delta extra bytes (deleted in B)
+    uint64_t diff_a = 0, diff_b = 0;    // first difference under the input shift (A / B offset)
+    uint64_t match_a = 0, match_b = 0;  // Found: A[match_a, +block) == B[match_b, +block)
+    uint64_t run = 0;           // ShiftJob: id of the start() call (0 = blocking call)
+};
+
+// Blocking primitive (ShiftJob runs it on its thread). `progress` counts bytes read; the total is
+// shift_work(a.size(), b.size(), shift, opt) (an upper bound: done jumps to it at the end).
+ShiftResult find_shift(const Snapshot& a, const Snapshot& b, int64_t shift, const ShiftOptions& opt = {},
+                       const std::atomic<bool>* cancel = nullptr, std::atomic<uint64_t>* progress = nullptr);
+uint64_t shift_work(uint64_t a_size, uint64_t b_size, int64_t shift, const ShiftOptions& opt = {});
+
+// Background find_shift(); same run model as DiffJob (start() supersedes without waiting).
+class ShiftJob {
+public:
+    ~ShiftJob();
+    uint64_t start(std::shared_ptr<const Snapshot> a, std::shared_ptr<const Snapshot> b, int64_t shift,
+                   const ShiftOptions& opt = {});
+    void cancel();
+    bool running() const;
+    double progress() const;      // 0..1
+    uint64_t generation() const;  // increments every time a run finishes
+    std::shared_ptr<const ShiftResult> result() const;  // the last finished run (null before)
+
+private:
+    struct Run;
+    std::shared_ptr<Run> current() const;
+    std::shared_ptr<Run> run_;    // guarded by mu_
+    std::vector<std::pair<std::thread, std::shared_ptr<Run>>> threads_;
+    std::atomic<bool> running_{false};
+    std::atomic<uint64_t> generation_{0};
+    uint64_t next_run_ = 0;
+    mutable std::mutex mu_;
+    std::shared_ptr<const ShiftResult> result_;
+};
+
 // Background compare. One run at a time; start() cancels a previous run without waiting for it
 // (it finishes in the background and its result is discarded), like SearchJob.
 class DiffJob {

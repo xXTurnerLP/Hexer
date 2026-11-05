@@ -7,6 +7,8 @@
 #include <cstring>
 #include <limits>
 
+#include "core/document.h"
+
 namespace hx {
 
 namespace {
@@ -845,6 +847,35 @@ InspType insp_type_of_int(int width, bool is_signed) {
         if (insp_int_type(InspType(i), w, s) && w == width && s == is_signed) return InspType(i);
     }
     return InspType::Count;
+}
+
+bool insp_bit_location(int width, bool big_endian, int bit, int& byte_index, uint8_t& mask) {
+    if (width < 1 || width > 8 || bit < 0 || bit >= width * 8) return false;
+    byte_index = big_endian ? width - 1 - bit / 8 : bit / 8;
+    mask = uint8_t(1u << (bit % 8));
+    return true;
+}
+
+bool inspector_toggle_bit(Document& d, uint64_t at, int width, bool big_endian, int bit, std::string* err) {
+    auto fail = [&](const char* m) {
+        if (err) *err = m;
+        return false;
+    };
+    int bi = 0;
+    uint8_t mask = 0;
+    if (!insp_bit_location(width, big_endian, bit, bi, mask)) return fail("bit out of range");
+    if (d.read_only()) return fail("document is read-only");
+    if (d.busy()) return fail("document is busy (saving)");
+    const uint64_t off = at + uint64_t(bi);
+    if (at > d.size() || uint64_t(width) > d.size() - at) return fail("not enough bytes");
+    uint8_t b = 0, bad = 0;
+    if (d.read(off, &b, 1, &bad) != 1) return fail("not enough bytes");
+    if (bad) return fail("byte is unreadable");
+    b ^= mask;
+    d.begin_group("Toggle bit " + std::to_string(bit));
+    const bool ok = d.overwrite(off, &b, 1);
+    d.end_group();
+    return ok || fail("write failed");
 }
 
 }  // namespace hx

@@ -83,6 +83,19 @@ public:
         fixed_ = off;
     }
 
+    // The last draw (for headless tests, tests/test_panels.cpp): the image's top-left screen
+    // corner, and the decoded window: zoom, cols x rows pixels (packed 0xAABBGGRR, row-major).
+    // decoded() stays false while there is no texture to decode into (renderer without
+    // ImGuiBackendFlags_RendererHasTextures); a headless context with that flag decodes normally
+    // (the texture is simply never uploaded).
+    float image_x() const { return image_x_; }
+    float image_y() const { return image_y_; }
+    bool decoded() const { return have_key_; }
+    int shown_zoom() const { return key_.zoom; }
+    int shown_cols() const { return key_.cols; }
+    int shown_rows() const { return key_.rows; }
+    const std::vector<uint32_t>& shown_pixels() const { return pixels_; }
+
 private:
     struct Key {                   // what the current texture contents were built from
         uint64_t doc_id = 0, gen = 0, size = 0, base = 0;
@@ -112,6 +125,7 @@ private:
     bool offset_editing_ = false;
     std::string offset_err_;
     uint64_t shown_doc_id_ = 0;
+    float image_x_ = 0.0f, image_y_ = 0.0f;  // image corner of the last draw (screen)
 
     Key key_;
     bool have_key_ = false;

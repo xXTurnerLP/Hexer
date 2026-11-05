@@ -111,6 +111,35 @@ std::string hit_text(const Src& src, const StringHit& h, size_t max_chars) {
 
 char ascii_lower(char c) { return c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c; }
 
+bool is_utf16(StringEncoding e) { return e != StringEncoding::Ascii; }
+
+// True if `s` is the shifted echo of `m`: ASCII text in UTF-16LE ("A\0B\0C\0") also reads as
+// UTF-16BE one byte later ("\0B\0C" + the next byte), and the other way round. The echo has the
+// other UTF-16 encoding, starts one byte before or after `m`, ends at most one byte past it and is
+// not longer (equal length: the LE reading wins).
+bool shadow_of(const StringHit& s, const StringHit& m) {
+    if (!is_utf16(s.encoding) || !is_utf16(m.encoding) || s.encoding == m.encoding) return false;
+    if (s.offset + 1 != m.offset && m.offset + 1 != s.offset) return false;
+    if (s.offset + s.byte_length > m.offset + m.byte_length + 1) return false;
+    return s.char_count < m.char_count || (s.char_count == m.char_count && m.encoding == StringEncoding::Utf16LE);
+}
+
+// With both UTF-16 byte orders on, drops the echo of every string (see shadow_of). `hits` is
+// sorted by offset, so the two readings of one string are neighbours (offsets differ by one).
+void drop_utf16_echoes(std::vector<StringHit>& hits) {
+    std::vector<bool> drop(hits.size(), false);
+    for (size_t i = 0; i < hits.size(); ++i) {
+        for (size_t j = i + 1; j < hits.size() && hits[j].offset <= hits[i].offset + 1; ++j) {
+            if (shadow_of(hits[j], hits[i])) drop[j] = true;
+            else if (shadow_of(hits[i], hits[j])) drop[i] = true;
+        }
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < hits.size(); ++i)
+        if (!drop[i]) hits[k++] = hits[i];
+    hits.resize(k);
+}
+
 }  // namespace
 
 void scan_strings(const Snapshot& snap, uint64_t begin, uint64_t end, const StringsOptions& opt,
@@ -156,6 +185,7 @@ void scan_strings(const Snapshot& snap, uint64_t begin, uint64_t end, const Stri
     std::sort(out.hits.begin(), out.hits.end(), [](const StringHit& a, const StringHit& b) {
         return std::tie(a.offset, a.encoding) < std::tie(b.offset, b.encoding);
     });
+    if (opt.utf16le && opt.utf16be) drop_utf16_echoes(out.hits);
 }
 
 std::string string_hit_text(const Snapshot& snap, const StringHit& hit, size_t max_chars) {

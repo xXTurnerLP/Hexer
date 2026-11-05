@@ -15,6 +15,7 @@
 #include <sstream>
 
 #include "core/os_file.h"
+#include "script/cexport.h"
 #include "script/lua_internal.h"
 
 namespace hx {
@@ -671,6 +672,17 @@ bool ScriptEngine::edit_field(Document& doc, const Field& field, const std::stri
                     have_int = true;
                     break;
                 }
+    }
+    // Flag names "READ|WRITE" (opts.flags), also after the number as displayed: "3 = READ|WRITE".
+    if (!have_int && field.flags && !pi.is_float) {
+        const size_t eq = text.find(" = ");
+        uint64_t fv = 0;
+        if (eq == std::string::npos && parse_flags(text, *field.flags, fv)) {
+            if (pi.size < 8 && (fv >> (pi.size * 8)) != 0) return fail("flag bit beyond the field's " + std::to_string(pi.size * 8) + " bits");
+            if (pi.is_signed && pi.size < 8 && ((fv >> (pi.size * 8 - 1)) & 1)) fv |= ~0ull << (pi.size * 8);
+            iv = int64_t(fv);
+            have_int = true;
+        }
     }
     // Char literal (fmt="char"): bytes, most significant first, like the display.
     std::string chars;

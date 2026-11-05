@@ -9,6 +9,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -493,4 +494,206 @@ TEST_CASE("entropy: a process address space skips holes; fully unmapped buckets 
         }
     CHECK(empty > 0);
     CHECK(r->buckets[0].unreadable);
+}
+
+// ---- incremental rescan (EntropyJob::rescan) -----------------------------------------------------
+
+namespace {
+
+std::atomic<uint32_t> g_computed{0};
+void count_hook(uint32_t) { g_computed.fetch_add(1); }
+struct CountGuard {
+    CountGuard() {
+        g_computed = 0;
+        EntropyJob::set_bucket_hook_for_tests(count_hook);
+    }
+    ~CountGuard() { EntropyJob::set_bucket_hook_for_tests(nullptr); }
+};
+
+std::shared_ptr<const EntropyResult> rerun(EntropyJob& job, std::shared_ptr<const Snapshot> s, EntropyOptions o) {
+    const uint64_t gen = job.generation();
+    job.rescan(std::move(s), o);
+    wait_for(job, gen);
+    auto r = job.result();
+    REQUIRE(r);
+    CHECK(r->finished);
+    return r;
+}
+
+// Every bucket of `a` equals the one of a full scan `b`.
+void check_same(const EntropyResult& a, const EntropyResult& b) {
+    REQUIRE(a.buckets.size() == b.buckets.size());
+    CHECK(a.done == b.done);
+    for (size_t i = 0; i < a.buckets.size(); ++i) {
+        CAPTURE(i);
+        CHECK(a.buckets[i].offset == b.buckets[i].offset);
+        CHECK(a.buckets[i].length == b.buckets[i].length);
+        CHECK(a.buckets[i].done);
+        CHECK(a.buckets[i].entropy == b.buckets[i].entropy);
+        for (int c = 0; c < kByteClassCount; ++c) CHECK(a.buckets[i].class_frac[c] == b.buckets[i].class_frac[c]);
+    }
+}
+
+}  // namespace
+
+TEST_CASE("entropy: snapshot_changes compares stored bytes, not values") {
+    using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+    Bytes d(1000);
+    for (size_t i = 0; i < d.size(); ++i) d[i] = uint8_t(i * 13);
+    auto doc = Document::create_from_bytes("a", d.data(), d.size());
+    auto s0 = doc->snapshot();
+    CHECK(snapshot_changes(*s0, *s0).empty());
+    const uint8_t x[3] = {1, 2, 3};
+    REQUIRE(doc->overwrite(400, x, 3));
+    REQUIRE(doc->overwrite(403, x, 2));  // adjacent: merged
+    REQUIRE(doc->overwrite(900, x, 1));
+    CHECK(snapshot_changes(*s0, *doc->snapshot()) == Ranges{{400, 405}, {900, 901}});
+    // Writing the same values again still counts (other storage): no byte is compared.
+    REQUIRE(doc->overwrite(10, d.data() + 10, 1));
+    CHECK(snapshot_changes(*s0, *doc->snapshot()) == Ranges{{10, 11}, {400, 405}, {900, 901}});
+    REQUIRE(doc->insert(100, x, 2));  // other size: from the first change to the end
+    CHECK(snapshot_changes(*s0, *doc->snapshot()) == Ranges{{10, 1002}});
+    for (int k = 0; k < 5; ++k) REQUIRE(doc->undo());
+    CHECK(snapshot_changes(*s0, *doc->snapshot()).empty());
+    REQUIRE(doc->erase(990, 10));  // truncated: the remaining bytes are unchanged
+    CHECK(snapshot_changes(*s0, *doc->snapshot()).empty());
+    CHECK(snapshot_changes(*doc->snapshot(), *s0) == Ranges{{990, 1000}});
+    // Same bytes in another document: everything differs.
+    auto other = Document::create_from_bytes("b", d.data(), d.size());
+    CHECK(snapshot_changes(*s0, *other->snapshot()) == Ranges{{0, 1000}});
+}
+
+TEST_CASE("entropy: rescan reads only the buckets an overwrite touched") {
+    Bytes d(64 * 1000);
+    std::mt19937 rng(11);
+    for (auto& v : d) v = uint8_t(rng() % 7);
+    auto doc = Document::create_from_bytes("t", d.data(), d.size());
+    EntropyJob job;
+    EntropyOptions o;
+    o.buckets = 64;  // 1000 bytes each
+    o.publish_ms = 0;
+    CountGuard count;
+    auto r = run(job, doc->snapshot(), o);
+    CHECK(r->reused == 0);
+    CHECK(g_computed.load() == 64);
+
+    // Nothing changed: everything is reused, nothing is read.
+    g_computed = 0;
+    r = rerun(job, doc->snapshot(), o);
+    CHECK(r->reused == 64);
+    CHECK(r->done == 64);
+    CHECK(g_computed.load() == 0);
+    CHECK(r->bytes_read == 0);
+
+    // Overwrite inside bucket 10 and across the bucket 20 / 21 edge.
+    Bytes hi(300, 0xFF);
+    REQUIRE(doc->overwrite(10100, hi.data(), 300));
+    REQUIRE(doc->overwrite(20900, hi.data(), 200));
+    g_computed = 0;
+    r = rerun(job, doc->snapshot(), o);
+    CHECK(r->reused == 61);  // buckets 10, 20, 21 (not the ones between the two edits)
+    CHECK(g_computed.load() == 3);
+    CHECK(r->bytes_read == 3000);
+    CHECK(frac(r->buckets[10], ByteClass::Full) == doctest::Approx(0.3));
+    CHECK(frac(r->buckets[21], ByteClass::Full) == doctest::Approx(0.1));
+    EntropyJob fresh;
+    check_same(*r, *run(fresh, doc->snapshot(), o));
+
+    // Undo: the pieces of the first scan come back, but the base is now the edited scan.
+    g_computed = 0;
+    REQUIRE(doc->undo());
+    r = rerun(job, doc->snapshot(), o);
+    CHECK(g_computed.load() == 2);  // bucket 20 + 21
+    check_same(*r, *run(fresh, doc->snapshot(), o));
+}
+
+TEST_CASE("entropy: rescan after an insert / delete rescans from the edit; a new layout rescans all") {
+    Bytes d(63990);  // 64 buckets of 1000 bytes (the last one 990)
+    for (size_t i = 0; i < d.size(); ++i) d[i] = uint8_t((i / 1000) * 3 + (i & 1));
+    auto doc = Document::create_from_bytes("t", d.data(), d.size());
+    EntropyJob job, fresh;
+    EntropyOptions o;
+    o.buckets = 64;
+    CountGuard count;
+    auto r = run(job, doc->snapshot(), o);
+    REQUIRE(r->bucket_size == 1000);
+    // The same bytes in another document (same layout): nothing is reused.
+    auto copy = Document::create_from_bytes("c", d.data(), d.size());
+    CHECK(rerun(job, copy->snapshot(), o)->reused == 0);
+    CHECK(rerun(job, doc->snapshot(), o)->reused == 0);
+
+    const uint8_t x[5] = {0x80, 0x81, 0x82, 0x83, 0x84};
+    REQUIRE(doc->insert(30500, x, 5));  // 63995 bytes: same layout, buckets 30.. shifted
+    g_computed = 0;
+    r = rerun(job, doc->snapshot(), o);
+    REQUIRE(r->bucket_size == 1000);
+    CHECK(r->reused == 30);
+    CHECK(g_computed.load() == 34);
+    check_same(*r, *run(fresh, doc->snapshot(), o));
+
+    REQUIRE(doc->erase(63000, 10));  // delete near the end: only the last bucket
+    g_computed = 0;
+    r = rerun(job, doc->snapshot(), o);
+    CHECK(r->reused == 63);
+    CHECK(g_computed.load() == 1);
+    check_same(*r, *run(fresh, doc->snapshot(), o));
+
+    Bytes more(5000, 0x41);
+    REQUIRE(doc->insert(0, more.data(), more.size()));  // bucket size changes: everything again
+    g_computed = 0;
+    r = rerun(job, doc->snapshot(), o);
+    CHECK(r->bucket_size != 1000);
+    CHECK(r->reused == 0);
+    CHECK(g_computed.load() == r->buckets.size());
+    check_same(*r, *run(fresh, doc->snapshot(), o));
+
+    // Other sampling options: nothing is reused.
+    EntropyOptions o2 = o;
+    o2.sample_per_bucket = 512;
+    r = rerun(job, doc->snapshot(), o2);
+    CHECK(r->reused == 0);
+}
+
+TEST_CASE("entropy: rescan of a partial (superseded) result reuses only its computed buckets") {
+    Bytes d(64 * 100, 0x30);
+    auto doc = Document::create_from_bytes("t", d.data(), d.size());
+    EntropyJob job;
+    EntropyOptions o;
+    o.buckets = 64;
+    o.publish_ms = 0;
+    {
+        HookGuard hook(4);  // blocks after bucket 5 (published)
+        job.start(doc->snapshot(), o);
+        auto t0 = std::chrono::steady_clock::now();
+        std::shared_ptr<const EntropyResult> p;
+        while (!(p = job.result()) || p->done < 5) {
+            REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+            std::this_thread::yield();
+        }
+        const uint64_t gen = job.generation();
+        job.rescan(doc->snapshot(), o);  // supersedes the blocked run
+        g_release = UINT32_MAX;
+        wait_for(job, gen);
+    }
+    auto r = job.result();
+    REQUIRE(r->finished);
+    CHECK(r->reused >= 5);
+    CHECK(r->reused < 64);
+    CHECK(r->done == 64);
+    EntropyJob fresh;
+    check_same(*r, *run(fresh, doc->snapshot(), o));
+}
+
+TEST_CASE("entropy: process memory is always rescanned in full") {
+    hx_test::HoleyMem hm;
+    auto doc = hx_test::open_self();
+    EntropyJob job;
+    EntropyOptions o;
+    o.buckets = 16;
+    o.sample_per_bucket = 4096;
+    auto r = run(job, doc->snapshot(), o);
+    REQUIRE(r->done == 16);
+    r = rerun(job, doc->snapshot(), o);
+    CHECK(r->reused == 0);
+    CHECK(r->done == 16);
 }

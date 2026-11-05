@@ -56,6 +56,14 @@ struct Settings {
     std::string bitmap_format;
     int bitmap_width = 256;
     int bitmap_zoom = 2;
+    // Disassembly panel: mode 0 = auto (the PE / ELF header's), 1 = 64-bit, 2 = 32-bit
+    // (settings.ini: disasm_mode = auto | 64 | 32), AT&T syntax (disasm_syntax = intel | att),
+    // uppercase, Follow cursor, bytes column. Per-tab map / base / pinned start: session extras.
+    int disasm_mode = 0;
+    bool disasm_att = false;
+    bool disasm_uppercase = false;
+    bool disasm_follow = true;
+    bool disasm_bytes = true;
     // Typing-run undo coalescing: a pause longer than undo_merge_ms, or a run already covering
     // undo_merge_max_bytes bytes, starts a new undo step (0 = no limit). See Document::set_undo_merge.
     int undo_merge_ms = 500;

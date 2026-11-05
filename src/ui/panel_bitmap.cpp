@@ -498,6 +498,8 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
 
     // ---- image -----------------------------------------------------------------------------------
     const ImVec2 a0 = p0, a1(p0.x + area_w, p0.y + area_h);
+    image_x_ = a0.x;
+    image_y_ = a0.y;
     ImGui::SetCursorScreenPos(a0);
     ImGui::InvisibleButton("##image", ImVec2(area_w, area_h));
     const bool img_hovered = ImGui::IsItemHovered();

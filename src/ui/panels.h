@@ -22,6 +22,11 @@ void update_structure(App& app, Tab& tab);
 // in Auto mode picks the detected parser (detect() only looks at the file start), so set
 // view().parser first to use another one.
 void set_parse_base(App& app, Tab& tab, uint64_t base, uint64_t length = UINT64_MAX);
+// Structure -> C header (script/cexport.h) of the active tab's parse tree; `field` = a struct /
+// array field's index for just that subtree, -1 = the whole tree. Copy puts it on the clipboard
+// (action "Structure: Copy as C Header"); Export asks for a .h file (native dialog).
+void structure_copy_c_header(App& app, int field = -1);
+void structure_export_c_header(App& app, int field = -1);
 
 void draw_inspector_panel(App& app);       // "Inspector": typed values at focus_offset(), editable
 void draw_structure_panel(App& app);       // "Structure": parser tree (virtualised), editable fields
@@ -45,6 +50,8 @@ void disasm_go_to_entry(App& app);
 // Follow the branch / RIP-relative target of the instruction at the caret (as a double-click on
 // its Disassembly row does; recorded in the jump history).
 void disasm_follow_target(App& app);
+// Shows the Disassembly panel with its "Go to Symbol" list (PE exports / imports, ELF symbols).
+void disasm_go_to_symbol(App& app);
 // Reads the Disassembly panel options (mode, syntax, uppercase, follow, bytes) from app.settings.
 void load_disasm_settings(App& app);
 void draw_status_bar(App& app);            // fixed bottom bar (call before the dockspace)

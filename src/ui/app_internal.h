@@ -132,6 +132,7 @@ struct Tab {
     uint64_t entropy_gen = UINT64_MAX;          // document generation of the last started scan
     uint64_t entropy_pending_gen = UINT64_MAX;  // generation waiting for the debounce
     double entropy_first_change = 0.0, entropy_last_change = 0.0;
+    uint64_t entropy_saved = 0;                 // saved_state_id() at the last scan (changed: full rescan)
     std::shared_ptr<const EntropyResult> entropy_shown;  // what the minimap draws (old map while rescanning)
 
     TailState tail;                   // View > Live Tail (session: doc extra tail.enabled)
@@ -290,6 +291,11 @@ struct App final : ScriptHost {
     uint64_t diff_a = 0, diff_b = 0;  // Document::id() of the two sides
     bool diff_select = false;         // select the Compare tab next frame
     bool diff_shown = false;          // the Compare tab was the selected tab last frame (session)
+    // B side that is not an open tab (diff_b is its id): A's file as saved on disk ("Compare with
+    // File on Disk": shows exactly the unsaved edits; reloaded when the file changes) or A's
+    // "<file>.backup" ("Restore from .backup" > Compare with Backup). Read-only, owned here.
+    std::unique_ptr<Tab> diff_aux;
+    bool diff_aux_backup = false;     // diff_aux is the .backup (else the file on disk)
 
     FindState find;
     SaveTask save;
@@ -365,6 +371,7 @@ struct App final : ScriptHost {
     Document* find_document(uint64_t id) override;
     Document* open_bytes(const std::string& name, const uint8_t* data, size_t len) override;
     void reveal(Document& doc, uint64_t offset, uint64_t len) override;
+    bool view_range(Document& doc, uint64_t& first, uint64_t& last) override;
 };
 
 // ---- helpers implemented in app.cpp, used by panels.cpp ------------------------------------
@@ -380,6 +387,9 @@ void set_status(App& app, const std::string& text, double seconds = 4.0);
 void notify(App& app, const std::string& text, bool error);
 void show_message(App& app, const std::string& title, const std::string& text);
 bool open_path(App& app, const std::string& path);
+// Native "Save as" dialog for a new file (e.g. an exported header) named `default_name`, in the
+// active file's folder. False when cancelled (dialog errors are reported).
+bool save_file_dialog(App& app, const std::string& default_name, std::string& out);
 void mark_settings_dirty(App& app);
 // Status text for an edit call that returned false.
 void report_edit_failure(App& app, const Document& doc);

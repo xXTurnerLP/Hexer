@@ -4,7 +4,7 @@
 -- directory entries and the end-of-central-directory record. All integers are little-endian.
 -- Reference: PKWARE APPNOTE.TXT, section 4.3.
 --
--- Techniques shown here: dispatch on a peeked signature, bit flags with fmt="bin", decoding packed
+-- Techniques shown here: dispatch on a peeked signature, named bit flags (opts.flags), decoding packed
 -- DOS date/time into a note, doc:find to resynchronise when sizes are unknown, ZIP64 extra
 -- fields (64-bit sizes) and end records.
 
@@ -20,6 +20,13 @@ local SIG = {
 local METHOD = {
     [0] = "stored", [1] = "shrunk", [6] = "imploded", [8] = "deflate", [9] = "deflate64",
     [12] = "bzip2", [14] = "LZMA", [93] = "zstd", [95] = "xz", [98] = "PPMd", [99] = "AES encrypted",
+}
+
+-- General purpose bit flag (APPNOTE 4.4.4): bit number -> name.
+local GP_FLAGS = {
+    [0] = "ENCRYPTED", [1] = "COMPRESS_OPT1", [2] = "COMPRESS_OPT2", [3] = "DATA_DESCRIPTOR",
+    [4] = "ENHANCED_DEFLATE", [5] = "PATCHED", [6] = "STRONG_ENCRYPTION", [11] = "UTF8",
+    [13] = "MASKED_HEADERS",
 }
 
 local HOST_OS = { [0] = "MS-DOS/FAT", [3] = "Unix", [7] = "Macintosh", [10] = "NTFS", [19] = "OS X" }
@@ -40,12 +47,8 @@ local U32_MAX = 0xFFFFFFFF   -- a 32-bit size/offset of 0xFFFFFFFF means "the re
 
 -- Fields shared by local and central headers. Returns the values the caller needs.
 local function common_header(p)
-    local flags = p:u16("flags", { fmt = "bin" })
-    local notes = {}
-    if flags & 0x0001 ~= 0 then notes[#notes + 1] = "encrypted" end
-    if flags & 0x0008 ~= 0 then notes[#notes + 1] = "sizes in data descriptor" end
-    if flags & 0x0800 ~= 0 then notes[#notes + 1] = "UTF-8 names" end
-    if #notes > 0 then p:note(table.concat(notes, ", ")) end
+    -- opts.flags names the set bits ("0x0808 = DATA_DESCRIPTOR|UTF8"); edits take names too.
+    local flags = p:u16("flags", { fmt = "hex", flags = GP_FLAGS })
     p:u16("method", { enum = METHOD })
     local t = p:u16("mod_time", { fmt = "hex" })
     local d = p:u16("mod_date", { fmt = "hex" })

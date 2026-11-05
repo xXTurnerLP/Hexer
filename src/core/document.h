@@ -256,6 +256,16 @@ public:
     // Fill [offset, offset+len) with a repeating pattern without materialising len bytes in RAM
     // beyond one add-buffer chunk (pattern is written once per chunk and pieces reference it).
     bool fill(uint64_t offset, uint64_t len, const uint8_t* pattern, size_t pattern_len);
+    // Replaces the whole content with the bytes of the file at `path` (e.g. "Revert to Backup"
+    // with backup_path_of(path())) as ONE undo step labelled `label`. O(pieces), nothing is copied:
+    // the file becomes an extra read-only source the piece list references (kept open while the
+    // state or its history needs it). Nothing on disk changes until save() writes the document
+    // (a rewrite; an existing "<path>.backup" is never replaced, see save()). Refused for devices /
+    // process memory (fixed size), read-only or busy documents, and for the document's own file.
+    // Hot exit: the session inlines at most 16 MiB of such bytes (hot_exit_safe() is false above).
+    bool replace_with_file(const std::string& path, const std::string& label, std::string* err = nullptr);
+    // "<file>.backup" that save() keeps for `path` (symlinks resolved like save() does).
+    static std::string backup_path_of(const std::string& path);
 
     // Group several edits into one undo step (nestable). Used by scripts and multi-step actions.
     // The step's label is the innermost non-empty group label (a labelled doc:transaction inside a

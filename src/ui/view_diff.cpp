@@ -83,6 +83,32 @@ const char* kind_name(uint8_t kind) {
     return kind == DiffRange::OnlyA ? "Only in A" : kind == DiffRange::OnlyB ? "Only in B" : "Changed";
 }
 
+std::string bytes_text(uint64_t n) { return fmt_count(n) + (n == 1 ? " byte" : " bytes"); }
+
+// What Find Shift found, for the toolbar note / status bar.
+std::string shift_message(const ShiftResult& r) {
+    const std::string at_a = "A 0x" + fmt_hex(r.diff_a);
+    switch (r.status) {
+    case ShiftResult::Found:
+        if (r.delta == 0)
+            return "No shift needed: the bytes after the difference at " + at_a +
+                   " already line up (changed, not inserted)";
+        if (r.delta > 0)
+            return "Shift " + fmt_shift(r.shift) + ": B has " + bytes_text(uint64_t(r.delta)) + " more at B 0x" +
+                   fmt_hex(r.diff_b);
+        return "Shift " + fmt_shift(r.shift) + ": A has " + bytes_text(uint64_t(0) - uint64_t(r.delta)) +
+               " more at " + at_a;
+    case ShiftResult::NoDifference: return "Nothing to align: no difference with the current shift";
+    case ShiftResult::NoProbe:
+        return "No distinctive bytes after the difference at " + at_a + " (only padding / repeats)";
+    case ShiftResult::NoMatch:
+        return "No shift found: nothing after the difference at " + at_a + " matches within +-" +
+               fmt_size(ShiftOptions{}.window);
+    case ShiftResult::IoError: return "Find Shift stopped: read error at " + at_a;
+    default: return "Find Shift cancelled";
+    }
+}
+
 }  // namespace
 
 DiffView::DiffView() = default;
@@ -116,6 +142,34 @@ void DiffView::start_compare(Document& a, Document& b) {
     started_ = true;
     pending_since_ = -1.0;
     recompare_requested_ = false;
+}
+
+// A finished Find Shift: apply the proposed shift and show the matching block on both sides.
+void DiffView::poll_shift(Document& a, Document& b, const DiffViewCallbacks& cb) {
+    const uint64_t g = shift_job_.generation();
+    if (g == shift_gen_seen_) return;
+    shift_gen_seen_ = g;
+    auto r = shift_job_.result();
+    if (!r || r->run != shift_run_) return;
+    shift_run_ = 0;
+    if (r->status == ShiftResult::Found) {
+        shift = r->shift;  // the toolbar realigns the views and the compare restarts
+        select_range(a, r->match_a, 0);
+        select_range(b, r->match_b, 0);
+        if (sync_scroll && a_.drawn) {
+            // Center A on the match; B follows with the new shift (aligned rows, also near the start).
+            const uint64_t bpr = uint64_t(std::max(1, a_.bpr)), vis = uint64_t(std::max(1, a_.ev.visible_rows));
+            const uint64_t row = std::min(r->match_a, a.size()) / bpr;
+            a.view().top_row = row > vis / 2 ? row - vis / 2 : 0;
+            synced_once_ = false;
+        } else {
+            a_.view.request_scroll_to(std::min(r->match_a, a.size()), true);
+            b_.view.request_scroll_to(std::min(r->match_b, b.size()), true);
+        }
+        cur_ = kNoDiff;
+    }
+    note_ = shift_message(*r);
+    if (cb.notify) cb.notify(note_);
 }
 
 void DiffView::poll_job() {
@@ -258,6 +312,14 @@ void DiffView::draw_toolbar(Document& a, Document& b) {
         ImGui::SetTooltip("B offset = A offset + shift (signed, decimal or 0x hex),\n"
                           "e.g. 0x200 when B has an extra 512-byte header.");
     ImGui::SameLine();
+    ImGui::BeginDisabled(shift_job_.running() || a.busy() || b.busy());
+    if (ImGui::Button("Find Shift")) find_shift_requested_ = true;
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Find the shift that lines the documents up again after their first difference\n"
+                          "(an inserted or deleted header / block, searched within +-%s).",
+                          fmt_size(ShiftOptions{}.window).c_str());
+    ImGui::SameLine();
     if (ImGui::Checkbox("Sync scroll", &sync_scroll) && sync_scroll) synced_once_ = false;
     ImGui::SameLine();
     ImGui::Checkbox("Sync caret", &sync_caret);
@@ -265,7 +327,14 @@ void DiffView::draw_toolbar(Document& a, Document& b) {
     if (ImGui::Button("Recompare")) recompare_requested_ = true;
 
     // Status line: progress or summary, staleness, last navigation note.
-    if (running) {
+    if (shift_job_.running()) {
+        ImGui::ProgressBar(float(shift_job_.progress()), ImVec2(ImGui::GetFontSize() * 14.0f, 0.0f));
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##shift")) shift_job_.cancel();
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Finding the shift...");
+    } else if (running) {
         ImGui::ProgressBar(float(job_.progress()), ImVec2(ImGui::GetFontSize() * 14.0f, 0.0f));
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) job_.cancel();
@@ -355,11 +424,19 @@ void DiffView::draw(const char* id, Document& a, Document& b, const DiffViewCall
         b_.ticks.clear();
         a_.layer_for = b_.layer_for = nullptr;
         cur_ = kNoDiff;
+        shift_job_.cancel();
+        shift_run_ = 0;
         started_ = false;
         synced_once_ = false;
         note_.clear();
     }
     poll_job();
+    if (find_shift_requested_ && !a.busy() && !b.busy()) {
+        find_shift_requested_ = false;
+        note_.clear();
+        shift_run_ = shift_job_.start(a.snapshot(), b.snapshot(), shift);
+    }
+    poll_shift(a, b, cb);
 
     // Recompare: immediately when asked / first time / shift changed, debounced after edits.
     const double now = ImGui::GetTime();

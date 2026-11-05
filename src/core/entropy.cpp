@@ -113,6 +113,68 @@ EntropyBucket entropy_aggregate(const EntropyResult& r, uint64_t begin, uint64_t
     return out;
 }
 
+// ---- snapshot comparison -------------------------------------------------------------------------
+
+namespace {
+
+// The object holding a piece's bytes (file version / add chunk); null if the index is unknown.
+const void* piece_store(const Snapshot& s, const Piece& p) {
+    if (p.src == Piece::Original)
+        return p.chunk < s.sources.size() ? static_cast<const void*>(s.sources[p.chunk].get()) : nullptr;
+    return p.chunk < s.chunks.size() ? static_cast<const void*>(s.chunks[p.chunk].get()) : nullptr;
+}
+
+// Same bytes (same storage, same position)?
+bool same_store(const Snapshot& a, const Piece& p, uint64_t oa, const Snapshot& b, const Piece& q, uint64_t ob) {
+    const void* store = piece_store(a, p);
+    return store && p.src == q.src && store == piece_store(b, q) && p.start + oa == q.start + ob;
+}
+
+bool has_process_source(const Snapshot& s) {
+    for (const auto& src : s.sources)
+        if (src && src->kind() == SourceKind::Process) return true;
+    return false;
+}
+
+}  // namespace
+
+std::vector<std::pair<uint64_t, uint64_t>> snapshot_changes(const Snapshot& before, const Snapshot& after) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    auto add = [&out](uint64_t from, uint64_t to) {
+        if (from >= to) return;
+        if (!out.empty() && out.back().second == from) out.back().second = to;
+        else out.emplace_back(from, to);
+    };
+    const bool same_size = before.size() == after.size();
+    // Walk both piece lists in step (logical offset `pos`); `oa` / `ob` = bytes consumed inside
+    // the current piece of before / after. Other sizes stop at the first difference.
+    const size_t na = before.pieces.size(), nb = after.pieces.size();
+    size_t i = 0, j = 0;
+    uint64_t oa = 0, ob = 0, pos = 0;
+    while (i < na && j < nb) {
+        const Piece& p = before.pieces[i];
+        const Piece& q = after.pieces[j];
+        const uint64_t k = std::min(p.len - oa, q.len - ob);
+        if (!same_store(before, p, oa, after, q, ob)) {
+            if (!same_size) break;
+            add(pos, pos + k);
+        }
+        pos += k;
+        oa += k;
+        ob += k;
+        if (oa >= p.len) {
+            ++i;
+            oa = 0;
+        }
+        if (ob >= q.len) {
+            ++j;
+            ob = 0;
+        }
+    }
+    add(std::min(pos, after.size()), after.size());  // shifted (other size) or past the shorter list
+    return out;
+}
+
 // ---- background job -----------------------------------------------------------------------------
 
 namespace {
@@ -245,15 +307,29 @@ std::shared_ptr<const EntropyResult> EntropyJob::result() const {
 }
 
 void EntropyJob::start(std::shared_ptr<const Snapshot> snap, EntropyOptions opts) {
+    launch(std::move(snap), opts, false);
+}
+
+void EntropyJob::rescan(std::shared_ptr<const Snapshot> snap, EntropyOptions opts) {
+    launch(std::move(snap), opts, true);
+}
+
+void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opts, bool incremental) {
     // Never block the UI thread on the previous run (it may sit in one slow read): cancel it, let it
     // finish in the background (it no longer publishes anything) and join it once it has exited.
     auto run = std::make_shared<Run>();
     EntropyResult layout = entropy_layout(snap ? snap->size() : 0, opts.buckets);
     run->total = uint32_t(layout.buckets.size());
+    std::shared_ptr<const EntropyResult> base;  // rescan: the latest published result ...
+    std::shared_ptr<const Snapshot> base_snap;  // ... and what it was computed from
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (run_) run_->cancel = true;
         run_ = run;
+        if (incremental && result_snap_ && result_opts_.sample_per_bucket == opts.sample_per_bucket) {
+            base = result_;
+            base_snap = result_snap_;
+        }
     }
     for (auto it = threads_.begin(); it != threads_.end();) {
         if (it->second->finished) {
@@ -264,7 +340,8 @@ void EntropyJob::start(std::shared_ptr<const Snapshot> snap, EntropyOptions opts
         }
     }
     running_ = true;
-    std::thread th([this, run, snap = std::move(snap), opts, r = std::move(layout)]() mutable {
+    std::thread th([this, run, snap = std::move(snap), opts, r = std::move(layout), base = std::move(base),
+                    base_snap = std::move(base_snap)]() mutable {
         using clock = std::chrono::steady_clock;
         uint64_t io_at = UINT64_MAX;
         std::vector<uint8_t> buf;
@@ -277,15 +354,41 @@ void EntropyJob::start(std::shared_ptr<const Snapshot> snap, EntropyOptions opts
             std::lock_guard<std::mutex> lock(mu_);
             if (run_ != run) return false;
             result_ = std::move(copy);
+            result_snap_ = snap;
+            result_opts_ = opts;
             if (final) {
                 running_ = false;
                 generation_.fetch_add(1);
             }
             return true;
         };
+        // Rescan: copy the computed buckets no changed range touches. Same layout only (then bucket
+        // i covers the same offsets in both; a shorter / longer last bucket is recomputed).
+        if (base && base_snap && snap && !has_process_source(*snap) && base->bucket_size == r.bucket_size &&
+            base->buckets.size() == r.buckets.size()) {
+            const auto changes = snapshot_changes(*base_snap, *snap);
+            size_t ci = 0;  // first change that ends after the current bucket's start
+            for (size_t i = 0; i < r.buckets.size(); ++i) {
+                EntropyBucket& b = r.buckets[i];
+                const EntropyBucket& old = base->buckets[i];
+                while (ci < changes.size() && changes[ci].second <= b.offset) ++ci;
+                if (!old.done || old.offset != b.offset || old.length != b.length) continue;
+                if (ci < changes.size() && changes[ci].first < b.offset + b.length) continue;  // touched
+                b = old;
+                ++r.reused;
+                if (base->io_error && base->io_error_offset >= b.offset && base->io_error_offset - b.offset < b.length)
+                    io_at = std::min(io_at, base->io_error_offset);
+            }
+            if (r.reused && r.reused < r.buckets.size()) publish(false);  // paint the kept buckets now
+        }
         for (size_t i = 0; i < r.buckets.size(); ++i) {
             if (run->cancel.load() || !snap) break;
             EntropyBucket& b = r.buckets[i];
+            if (b.done) {  // reused
+                r.done = uint32_t(i + 1);
+                run->done = r.done;
+                continue;
+            }
             if (!compute_bucket(*snap, b, opts, run->cancel, buf, io_at)) break;
             r.bytes_read += b.bytes_read;
             r.done = uint32_t(i + 1);

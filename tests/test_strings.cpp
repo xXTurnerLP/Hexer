@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -106,6 +108,32 @@ std::vector<StringHit> reference(const Bytes& d, const StringsOptions& o) {
     std::sort(out.begin(), out.end(), [](const StringHit& a, const StringHit& b) {
         return std::tie(a.offset, a.encoding) < std::tie(b.offset, b.encoding);
     });
+    if (o.utf16le && o.utf16be) {
+        // Both byte orders: a string is not listed again as its one-byte-shifted echo in the other
+        // order (not longer, ends at most one byte past it; equal length: LE is kept).
+        auto echo = [](const StringHit& e, const StringHit& m) {
+            const bool shifted = e.offset == m.offset + 1 || m.offset == e.offset + 1;
+            const bool other = e.encoding != StringEncoding::Ascii && m.encoding != StringEncoding::Ascii &&
+                               e.encoding != m.encoding;
+            return other && shifted && e.offset + 2 * e.char_count <= m.offset + 2 * m.char_count + 1 &&
+                   (e.char_count < m.char_count ||
+                    (e.char_count == m.char_count && m.encoding == StringEncoding::Utf16LE));
+        };
+        std::map<uint64_t, std::vector<size_t>> at;  // offset -> UTF-16 hits there
+        for (size_t i = 0; i < out.size(); ++i)
+            if (out[i].encoding != StringEncoding::Ascii) at[out[i].offset].push_back(i);
+        std::vector<StringHit> kept;
+        for (const StringHit& h : out) {
+            bool drop = false;
+            for (uint64_t nb : {h.offset - 1, h.offset + 1}) {
+                auto it = at.find(nb);
+                if (it == at.end()) continue;
+                for (size_t m : it->second) drop = drop || echo(h, out[m]);
+            }
+            if (!drop) kept.push_back(h);
+        }
+        out.swap(kept);
+    }
     return out;
 }
 
@@ -156,8 +184,8 @@ TEST_CASE("strings: UTF-16 alignment") {
     Bytes d = {0, 'A', 0, 'B', 0, 'C', 0, 'D', 0, 'E', 0};
     StringsOptions o;
     check_hits(scan(d, o).hits, {hit(1, 5, StringEncoding::Utf16LE)});
-    o.utf16be = true;
-    check_hits(scan(d, o).hits, {hit(0, 5, StringEncoding::Utf16BE), hit(1, 5, StringEncoding::Utf16LE)});
+    o.utf16be = true;  // both readings are equally long: only the LE one is listed (no shifted echo)
+    check_hits(scan(d, o).hits, {hit(1, 5, StringEncoding::Utf16LE)});
     o.utf16le = false;
     check_hits(scan(d, o).hits, {hit(0, 5, StringEncoding::Utf16BE)});
 
@@ -446,4 +474,29 @@ TEST_CASE("strings: holes of process memory end strings and are skipped, not err
     CHECK(jr->scan.hits.size() == 3);
     CHECK(jr->scan.skipped == pg);
     CHECK_FALSE(jr->scan.io_error);
+}
+
+TEST_CASE("strings: an ASCII-in-UTF-16 string is not listed again shifted by one byte") {
+    StringsOptions o;
+    o.ascii = false;
+    o.utf16be = true;
+    o.min_length = 4;
+    // UTF-16LE "Hello": read one byte later as UTF-16BE it is "ello" (00 'e' 00 'l' ...).
+    Bytes d(40, 0xFF);
+    put16(d, 0, "Hello");
+    put16(d, 21, "World", true);  // UTF-16BE "World": LE one byte later reads "orld"
+    check_hits(scan(d, o).hits, {hit(0, 5, StringEncoding::Utf16LE), hit(21, 5, StringEncoding::Utf16BE)});
+    // Before the dedup the echoes were listed too.
+    o.utf16be = false;
+    check_hits(scan(d, o).hits, {hit(0, 5, StringEncoding::Utf16LE), hit(22, 4, StringEncoding::Utf16LE)});
+    o.utf16be = true;
+    o.utf16le = false;
+    check_hits(scan(d, o).hits, {hit(1, 4, StringEncoding::Utf16BE), hit(21, 5, StringEncoding::Utf16BE)});
+
+    // A real BE string right behind an LE one is kept (it is not their shifted reading).
+    Bytes e(60, 0xFF);
+    put16(e, 0, "First");
+    put16(e, 10, "Second", true);  // directly behind it
+    o.utf16le = true;
+    check_hits(scan(e, o).hits, {hit(0, 5, StringEncoding::Utf16LE), hit(10, 6, StringEncoding::Utf16BE)});
 }

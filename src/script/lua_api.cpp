@@ -9,8 +9,10 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
+#include <initializer_list>
 #include <memory>
 
 #include "core/disasm.h"
@@ -19,7 +21,10 @@
 #include "core/highlight.h"
 #include "core/os_file.h"
 #include "core/search.h"
+#include "core/symbols.h"
 #include "core/util.h"
+#include "core/xorscan.h"
+#include "script/cexport.h"
 
 #ifndef HEXER_VERSION
 #define HEXER_VERSION "0.1.0"
@@ -522,6 +527,112 @@ int doc_disasm(lua_State* L) {
     return 1;
 }
 
+// ---- doc:symbols ---------------------------------------------------------------------------------
+// The table is serialized into a malloc'ed blob owned by a userdata with __gc (a Lua error while
+// the result tables are built frees it), so no C++ object is alive while Lua may raise.
+
+struct SymRec {
+    uint64_t address, offset;
+    uint32_t name_off, name_len, mod_off, mod_len, fwd_off, fwd_len, ordinal;
+    uint8_t kind;
+    bool has_address, has_offset;
+};
+struct SymBlob {
+    void* p;
+    size_t n;
+};
+constexpr const char* kSymBlobMeta = "hexer.symblob";
+
+int symblob_gc(lua_State* L) {
+    auto* b = static_cast<SymBlob*>(luaL_checkudata(L, 1, kSymBlobMeta));
+    std::free(b->p);
+    b->p = nullptr;
+    return 0;
+}
+
+// doc:symbols() -> list of {name=, address=, offset=, kind=, module=, ordinal=?, forward=?}
+int doc_symbols(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    auto* blob = static_cast<SymBlob*>(lua_newuserdatauv(L, sizeof(SymBlob), 0));
+    blob->p = nullptr;
+    blob->n = 0;
+    if (luaL_newmetatable(L, kSymBlobMeta)) {
+        lua_pushcfunction(L, symblob_gc);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_setmetatable(L, -2);
+    bool oom = false;
+    {
+        const AddressMap map = detect_address_map(*d);
+        const SymbolTable t = build_symbols(*d->snapshot(), map);
+        const size_t n = t.symbols.size() + t.forwarders.size();
+        size_t pool = 0;
+        for (const auto* v : {&t.symbols, &t.forwarders})
+            for (const Symbol& s : *v) pool += s.name.size() + s.module.size() + s.forward.size();
+        blob->p = std::malloc(std::max<size_t>(n * sizeof(SymRec) + pool, 1));
+        if (!blob->p) {
+            oom = true;
+        } else {
+            blob->n = n;
+            auto* rec = static_cast<SymRec*>(blob->p);
+            char* str = static_cast<char*>(blob->p) + n * sizeof(SymRec);
+            uint32_t at = 0;
+            auto put = [&](const std::string& s, uint32_t& off, uint32_t& len) {
+                off = at;
+                len = uint32_t(s.size());
+                std::memcpy(str + at, s.data(), s.size());
+                at += len;
+            };
+            size_t k = 0;
+            for (const auto* v : {&t.symbols, &t.forwarders})
+                for (const Symbol& s : *v) {
+                    SymRec& r = rec[k++];
+                    r.address = s.address;
+                    r.has_address = s.forward.empty();
+                    r.has_offset = r.has_address && map.va_to_offset(s.address, r.offset);
+                    r.ordinal = s.ordinal;
+                    r.kind = uint8_t(s.kind);
+                    put(s.name, r.name_off, r.name_len);
+                    put(s.module, r.mod_off, r.mod_len);
+                    put(s.forward, r.fwd_off, r.fwd_len);
+                }
+        }
+    }
+    if (oom) return luaL_error(L, "doc:symbols: out of memory");
+    const auto* rec = static_cast<const SymRec*>(blob->p);
+    const char* str = static_cast<const char*>(blob->p) + blob->n * sizeof(SymRec);
+    lua_createtable(L, int(std::min<size_t>(blob->n, INT32_MAX)), 0);
+    for (size_t k = 0; k < blob->n; ++k) {
+        const SymRec& r = rec[k];
+        lua_createtable(L, 0, 6);
+        lua_pushlstring(L, str + r.name_off, r.name_len);
+        lua_setfield(L, -2, "name");
+        if (r.has_address) {
+            lua_pushinteger(L, lua_Integer(r.address));
+            lua_setfield(L, -2, "address");
+        }
+        if (r.has_offset) {
+            lua_pushinteger(L, lua_Integer(r.offset));
+            lua_setfield(L, -2, "offset");
+        }
+        lua_pushstring(L, symbol_kind_name(Symbol::Kind(r.kind)));
+        lua_setfield(L, -2, "kind");
+        lua_pushlstring(L, str + r.mod_off, r.mod_len);
+        lua_setfield(L, -2, "module");
+        if (r.ordinal) {
+            lua_pushinteger(L, lua_Integer(r.ordinal));
+            lua_setfield(L, -2, "ordinal");
+        }
+        if (r.fwd_len) {
+            lua_pushlstring(L, str + r.fwd_off, r.fwd_len);
+            lua_setfield(L, -2, "forward");
+        }
+        lua_rawseti(L, -2, lua_Integer(k + 1));
+    }
+    lua_remove(L, -2);  // the blob (freed by its __gc)
+    return 1;
+}
+
 int doc_find(lua_State* L) {
     Document* d = check_doc(L, 1);
     size_t n;
@@ -581,6 +692,94 @@ int doc_find(lua_State* L) {
     return 1;
 }
 
+// doc:view_range() -> first, last (inclusive) visible byte of the document's hex view, or nil.
+int doc_view_range(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    ScriptHost* host = impl_of(L).eng.host();
+    uint64_t first = 0, last = 0;
+    if (!host || !host->view_range(*d, first, last)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, lua_Integer(first));
+    lua_pushinteger(L, lua_Integer(last));
+    return 2;
+}
+
+// ---- bookmarks (doc:bookmarks / doc:add_bookmark / doc:remove_bookmark; undoable via Document) ----
+
+int doc_bookmarks(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const std::vector<Bookmark>& bms = d->view().bookmarks;  // a reference: nothing to destroy
+    lua_createtable(L, int(bms.size()), 0);
+    for (size_t i = 0; i < bms.size(); ++i) {
+        const Bookmark& b = bms[i];
+        lua_createtable(L, 0, 5);
+        lua_pushinteger(L, lua_Integer(b.offset));
+        lua_setfield(L, -2, "offset");
+        lua_pushinteger(L, lua_Integer(b.length));
+        lua_setfield(L, -2, "length");
+        lua_pushlstring(L, b.name.data(), b.name.size());
+        lua_setfield(L, -2, "name");
+        lua_pushinteger(L, lua_Integer(b.color));
+        lua_setfield(L, -2, "color");
+        lua_pushlstring(L, b.note.data(), b.note.size());
+        lua_setfield(L, -2, "note");
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    return 1;
+}
+
+// C++ work of a lua_CFunction that raises Lua errors goes into a separate non-inlined helper, so
+// the function's own frame holds no object with a destructor anywhere (MSVC's longjmp unwinding of
+// a Lua error through such a frame can run destructors of objects that were never constructed).
+#if defined(_MSC_VER)
+#define HX_NOINLINE __declspec(noinline)
+#else
+#define HX_NOINLINE __attribute__((noinline))
+#endif
+
+HX_NOINLINE bool add_bookmark_plain(Document& d, uint64_t off, uint64_t len, const char* name, size_t name_len, uint32_t color,
+                        const char* note, size_t note_len) {
+    Bookmark b;
+    b.offset = off;
+    b.length = len;
+    b.name.assign(name, name_len);
+    b.color = color;
+    b.note.assign(note, note_len);
+    return d.add_bookmark(b);
+}
+
+// doc:add_bookmark(off, len?, name?, color?, note?) -> 1-based index of the new bookmark.
+int doc_add_bookmark(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const uint64_t off = check_u64(L, 2);
+    const uint64_t len = luaL_opt(L, check_u64, 3, 1);
+    size_t name_len = 0, note_len = 0;
+    const char* name = luaL_optlstring(L, 4, "", &name_len);
+    uint32_t color = 0;
+    if (!lua_isnoneornil(L, 5) && !to_color(L, 5, color))
+        return luaL_argerror(L, 5, "color expected (\"red\", \"#ff8800\", 0xff8800)");
+    const char* note = luaL_optlstring(L, 6, "", &note_len);
+    const uint64_t size = d->size();
+    if (off >= size) return edit_failed(L, "doc:add_bookmark", off, size);
+    const uint64_t blen = std::max<uint64_t>(1, std::min(len, size - off));
+    if (!add_bookmark_plain(*d, off, blen, name, name_len, color, note, note_len))
+        return luaL_error(L, "document is busy (saving)");
+    lua_pushinteger(L, lua_Integer(d->view().bookmarks.size()));
+    return 1;
+}
+
+int doc_remove_bookmark(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const lua_Integer i = luaL_checkinteger(L, 2);
+    const size_t n = d->view().bookmarks.size();
+    if (i < 1 || uint64_t(i) > n)
+        return luaL_error(L, "doc:remove_bookmark: no bookmark #%I (the document has %I)", i, lua_Integer(n));
+    if (!d->remove_bookmark(size_t(i - 1))) return luaL_error(L, "document is busy (saving)");
+    return 0;
+}
+
 int doc_tostring(lua_State* L) {
     auto* ud = static_cast<DocUd*>(luaL_checkudata(L, 1, kDocMeta));
     ScriptHost* host = impl_of(L).eng.host();
@@ -609,7 +808,9 @@ const luaL_Reg kDocMethods[] = {
     {"selection", doc_selection},                          {"select", doc_select},
     {"goto", doc_goto},       {"jump", doc_goto},          {"find", doc_find},
     {"hash", doc_hash},       {"target", doc_target},      {"pid", doc_pid},
-    {"disasm", doc_disasm},
+    {"disasm", doc_disasm},   {"symbols", doc_symbols},
+    {"view_range", doc_view_range},                        {"bookmarks", doc_bookmarks},
+    {"add_bookmark", doc_add_bookmark},                    {"remove_bookmark", doc_remove_bookmark},
     {nullptr, nullptr},
 };
 
@@ -636,6 +837,7 @@ struct ParseCtx {
     int last = -1;                       // last emitted (or closed) field, target of p:note
     std::vector<uint8_t> explicit_color; // per field
     std::unordered_map<const void*, std::shared_ptr<const EnumList>> enums;
+    std::unordered_map<const void*, std::shared_ptr<const std::vector<Field::FlagItem>>> flags;
     int ud_ref = LUA_NOREF;              // the `p` userdata (invalidated after the parse)
     int anchor_ref = LUA_NOREF;          // table keeping enum tables alive (stable cache keys)
     int parser_ref = LUA_NOREF;
@@ -679,7 +881,25 @@ struct Opts {
     const char* comment = nullptr;  // kept alive on the Lua stack
     const char* fmt = "";           // "", "hex", "dec", "bin", "char" (static strings)
     int enum_idx = 0;               // absolute stack index of the enum table (0 = none)
+    int flags_idx = 0;              // absolute stack index of the flags table (0 = none)
+    Field::BitField bits;           // opts.bitfield
 };
+
+// opts.bitfield = {shift=, width=, be=?, signed=?} at `idx` (a table).
+void read_bitfield(lua_State* L, int idx, Field::BitField& b) {
+    luaL_checktype(L, idx, LUA_TTABLE);
+    lua_getfield(L, idx, "shift");
+    lua_getfield(L, idx, "width");
+    lua_getfield(L, idx, "be");
+    lua_getfield(L, idx, "signed");
+    const lua_Integer shift = luaL_checkinteger(L, -4), width = luaL_checkinteger(L, -3);
+    if (shift < 0 || width < 1 || shift + width > 64) luaL_error(L, "opts.bitfield: need 0 <= shift, 1 <= width, shift + width <= 64");
+    b.shift = int(shift);
+    b.width = int(width);
+    b.big_endian = lua_toboolean(L, -2) != 0;
+    b.is_signed = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 4);
+}
 
 // Reads the opts table at `idx`. Leaves comment/enum values on the stack (they must stay alive).
 void read_opts(lua_State* L, int idx, Opts& o) {
@@ -712,6 +932,16 @@ void read_opts(lua_State* L, int idx, Opts& o) {
         luaL_checktype(L, -1, LUA_TTABLE);
         o.enum_idx = lua_gettop(L);
     }
+    lua_getfield(L, idx, "flags");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+    } else {
+        luaL_checktype(L, -1, LUA_TTABLE);
+        o.flags_idx = lua_gettop(L);
+    }
+    lua_getfield(L, idx, "bitfield");
+    if (!lua_isnil(L, -1)) read_bitfield(L, lua_gettop(L), o.bits);
+    lua_pop(L, 1);
 }
 
 // Appends a field under the innermost open struct/array and returns its index. Raises the
@@ -739,6 +969,7 @@ int emit(lua_State* L, ParseCtx* c, const char* name, const char* type, uint64_t
     f.parent = parent;
     f.depth = parent >= 0 ? F[parent].depth + 1 : 0;
     if (o.comment) f.comment = o.comment;
+    f.bits = o.bits;
     f.color = o.color;
     c->explicit_color.push_back(o.has_color ? 1 : 0);
     if (parent >= 0) F[parent].children.push_back(idx);
@@ -774,6 +1005,42 @@ std::shared_ptr<const EnumList> get_enum(lua_State* L, ParseCtx* c, int tbl) {
     return list;
 }
 
+// Flags table ({[0] = "READ"} or {READ = 0}) -> shared list sorted by bit (cached like enums).
+std::shared_ptr<const std::vector<Field::FlagItem>> get_flags(lua_State* L, ParseCtx* c, int tbl) {
+    const void* key = lua_topointer(L, tbl);
+    auto it = c->flags.find(key);
+    if (it != c->flags.end()) return it->second;
+    auto list = std::make_shared<std::vector<Field::FlagItem>>();
+    lua_pushnil(L);
+    while (lua_next(L, tbl)) {
+        int kt = lua_type(L, -2), vt = lua_type(L, -1);
+        lua_Integer bit = -1;
+        const char* name = nullptr;
+        if (kt == LUA_TNUMBER && lua_isinteger(L, -2) && vt == LUA_TSTRING) {
+            bit = lua_tointeger(L, -2);
+            name = lua_tostring(L, -1);
+        } else if (kt == LUA_TSTRING && vt == LUA_TNUMBER && lua_isinteger(L, -1)) {
+            bit = lua_tointeger(L, -1);
+            name = lua_tostring(L, -2);
+        }
+        if (!name || bit < 0 || bit > 63) {
+            list.reset();  // luaL_error longjmps past this frame: free the list first
+            luaL_error(L, "opts.flags: use {[bit] = \"NAME\"} with bit numbers 0..63");
+        }
+        list->push_back({int(bit), name});
+        lua_pop(L, 1);
+    }
+    std::sort(list->begin(), list->end(),
+              [](const Field::FlagItem& a, const Field::FlagItem& b) { return a.bit < b.bit; });
+    lua_rawgeti(L, LUA_REGISTRYINDEX, c->anchor_ref);
+    lua_pushvalue(L, tbl);
+    lua_pushboolean(L, 1);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
+    c->flags.emplace(key, list);
+    return list;
+}
+
 const char* enum_name(const EnumList& list, int64_t v) {
     auto it = std::lower_bound(list.begin(), list.end(), v,
                                [](const Field::EnumItem& e, int64_t x) { return e.value < x; });
@@ -788,6 +1055,11 @@ void set_int_value(lua_State* L, ParseCtx* c, Field& f, int64_t v, bool is_unsig
         f.value = (is_unsigned ? std::to_string(uint64_t(v)) : std::to_string(v)) + " = " + (name ? name : "?");
     } else {
         f.value = format_int(v, is_unsigned, size, o.fmt);
+        if (o.flags_idx) {
+            f.flags = get_flags(L, c, o.flags_idx);
+            const std::string names = format_flags(uint64_t(v), size, *f.flags);
+            if (!names.empty()) f.value += " = " + names;
+        }
     }
 }
 
@@ -1609,6 +1881,201 @@ int l_disasm(lua_State* L) {
     return 1;
 }
 
+// ---- XOR search (hx.xor_scan / hx.xor_guess_key) -----------------------------------------------
+// The scans run in HX_NOINLINE helpers that fill Lua-owned arrays of plain structs.
+
+constexpr uint64_t kMaxXorScan = 256ull << 20;   // hx.xor_scan range cap (it blocks)
+constexpr uint64_t kMaxKeyGuess = 16ull << 20;   // hx.xor_guess_key range cap
+constexpr lua_Integer kMaxXorHits = 100000;
+
+struct LuaXorHit {
+    uint64_t offset;
+    uint32_t phase;
+    uint8_t transform, key_len;
+    uint8_t key[kXorMaxKeyLen];
+    char text[192];
+};
+
+struct LuaKeyCand {
+    uint8_t key[kXorMaxKeyLen];
+    uint8_t len;
+    double score;
+};
+
+// Optional fields of an options table at `idx` (absent / nil: the default; idx 0 = no table).
+bool opt_bool(lua_State* L, int idx, const char* key, bool def) {
+    if (!idx) return def;
+    lua_getfield(L, idx, key);
+    const bool v = lua_isnil(L, -1) ? def : lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return v;
+}
+lua_Integer opt_int(lua_State* L, int idx, const char* key, lua_Integer def) {
+    if (!idx) return def;
+    lua_getfield(L, idx, key);
+    lua_Integer v = def;
+    if (!lua_isnil(L, -1)) {
+        int ok = 0;
+        v = lua_tointegerx(L, -1, &ok);
+        if (!ok) luaL_error(L, "option '%s' must be an integer", key);
+    }
+    lua_pop(L, 1);
+    return v;
+}
+int opts_index(lua_State* L, int idx) {
+    if (lua_isnoneornil(L, idx)) return 0;
+    luaL_checktype(L, idx, LUA_TTABLE);
+    return lua_absindex(L, idx);
+}
+
+const char* xor_transform_lua(XorTransform t) {
+    switch (t) {
+    case XorTransform::Xor: return "xor";
+    case XorTransform::Add: return "add";
+    case XorTransform::Rol: return "rol";
+    case XorTransform::XorKey: return "xor_key";
+    }
+    return "?";
+}
+
+// Scans [start, start+len) of `d` on a worker (stopped at `until`); at most `max` hits into `arr`.
+// Returns the hit count; *timed_out when the time limit stopped it.
+HX_NOINLINE size_t xor_scan_into(const Document& d, uint64_t start, uint64_t len, const char* pt, size_t pn,
+                                 const XorScanOptions& o, size_t max, std::chrono::steady_clock::time_point until,
+                                 LuaXorHit* arr, bool* timed_out) {
+    const std::vector<uint8_t> plain(pt, pt + pn);
+    std::shared_ptr<const Snapshot> snap = d.snapshot();
+    XorScanResult res;
+    std::atomic<bool> cancel{false};
+    // On a worker so the script time limit can stop a long scan (the hook cannot interrupt C).
+    auto fut = std::async(std::launch::async, [&] { scan_xor(*snap, start, start + len, plain, o, res, &cancel); });
+    *timed_out = fut.wait_until(until) != std::future_status::ready;
+    if (*timed_out) cancel = true;
+    fut.get();
+    if (*timed_out) return 0;
+    const size_t n = std::min(res.hits.size(), max);
+    for (size_t k = 0; k < n; ++k) {
+        const XorHit& h = res.hits[k];
+        LuaXorHit& out = arr[k];
+        out.offset = h.offset;
+        out.phase = h.phase;
+        out.transform = uint8_t(h.transform);
+        out.key_len = uint8_t(std::min<size_t>(h.key.size(), kXorMaxKeyLen));
+        std::memcpy(out.key, h.key.data(), out.key_len);
+        std::snprintf(out.text, sizeof out.text, "%s", describe_key(h.transform, h.key).c_str());
+    }
+    return n;
+}
+
+// key_guess over [off, off+len) of `d` into `arr` (kXorMaxKeyLen entries); returns the count.
+HX_NOINLINE size_t key_guess_into(const Document& d, uint64_t off, uint64_t len, uint8_t plain, uint32_t max_len,
+                                  LuaKeyCand* arr) {
+    std::vector<uint8_t> buf(static_cast<size_t>(len));
+    const size_t got = len ? d.read(off, buf.data(), buf.size()) : 0;
+    const std::vector<KeyCandidate> c = key_guess(buf.data(), got, off, plain, max_len);
+    const size_t n = std::min(c.size(), size_t(kXorMaxKeyLen));
+    for (size_t k = 0; k < n; ++k) {
+        arr[k].len = uint8_t(std::min<size_t>(c[k].key.size(), kXorMaxKeyLen));
+        std::memcpy(arr[k].key, c[k].key.data(), arr[k].len);
+        arr[k].score = c[k].score;
+    }
+    return n;
+}
+
+// hx.xor_scan(doc, plaintext, opts?) -> list of hits (see the API comment).
+int l_xor_scan(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    size_t pn = 0;
+    const char* pt = luaL_checklstring(L, 2, &pn);
+    const int ot = opts_index(L, 3);
+    XorScanOptions o;  // plain data
+    o.xor8 = opt_bool(L, ot, "xor", true);
+    o.add8 = opt_bool(L, ot, "add", true);
+    o.rol = opt_bool(L, ot, "rol", true);
+    o.xor_multi = opt_bool(L, ot, "multi", false);
+    const lua_Integer mk = opt_int(L, ot, "max_key_len", lua_Integer(kXorMaxKeyLen));
+    const lua_Integer max = opt_int(L, ot, "max", 10000);
+    const lua_Integer start_i = opt_int(L, ot, "start", 0);
+    const lua_Integer length_i = opt_int(L, ot, "length", -1);
+    if (!pn) return luaL_error(L, "hx.xor_scan: empty plaintext");
+    if (mk < 2 || mk > lua_Integer(kXorMaxKeyLen)) return luaL_error(L, "hx.xor_scan: max_key_len must be 2..16");
+    if (max < 1 || max > kMaxXorHits) return luaL_error(L, "hx.xor_scan: max must be 1..100000");
+    if (start_i < 0) return luaL_error(L, "hx.xor_scan: start must be >= 0");
+    o.max_key_len = uint32_t(mk);
+    o.max_results = size_t(max);
+    const uint64_t size = d->size();
+    const uint64_t start = std::min(uint64_t(start_i), size);
+    const uint64_t len = length_i < 0 ? size - start : std::min(uint64_t(length_i), size - start);
+    if (len > kMaxXorScan)
+        return luaL_error(L, "hx.xor_scan: at most 256 MiB per call (pass start / length, or use the XOR Search "
+                             "panel, which scans any size in the background)");
+    auto* arr = static_cast<LuaXorHit*>(lua_newuserdatauv(L, sizeof(LuaXorHit) * size_t(max), 0));
+    Impl& im = impl_of(L);
+    const auto until = im.deadline_on ? im.deadline : std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool timed_out = false;
+    const size_t n = xor_scan_into(*d, start, len, pt, pn, o, size_t(max), until, arr, &timed_out);
+    if (timed_out) return luaL_error(L, "hx.xor_scan: time limit reached (use the XOR Search panel for huge ranges)");
+    lua_createtable(L, int(n), 0);
+    for (size_t k = 0; k < n; ++k) {
+        const LuaXorHit& h = arr[k];
+        lua_createtable(L, 0, 5);
+        lua_pushinteger(L, lua_Integer(h.offset));
+        lua_setfield(L, -2, "offset");
+        lua_pushstring(L, xor_transform_lua(XorTransform(h.transform)));
+        lua_setfield(L, -2, "transform");
+        lua_pushlstring(L, reinterpret_cast<const char*>(h.key), h.key_len);
+        lua_setfield(L, -2, "key");
+        lua_pushinteger(L, lua_Integer(h.phase));
+        lua_setfield(L, -2, "phase");
+        lua_pushstring(L, h.text);
+        lua_setfield(L, -2, "text");
+        lua_rawseti(L, -2, lua_Integer(k + 1));
+    }
+    return 1;
+}
+
+// hx.xor_guess_key(doc, off, len, opts?) -> list of { key=, score= }, best first.
+int l_xor_guess_key(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    uint64_t off = check_u64(L, 2);
+    uint64_t len = check_u64(L, 3);
+    const int ot = opts_index(L, 4);
+    lua_Integer plain = 0;
+    if (ot) {
+        lua_getfield(L, ot, "plain");
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            size_t sl = 0;
+            const char* s = lua_tolstring(L, -1, &sl);
+            plain = sl == 1 ? lua_Integer(uint8_t(s[0])) : -1;
+        } else if (!lua_isnil(L, -1)) {
+            int ok = 0;
+            plain = lua_tointegerx(L, -1, &ok);
+            if (!ok) plain = -1;
+        }
+        lua_pop(L, 1);
+    }
+    if (plain < 0 || plain > 255)
+        return luaL_error(L, "hx.xor_guess_key: plain must be a byte value or a 1-character string");
+    const lua_Integer max_len = opt_int(L, ot, "max_len", lua_Integer(kXorMaxKeyLen));
+    if (max_len < 1 || max_len > lua_Integer(kXorMaxKeyLen)) return luaL_error(L, "hx.xor_guess_key: max_len must be 1..16");
+    const uint64_t size = d->size();
+    off = std::min(off, size);
+    len = std::min(len, size - off);
+    if (len > kMaxKeyGuess) return luaL_error(L, "hx.xor_guess_key: at most 16 MiB per call");
+    auto* arr = static_cast<LuaKeyCand*>(lua_newuserdatauv(L, sizeof(LuaKeyCand) * kXorMaxKeyLen, 0));
+    const size_t n = key_guess_into(*d, off, len, uint8_t(plain), uint32_t(max_len), arr);
+    lua_createtable(L, int(n), 0);
+    for (size_t k = 0; k < n; ++k) {
+        lua_createtable(L, 0, 2);
+        lua_pushlstring(L, reinterpret_cast<const char*>(arr[k].key), arr[k].len);
+        lua_setfield(L, -2, "key");
+        lua_pushnumber(L, arr[k].score);
+        lua_setfield(L, -2, "score");
+        lua_rawseti(L, -2, lua_Integer(k + 1));
+    }
+    return 1;
+}
+
 // hx.hash_algorithms() -> { "Sum-8", ..., "SHA-512" } (display names, in display order)
 int l_hash_algorithms(lua_State* L) {
     const auto& all = hash_algorithms();
@@ -1696,6 +2163,7 @@ const luaL_Reg kHexerFuncs[] = {
     {"hex", l_hex},           {"unhex", l_unhex},       {"crc32", l_crc32},
     {"hash", l_hash},         {"hash_algorithms", l_hash_algorithms},
     {"run", l_run},           {"prompt", l_prompt},     {"disasm", l_disasm},
+    {"xor_scan", l_xor_scan}, {"xor_guess_key", l_xor_guess_key},
     {nullptr, nullptr},
 };
 

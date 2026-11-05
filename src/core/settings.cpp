@@ -132,6 +132,19 @@ bool Settings::load(const std::string& path) {
         else if (key == "bitmap_format") bitmap_format = v;
         else if (key == "bitmap_width") parse_int(v, 1, 8192, bitmap_width);
         else if (key == "bitmap_zoom") parse_int(v, 1, 16, bitmap_zoom);
+        else if (key == "disasm_mode") {
+            const std::string m = lower(v);
+            if (m == "auto") disasm_mode = 0;
+            else if (m == "64") disasm_mode = 1;
+            else if (m == "32") disasm_mode = 2;
+        }
+        else if (key == "disasm_syntax") {
+            const std::string m = lower(v);
+            if (m == "intel" || m == "att") disasm_att = m == "att";
+        }
+        else if (key == "disasm_uppercase") parse_bool(v, disasm_uppercase);
+        else if (key == "disasm_follow") parse_bool(v, disasm_follow);
+        else if (key == "disasm_bytes") parse_bool(v, disasm_bytes);
         else if (key == "undo_merge_ms") parse_int(v, 0, 600000, undo_merge_ms);
         else if (key == "undo_merge_max_bytes") parse_int(v, 0, 1 << 30, undo_merge_max_bytes);
         else if (key == "backup_on_save") parse_bool(v, backup_on_save);
@@ -191,6 +204,11 @@ bool Settings::save(const std::string& path) const {
     put("bitmap_format", bitmap_format);
     put("bitmap_width", std::to_string(bitmap_width));
     put("bitmap_zoom", std::to_string(bitmap_zoom));
+    put("disasm_mode", disasm_mode == 1 ? "64" : disasm_mode == 2 ? "32" : "auto");
+    put("disasm_syntax", disasm_att ? "att" : "intel");
+    put("disasm_uppercase", b(disasm_uppercase));
+    put("disasm_follow", b(disasm_follow));
+    put("disasm_bytes", b(disasm_bytes));
     put("undo_merge_ms", std::to_string(undo_merge_ms));
     put("undo_merge_max_bytes", std::to_string(undo_merge_max_bytes));
     put("backup_on_save", b(backup_on_save));
