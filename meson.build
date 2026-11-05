@@ -37,6 +37,18 @@ imgui_dep   = dependency('imgui-docking')
 freetype_dep = dependency('freetype2', default_options : ['png=disabled', 'zlib=disabled',
   'bzip2=disabled', 'brotli=disabled', 'harfbuzz=disabled', 'tests=disabled', 'warning_level=0'])
 nfd_dep     = dependency('nativefiledialog-extended')
+# Zydis (x86 / x64 decoder + formatter) for the Disassembly panel. Static build: consumers must
+# define ZYDIS_STATIC_BUILD / ZYCORE_STATIC_BUILD (disasm_zydis_dep). Third-party code: no warnings,
+# no examples / tools / tests / docs, no encoder. as_system(): its headers never warn in our code.
+# The versions match the wraps (Zydis 4.1 needs Zycore >= 1.5): an older system copy (pkg-config,
+# e.g. a distro's Zydis 3.x / Zycore 1.4) is ignored and both are built from the wraps instead.
+zycore_dep  = dependency('zycore', version : '>=1.5.0', default_options : ['examples=disabled', 'tests=disabled',
+  'doc=disabled', 'warning_level=0'])
+zydis_dep   = dependency('zydis', version : '>=4.1.0', default_options : ['examples=disabled', 'tools=disabled',
+  'tests=disabled', 'doc=disabled', 'man=disabled', 'decoder=enabled', 'formatter=enabled',
+  'encoder=disabled', 'warning_level=0'])
+disasm_zydis_dep = declare_dependency(dependencies : [zydis_dep.as_system(), zycore_dep.as_system()],
+  compile_args : ['-DZYDIS_STATIC_BUILD', '-DZYCORE_STATIC_BUILD'])
 doctest_dep = dependency('doctest', required : get_option('tests'))
 
 sys_deps = []

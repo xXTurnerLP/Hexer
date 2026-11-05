@@ -29,7 +29,10 @@ src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device 
              definitions -> Lua parser source),
              entropy (ByteClass + EntropyJob: sampled per-bucket entropy for the minimap), bitmap
              (bytes -> pixels), diff (DiffJob: compare two Snapshots with a shift), pcap (pcap/pcapng
-             PcapIndexJob + packet dissector); document also has refresh_appended() (live tail)
+             PcapIndexJob + packet dissector); document also has refresh_appended() (live tail);
+             exe_map (AddressMap: PE / ELF / manual file offset <-> VA, entry point, sections);
+             disasm (x86-64 / x86 via Zydis, disasm_range / disasm_sync_back; its own static lib
+             hexer_disasm so only its users link Zydis)
 src/script/  script_engine.h (Lua API contract — the header comment is the API spec),
              script_engine.cpp, lua_api.cpp
 src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
@@ -37,7 +40,8 @@ src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, 
              extras, ScriptHost impl); self-contained feature UIs without App dependency:
              panel_strings, panel_hash, dialog_cstruct, panel_bitmap, panel_packets, panel_history,
              panel_xor, dialog_targets (Open Process / Open Disk + RegionsPanel) (App owns one of
-             each), minimap (one per tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare)
+             each), minimap (one per tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
+             panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly)
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
@@ -45,7 +49,8 @@ tests/       doctest; one exe per module: test_core, test_util, test_script, tes
              test_ui (headless ImGui: drives HexView + Minimap with simulated mouse/keyboard),
              test_nav, test_strings, test_hash, test_cstruct, test_entropy, test_bitmap,
              test_diff, test_pcap, test_tail (growing files), test_procmem (reads and writes the
-             test process's own memory), test_history, test_xorscan, test_session
+             test process's own memory), test_history, test_xorscan, test_session, test_disasm
+             (encodings, sync_back, PE / ELF maps incl. malformed headers, Lua, headless panel)
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
              make_pcap.py (demo pcapng with HXP packets for the Packets panel)
@@ -82,7 +87,8 @@ Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`
 `"Structure: Parse Selection"`, `"Toggle Live Tail"`, `"Compare with: <tab name>"`,
 `"Compare: Align at Cursors"`, `"Show History"`, `"XOR: Scan File"`, `"XOR: Guess Key from
 Selection"`, `"Open Process..."`, `"Open Disk..."`, `"Toggle Regions"`, `"Split Horizontally"`,
-`"Split Vertically"`, `"Split View: Switch Pane"`, `"Undo"`; any palette
+`"Split Vertically"`, `"Split View: Switch Pane"`, `"Undo"`, `"Toggle Disassembly"`, `"Go to Entry
+Point"`, `"Disassemble at Cursor"`, `"Disassembly: Follow Target"`; any palette
 label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable; all
 actions of one run execute in the same frame, so e.g. "Compare: Next Difference" right after
 "Compare with: ..." finds no result yet). A process opens from the command line as

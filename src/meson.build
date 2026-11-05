@@ -23,6 +23,7 @@ core_lib = static_library('hexer_core',
   'core/procmem.cpp',        # process memory as a byte source
   'core/devices.cpp',        # enumerate processes / disks
   'core/xorscan.cpp',        # XOR / ADD / ROL brute force
+  'core/exe_map.cpp',        # PE / ELF file offset <-> virtual address
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [threads_dep],
@@ -30,28 +31,38 @@ core_lib = static_library('hexer_core',
 core_dep = declare_dependency(link_with : core_lib, include_directories : inc,
   dependencies : [threads_dep] + sys_deps)
 
+# ---- disasm: x86 / x64 disassembly (Zydis), kept out of hexer_core so only its users link Zydis ----
+disasm_lib = static_library('hexer_disasm',
+  'core/disasm.cpp',
+  include_directories : inc,
+  cpp_args : conf_args,
+  dependencies : [core_dep, disasm_zydis_dep],
+)
+disasm_dep = declare_dependency(link_with : disasm_lib, dependencies : [core_dep, disasm_zydis_dep])
+
 # ---- script: Lua engine + hexer API ----
 script_lib = static_library('hexer_script',
   'script/script_engine.cpp',
   'script/lua_api.cpp',
   include_directories : inc,
   cpp_args : conf_args,
-  dependencies : [core_dep, lua_dep],
+  dependencies : [core_dep, disasm_dep, lua_dep],
 )
-script_dep = declare_dependency(link_with : script_lib, dependencies : [core_dep, lua_dep])
+script_dep = declare_dependency(link_with : script_lib, dependencies : [core_dep, disasm_dep, lua_dep])
 
 # ---- ui view: theme/fonts + the hex view widget (no window, no Lua; tests/test_ui.cpp drives it) ----
 ui_view_lib = static_library('hexer_ui_view',
   'ui/theme.cpp',
   'ui/hex_view.cpp',
   'ui/minimap.cpp',
+  'ui/panel_disasm.cpp',     # Disassembly panel (no App dependency; tests/test_disasm.cpp drives it)
   'ui/third_party/imgui_freetype.cpp',  # vendored from imgui misc/freetype (MIT)
   include_directories : inc,
   cpp_args : conf_args,
-  dependencies : [core_dep, imgui_dep, freetype_dep],
+  dependencies : [core_dep, disasm_dep, imgui_dep, freetype_dep],
 )
 ui_view_dep = declare_dependency(link_with : ui_view_lib, include_directories : inc,
-  dependencies : [core_dep, imgui_dep, freetype_dep])
+  dependencies : [core_dep, disasm_dep, imgui_dep, freetype_dep])
 
 # ---- ui: ImGui application ----
 ui_lib = static_library('hexer_ui',

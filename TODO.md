@@ -65,12 +65,11 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       which test_ui does not link; move them to hexer_ui_view or add a test exe)
 - [x] Open process memory and raw disks/devices (File > Open Process... / Open Disk..., Regions
       panel, read-only unless asked, in-place saves of overwrites, `doc:target()` / `doc:pid()`)
-- [ ] Process memory: Search / Strings / XOR search / minimap stop at the first unreadable byte
-      (the null page at 0), so they find nothing yet; skip holes with `Snapshot::next_readable`
-      (core/document.h) in search.cpp, strings_scan.cpp, xorscan.cpp, entropy.cpp
+- [x] Process memory: Search / Strings / XOR search / minimap / Hash skip unreadable holes
+      ("X unreadable skipped"); Inspector shows ?? for unreadable bytes
 - [ ] Process memory: default the follow-pointer width to the process's pointer size; module
       list / jump to a module's base from the palette; Lua `hx.open_process(pid)`
-- [ ] Compile and test core/procmem.cpp + core/devices.cpp on Linux (/proc/PID/mem, /sys/block)
+- [x] Compile and test core/procmem.cpp + core/devices.cpp on Linux (/proc/PID/mem, /sys/block)
 - [ ] Verify by hand: Open Process / Open Disk pickers, writable process save, the Regions click
       (screenshots only so far)
 - [x] pcap/pcapng: Packets panel (index in the background, filter, "Parse with" a parser over each
@@ -92,7 +91,12 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Bitmap: zoom below 1x (downscale) for very wide images; remember the source mode
 - [x] Byte-class coloring mode (zero / printable / whitespace / control / high bytes; View > Color
       Bytes by Class)
-- [ ] Disassembly at cursor (Capstone: x86/x64/ARM/AArch64/...)
+- [x] Disassembly at cursor: x86-64 / x86-32 (Zydis), Disassembly panel following the caret,
+      PE / ELF / manual address maps, resolved branch + RIP-relative targets (follow = jump
+      history), Go to Entry Point, backward scrolling (disasm_sync_back), `hx.disasm` / `doc:disasm`
+- [ ] Disassembly: symbol names (PE exports / imports, ELF symtab) for targets and as labels;
+      branch arrows; a "Find references to" scan; remember the map choice / base per tab (session)
+- [ ] Disassembly: other architectures (ARM / AArch64) only if asked (Zydis is x86 only)
 - [x] Live tail mode for growing files (captures, logs): View > Live Tail, follows the end while the
       caret is there, a rewrite falls back to the "changed on disk" banner
 - [x] Live tail: remember the toggle in the session

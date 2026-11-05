@@ -23,6 +23,7 @@
 #include "ui/hex_view.h"
 #include "ui/minimap.h"
 #include "ui/panel_bitmap.h"
+#include "ui/panel_disasm.h"
 #include "ui/panel_hash.h"
 #include "ui/panel_history.h"
 #include "ui/panel_packets.h"
@@ -50,6 +51,7 @@ inline constexpr const char* kWinPackets = "Packets";
 inline constexpr const char* kWinHistory = "History";
 inline constexpr const char* kWinXor = "XOR Search";
 inline constexpr const char* kWinRegions = "Regions";
+inline constexpr const char* kWinDisasm = "Disassembly";
 
 // ---- per-tab state -------------------------------------------------------------------------
 
@@ -259,6 +261,7 @@ struct App final : ScriptHost {
     bool show_bitmap = false, show_packets = false;  // opened on demand (Packets: for captures)
     bool show_history = false, show_xor = false;
     bool show_regions = false;        // auto-shown when a process document is opened
+    bool show_disasm = false, focus_disasm = false;  // Disassembly panel (View > Disassembly)
     bool show_settings = false;       // Settings window (Edit > Settings..., Ctrl+,)
     bool focus_bookmarks = false;     // bring the Bookmarks panel to the front next frame
     bool build_layout = false;        // (re)build the default dock layout this frame
@@ -279,6 +282,7 @@ struct App final : ScriptHost {
     XorPanel xor_panel;
     TargetsDialog targets;            // File > Open Process... / Open Disk...
     RegionsPanel regions_panel;
+    DisasmPanel disasm_panel;         // Disassembly (x86-64 / x86 listing at the caret)
 
     // Compare (File > Compare With...): a "Compare" tab in the editor's tab bar showing two open
     // documents side by side. Closing either document ends it.

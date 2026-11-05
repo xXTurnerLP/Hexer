@@ -37,6 +37,16 @@ void draw_packets_panel(App& app);         // "Packets": ui/panel_packets.h (pca
 void draw_history_panel(App& app);         // "History": ui/panel_history.h (click a state to undo / redo to it)
 void draw_xor_panel(App& app);             // "XOR Search": ui/panel_xor.h (known plaintext / key guess)
 void draw_regions_panel(App& app);         // "Regions": memory map of a process document (ui/dialog_targets.h)
+void draw_disasm_panel(App& app);          // "Disassembly": ui/panel_disasm.h (x86-64 listing at the caret)
+// Disassembly panel actions: list from the caret and pin it there ("Disassemble at Cursor");
+// jump to the PE / ELF entry point and list it ("Go to Entry Point"; status message if none).
+void disasm_at_cursor(App& app);
+void disasm_go_to_entry(App& app);
+// Follow the branch / RIP-relative target of the instruction at the caret (as a double-click on
+// its Disassembly row does; recorded in the jump history).
+void disasm_follow_target(App& app);
+// Reads the Disassembly panel options (mode, syntax, uppercase, follow, bytes) from app.settings.
+void load_disasm_settings(App& app);
 void draw_status_bar(App& app);            // fixed bottom bar (call before the dockspace)
 
 // Bookmark the selection (or the caret byte) of `d`, undoable; reports in the status bar.

@@ -318,6 +318,7 @@ void close_tab_now(App& app, int index) {
     app.strings_panel.forget(id);  // results are cheap to rescan; free the memory now
     app.packets_panel.forget(id);
     app.xor_panel.forget(id);
+    app.disasm_panel.forget(id);
     app.regions_panel.forget(id);
     if (app.diff && (app.diff_a == id || app.diff_b == id)) end_compare(app);
     t->entropy.cancel();  // rescanned if the tab is reopened
@@ -1220,6 +1221,8 @@ void poll_search(App& app) {
         log_console(app, ConsoleLine::Warn, msg);
         notify(app, msg, true);
     }
+    // Holes of a sparse target (process memory) are skipped, not errors: just say so.
+    const std::string skip = r.skipped ? "  (" + fmt_size(r.skipped) + " unreadable skipped)" : "";
     if (r.mode == SearchJob::Mode::All) {
         SearchHits& h = t->hits;
         h.offsets = std::move(r.hits);
@@ -1233,15 +1236,16 @@ void poll_search(App& app) {
         h.layer.finalize();
         app.show_results = true;
         app.focus_results = true;
-        set_status(app, std::to_string(h.offsets.size()) + (h.truncated ? "+" : "") + " hits for '" + h.query + "'");
+        set_status(app, std::to_string(h.offsets.size()) + (h.truncated ? "+" : "") + " hits for '" + h.query + "'" + skip);
         return;
     }
     if (r.hits.empty()) {
-        set_status(app, "Not found: " + f.job_query);
+        set_status(app, "Not found: " + f.job_query + skip);
         return;
     }
     reveal_range(app, *t, r.hits[0], r.pattern_len ? r.pattern_len : f.job_len, false);
-    if (r.wrapped) set_status(app, "Search wrapped around");
+    if (r.wrapped) set_status(app, "Search wrapped around" + skip);
+    else if (r.skipped) set_status(app, "Found at " + fmt_offset(r.hits[0]) + skip);
 }
 
 }  // namespace
@@ -1514,6 +1518,7 @@ const Action kActions[] = {
     {"Toggle History", {0, 0}, [](App& a) { toggle_panel(a.show_history, a.focus_history); }, nullptr, true, false},
     {"Show History", {0, 0}, show_history, nullptr, true, false},
     {"Toggle XOR Search", {0, 0}, [](App& a) { toggle_panel(a.show_xor, a.focus_xor); }, nullptr, true, false},
+    {"Toggle Disassembly", {0, 0}, [](App& a) { toggle_panel(a.show_disasm, a.focus_disasm); }, nullptr, true, false},
     {"Toggle Regions", {0, 0}, [](App& a) { toggle_panel(a.show_regions, a.focus_regions); }, nullptr, true, false},
     {"Minimap: Off", {0, 0}, [](App& a) { set_minimap(a, 0); }, nullptr, true, false},
     {"Minimap: Entropy", {0, 0}, [](App& a) { set_minimap(a, 1); }, nullptr, true, false},
@@ -1546,6 +1551,9 @@ const Action kActions[] = {
     {"XOR: Scan Selection", {0, 0}, [](App& a) { show_xor(a); a.xor_panel.request_scan(true); }, has_selection, true, false},
     {"XOR: Guess Key from Selection", {0, 0}, [](App& a) { show_xor(a); a.xor_panel.request_guess(); }, has_selection, true, false},
     {"Bitmap: Show at Cursor", {0, 0}, bitmap_at_cursor, has_doc, true, false},
+    {"Disassemble at Cursor", {0, 0}, disasm_at_cursor, has_doc, true, false},
+    {"Go to Entry Point", {0, 0}, disasm_go_to_entry, has_doc, true, false},
+    {"Disassembly: Follow Target", {0, 0}, disasm_follow_target, has_doc, true, false},
     {"Packets: Index Capture", {0, 0}, [](App& a) {
          a.show_packets = a.focus_packets = true;
          a.packets_panel.request_index();
@@ -1726,6 +1734,7 @@ void draw_view_menu(App& app) {
     if (ImGui::MenuItem(kWinPackets, nullptr, &app.show_packets)) app.focus_packets = app.show_packets;
     if (ImGui::MenuItem(kWinHistory, nullptr, &app.show_history)) app.focus_history = app.show_history;
     if (ImGui::MenuItem(kWinXor, nullptr, &app.show_xor)) app.focus_xor = app.show_xor;
+    if (ImGui::MenuItem(kWinDisasm, nullptr, &app.show_disasm)) app.focus_disasm = app.show_disasm;
     if (ImGui::MenuItem(kWinRegions, nullptr, &app.show_regions)) app.focus_regions = app.show_regions;
     ImGui::Separator();
     if (ImGui::BeginMenu("Minimap")) {
@@ -1819,6 +1828,7 @@ void draw_navigate_items(App& app) {
         ImGui::TextDisabled("Ctrl+hover a byte to preview the target, Ctrl+click to follow it");
         ImGui::EndMenu();
     }
+    menu_action(app, "Go to Entry Point");
 }
 
 // File > Compare With: every other open document, or a file to open.
@@ -2131,6 +2141,7 @@ void draw_hex_context_menu(App& app) {
     menu_action(app, "Structure: Parse at Cursor", "Parse Structure Here");
     menu_action(app, "Structure: Parse Selection", "Parse Selection");
     menu_action(app, "Bitmap: Show at Cursor", "Show as Bitmap Here");
+    menu_action(app, "Disassemble at Cursor", "Disassemble Here");
     close_popup_on_escape();
     ImGui::EndPopup();
 }
@@ -2142,6 +2153,8 @@ void collect_layers(App& app, Tab& t, std::vector<const HighlightSet*>& layers) 
     update_bookmark_layer(t);
     if (!t.bookmark_layer.empty()) layers.push_back(&t.bookmark_layer);
     if (!t.hits.layer.empty()) layers.push_back(&t.hits.layer);
+    if (app.show_disasm)  // the Disassembly panel's current instruction
+        if (const HighlightSet* l = app.disasm_panel.layer(t.doc->id())) layers.push_back(l);
 }
 
 // doc.view().top_row is a row index: re-express it in rows of `bpr` bytes (what the next HexView
@@ -3592,6 +3605,7 @@ void build_default_layout(ImGuiID dock_id) {
     ImGui::DockBuilderDockWindow(kWinHashes, right);
     ImGui::DockBuilderDockWindow(kWinStructure, right_bottom);
     ImGui::DockBuilderDockWindow(kWinBitmap, right_bottom);
+    ImGui::DockBuilderDockWindow(kWinDisasm, right_bottom);
     ImGui::DockBuilderDockWindow(kWinConsole, bottom);
     ImGui::DockBuilderDockWindow(kWinResults, bottom);
     ImGui::DockBuilderDockWindow(kWinBookmarks, bottom);
@@ -3741,6 +3755,13 @@ void draw_panels(App& app) {
             app.focus_xor = false;
         }
         draw_xor_panel(app);
+    }
+    if (app.show_disasm) {
+        if (app.focus_disasm) {
+            ImGui::SetNextWindowFocus();
+            app.focus_disasm = false;
+        }
+        draw_disasm_panel(app);
     }
     if (app.show_regions) {
         if (app.focus_regions && ImGui::GetFrameCount() > 1 && app.layout_focus_step == 0) {
@@ -3921,6 +3942,7 @@ void startup(App& app) {
         bp.width = std::clamp(app.settings.bitmap_width, 1, BitmapPanel::kMaxWidth);
         bp.zoom = std::clamp(app.settings.bitmap_zoom, 1, BitmapPanel::kMaxZoom);
     }
+    load_disasm_settings(app);  // Disassembly panel options (written back by draw_disasm_panel)
     // The Inspector starts with the follow-pointer type's row selected (and its bytes outlined).
     if (InspType ft = insp_type_of_int(app.settings.pointer_width, app.settings.pointer_signed); ft != InspType::Count)
         app.insp_sel = int(ft);

@@ -1,0 +1,10 @@
+[wrap-file]
+directory = zycore-c-1.5.2
+source_url = https://github.com/zyantific/zycore-c/archive/refs/tags/v1.5.2.tar.gz
+source_filename = zycore-c-1.5.2.tar.gz
+source_hash = 943f91eb9ab2a8cc01ab9f8b785e769a273502071e0ee8011cdfcaad93947cec
+source_fallback_url = https://github.com/mesonbuild/wrapdb/releases/download/zycore_1.5.2-1/zycore-c-1.5.2.tar.gz
+wrapdb_version = 1.5.2-1
+
+[provide]
+dependency_names = zycore

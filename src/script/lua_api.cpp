@@ -13,6 +13,8 @@
 #include <future>
 #include <memory>
 
+#include "core/disasm.h"
+#include "core/exe_map.h"
 #include "core/hash.h"
 #include "core/highlight.h"
 #include "core/os_file.h"
@@ -416,6 +418,110 @@ int doc_hash(lua_State* L) {
     return 1;
 }
 
+// ---- disassembly (hx.disasm / doc:disasm) ------------------------------------------------------
+// Results are first copied into a Lua-owned array of plain structs, so no C++ object is alive
+// while the result tables are built (see the error-handling rule in lua_internal.h).
+
+constexpr size_t kMaxDisasm = 10000;  // instructions per call
+
+struct LuaInsn {
+    uint64_t offset, address, target;
+    uint8_t length, flow;
+    bool valid, readable, has_target;
+    uint8_t bytes[Insn::kMaxLength];
+    char text[256];
+    char section[32];
+};
+
+// Argument `idx`: nil -> def, 64 / 32, or "x64" / "amd64" / "x86" / "64" / "32".
+DisasmMode check_disasm_mode(lua_State* L, int idx, DisasmMode def) {
+    if (lua_isnoneornil(L, idx)) return def;
+    if (lua_type(L, idx) == LUA_TNUMBER) {
+        const lua_Integer v = luaL_checkinteger(L, idx);
+        if (v == 64) return DisasmMode::X64;
+        if (v == 32) return DisasmMode::X86;
+    } else if (const char* m = lua_tostring(L, idx)) {
+        if (!std::strcmp(m, "64") || !std::strcmp(m, "x64") || !std::strcmp(m, "amd64") || !std::strcmp(m, "x86_64"))
+            return DisasmMode::X64;
+        if (!std::strcmp(m, "32") || !std::strcmp(m, "x86") || !std::strcmp(m, "i386")) return DisasmMode::X86;
+    }
+    luaL_argerror(L, idx, "mode must be 64 or 32");
+    return def;
+}
+
+void to_lua_insn(const Insn& i, const std::string& section, LuaInsn& o) {
+    o.offset = i.offset;
+    o.address = i.address;
+    o.target = i.target;
+    o.length = i.length;
+    o.flow = uint8_t(i.flow);
+    o.valid = i.valid;
+    o.readable = i.readable;
+    o.has_target = i.has_target;
+    std::memcpy(o.bytes, i.bytes, sizeof o.bytes);
+    std::snprintf(o.text, sizeof o.text, "%s", i.text.c_str());
+    std::snprintf(o.section, sizeof o.section, "%s", section.c_str());
+}
+
+// Replaces the array userdata at the top of the stack by the list of result tables.
+void push_lua_insns(lua_State* L, const LuaInsn* v, size_t n) {
+    lua_createtable(L, int(n), 0);
+    for (size_t k = 0; k < n; ++k) {
+        const LuaInsn& i = v[k];
+        lua_createtable(L, 0, 9);
+        lua_pushinteger(L, lua_Integer(i.address));
+        lua_setfield(L, -2, "address");
+        lua_pushinteger(L, lua_Integer(i.offset));
+        lua_setfield(L, -2, "offset");
+        lua_pushinteger(L, i.length);
+        lua_setfield(L, -2, "length");
+        lua_pushstring(L, i.text);
+        lua_setfield(L, -2, "text");
+        lua_pushlstring(L, reinterpret_cast<const char*>(i.bytes), std::min<size_t>(i.length, sizeof i.bytes));
+        lua_setfield(L, -2, "bytes");
+        lua_pushboolean(L, i.valid);
+        lua_setfield(L, -2, "valid");
+        if (i.has_target) {
+            lua_pushinteger(L, lua_Integer(i.target));
+            lua_setfield(L, -2, "target");
+        }
+        if (const char* f = insn_flow_name(Insn::Flow(i.flow)); f[0]) {
+            lua_pushstring(L, f);
+            lua_setfield(L, -2, "flow");
+        }
+        if (i.section[0]) {
+            lua_pushstring(L, i.section);
+            lua_setfield(L, -2, "section");
+        }
+        lua_rawseti(L, -2, lua_Integer(k + 1));
+    }
+    lua_remove(L, -2);  // the array userdata
+}
+
+// doc:disasm(off, count?, mode?) -> list of instructions (see the API comment). Addresses come
+// from the document's address map (PE / ELF headers, process memory: identity, else offset).
+int doc_disasm(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const uint64_t off = check_u64(L, 2);
+    const lua_Integer cnt = luaL_optinteger(L, 3, 16);
+    luaL_argcheck(L, cnt >= 0 && size_t(cnt) <= kMaxDisasm, 3, "count must be 0..10000");
+    const bool has_mode = !lua_isnoneornil(L, 4);
+    const DisasmMode forced = check_disasm_mode(L, 4, DisasmMode::X64);
+    auto* arr = static_cast<LuaInsn*>(lua_newuserdatauv(L, sizeof(LuaInsn) * std::max<size_t>(size_t(cnt), 1), 0));
+    size_t n = 0;
+    {
+        const AddressMap map = detect_address_map(*d);
+        DisasmOptions opt;
+        opt.mode = has_mode ? forced : (map.bits == 32 ? DisasmMode::X86 : DisasmMode::X64);
+        std::vector<Insn> out;
+        disasm_range(*d, off, size_t(cnt), map, opt, out);
+        n = std::min(out.size(), size_t(cnt));
+        for (size_t k = 0; k < n; ++k) to_lua_insn(out[k], map.section_at_offset(out[k].offset), arr[k]);
+    }
+    push_lua_insns(L, arr, n);
+    return 1;
+}
+
 int doc_find(lua_State* L) {
     Document* d = check_doc(L, 1);
     size_t n;
@@ -503,6 +609,7 @@ const luaL_Reg kDocMethods[] = {
     {"selection", doc_selection},                          {"select", doc_select},
     {"goto", doc_goto},       {"jump", doc_goto},          {"find", doc_find},
     {"hash", doc_hash},       {"target", doc_target},      {"pid", doc_pid},
+    {"disasm", doc_disasm},
     {nullptr, nullptr},
 };
 
@@ -1477,6 +1584,31 @@ int l_hash(lua_State* L) {
     return 1;
 }
 
+// hx.disasm(bytes, address?, mode?) -> list of instructions decoded from a string (offset =
+// position in `bytes`, 0-based; address = address + offset). At most kMaxDisasm instructions.
+int l_disasm(lua_State* L) {
+    size_t len = 0;
+    const auto* data = reinterpret_cast<const uint8_t*>(luaL_checklstring(L, 1, &len));
+    const lua_Integer base = luaL_optinteger(L, 2, 0);
+    DisasmOptions opt;
+    opt.mode = check_disasm_mode(L, 3, DisasmMode::X64);
+    const size_t cap = std::min(len, kMaxDisasm);
+    auto* arr = static_cast<LuaInsn*>(lua_newuserdatauv(L, sizeof(LuaInsn) * std::max<size_t>(cap, 1), 0));
+    size_t n = 0;
+    {
+        const std::string none;
+        for (size_t pos = 0; pos < len && n < cap;) {
+            Insn i;
+            disasm_one(data + pos, len - pos, uint64_t(base) + pos, opt, i);
+            i.offset = pos;
+            to_lua_insn(i, none, arr[n++]);
+            pos += i.length ? i.length : 1;
+        }
+    }
+    push_lua_insns(L, arr, n);
+    return 1;
+}
+
 // hx.hash_algorithms() -> { "Sum-8", ..., "SHA-512" } (display names, in display order)
 int l_hash_algorithms(lua_State* L) {
     const auto& all = hash_algorithms();
@@ -1563,7 +1695,7 @@ const luaL_Reg kHexerFuncs[] = {
     {"clear_highlights", l_clear_highlights},           {"color", l_color},
     {"hex", l_hex},           {"unhex", l_unhex},       {"crc32", l_crc32},
     {"hash", l_hash},         {"hash_algorithms", l_hash_algorithms},
-    {"run", l_run},           {"prompt", l_prompt},
+    {"run", l_run},           {"prompt", l_prompt},     {"disasm", l_disasm},
     {nullptr, nullptr},
 };
 

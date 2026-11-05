@@ -138,6 +138,25 @@ hx.command {
 }
 
 hx.command {
+    name = "Selection: disassemble to console",
+    description = "Print the selected bytes as x86-64 instructions (addresses from the PE / ELF headers)",
+    run = function(doc)
+        local start, len = selection(doc, 64 * 1024)
+        if not start then return end
+        local stop, lines = start + len, 0
+        while start < stop and lines < 10000 do
+            local list = doc:disasm(start, math.min(1000, stop - start))   -- at most 1 per byte
+            if #list == 0 then break end
+            for _, i in ipairs(list) do
+                if i.offset >= stop then break end
+                print(string.format("%010X  %-30s %s", i.address, hx.hex(i.bytes), i.text))
+                start, lines = i.offset + i.length, lines + 1
+            end
+        end
+    end,
+}
+
+hx.command {
     name = "Highlight: all NUL runs >= 16 bytes in view range",
     description = "Mark runs of 16+ zero bytes in the selection, or else in the 1 MiB starting at the cursor",
     run = function(doc)

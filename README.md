@@ -99,6 +99,16 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   RGBA/BGRA/ARGB 32-bit, RGB565/555, byte classes) with an adjustable width, zoom and start
   (follow the hex view, follow the cursor, or a fixed offset; right-click > Show as Bitmap Here).
   Spot images, tables and padding at a glance; click a pixel to jump there, drag to select.
+- **Disassembly panel** (View > Disassembly): an x86-64 listing (or 32-bit x86) at the caret,
+  decoded by [Zydis](https://github.com/zyantific/zydis): address, bytes and Intel-syntax
+  instruction, colored by control flow. Virtual addresses come from the PE (PE32 / PE32+) or ELF
+  headers, a manual base address, or none (address = offset); process memory uses its own
+  addresses. The listing follows the hex caret (or stays pinned: right-click > Disassemble Here),
+  the caret's instruction is highlighted in both views, and a click selects an instruction's bytes.
+  Branch and RIP-relative targets are resolved (`lea rcx, [rip+0x2f5c]  ; 0x140004000 <.rdata>`);
+  double-click, `Ctrl+click` or `Enter` follows one (recorded in the jump history, `Alt+Left`
+  returns). Search > Go to Entry Point jumps to the entry point. The wheel, arrows and
+  PageUp / PageDown scroll, backwards too. Lua: `hx.disasm(bytes)`, `doc:disasm(off, n)`.
 - **Compare** (File > Compare With...): two open files side by side in a Compare tab, with the
   differences highlighted (red = changed, blue = only in one file), synced scrolling and
   `F7` / `Shift+F7` for the next / previous difference. A **shift** lines up files where one has
@@ -158,8 +168,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 
 ## Building
 
-Meson downloads all dependencies (ImGui, GLFW, Lua, nativefiledialog-extended, doctest) on
-first setup.
+Meson downloads all dependencies (ImGui, GLFW, Lua, FreeType, nativefiledialog-extended, Zydis,
+doctest) on first setup.
 
 ### Windows
 
@@ -325,8 +335,8 @@ See **[docs/scripting.md](docs/scripting.md)** for the full guide and API refere
 
 `src/core` holds documents, streaming I/O (files, disks and process memory), the piece table,
 undo, saving, the session, search, the inspector, strings extraction, hashes, XOR search, the C
-struct converter, the jump history, entropy, bitmap decoding, the compare engine, the pcap reader
-and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
+struct converter, the jump history, entropy, bitmap decoding, the compare engine, the pcap reader,
+x86 disassembly with PE / ELF address maps and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
 live in `tests/`, one executable per module; `tests/test_ui.cpp` drives the hex view headlessly
 (simulated mouse and keyboard, no window). See `CLAUDE.md` for contributor notes and `TODO.md`
 for the roadmap.

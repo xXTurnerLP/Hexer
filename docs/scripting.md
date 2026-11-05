@@ -235,6 +235,7 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | `doc:select(off, len)` `doc:jump(off)` | moves the selection/cursor and scrolls it into view (`doc:goto` also exists, but `goto` is a Lua keyword: call it as `doc["goto"](doc, off)`) |
 | `doc:find(needle, start?, {hex=bool, backward=bool})` | offset or `nil`; `hex=true` takes patterns like `"DE ?? AD"` |
 | `doc:hash(algo, off?, len?)` | lowercase hex digest of the range (default: the whole document; clamped to the end). It blocks, so at most 256 MiB per call; the Hashes panel hashes any size in the background |
+| `doc:disasm(off, count?, mode?)` | x86-64 disassembly of `count` instructions (default 16, at most 10000) from file offset `off`, as a list like `hx.disasm`'s. `address` / `target` are virtual addresses from the document's address map (PE and ELF headers; process memory and other files: the offset), `section` names the PE section / ELF section when known. `mode` defaults to the header's (32 for PE32 / ELF32), else 64. Unreadable bytes are 1-byte `"??"` entries |
 
 All edits are undoable. They fail with an error on read-only documents (`document is read-only`)
 and while a save is running.
@@ -260,6 +261,7 @@ and while a save is running.
 | `hx.crc32(s, prev?)` | zlib/PNG/ZIP CRC-32; pass the previous result to continue over chunks |
 | `hx.hash(algo, s)` | lowercase hex digest of a string: `hx.hash("sha256", data)`. Names ignore case and punctuation (`"CRC-32C"`, `"crc32c"`, `"md5"`) |
 | `hx.hash_algorithms()` | the names, in display order: Sum-8, XOR-8, CRC-8, CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-16/XMODEM, CRC-32, CRC-32C, Adler-32, Fletcher-16, FNV-1a/32, FNV-1a/64, MD5, SHA-1, SHA-256, SHA-512 |
+| `hx.disasm(bytes, address?, mode?)` | disassembles a string as x86-64 (`mode` 64, the default) or 32-bit x86 (`32` / `"x86"`), the first byte at `address` (default 0); at most 10000 instructions. Each entry: `address`, `offset` (0-based position in `bytes`), `length`, `text`, `bytes`, `valid`, and when present `target` (branch target or RIP-relative / absolute memory address) and `flow` (`"call"`, `"jmp"`, `"jcc"`, `"ret"`, `"int"`). Text is Intel syntax: `mov rax, qword ptr [rip+0x2a]  ; 0x1031` (the comment is the resolved address), `call 0x1105`; an invalid byte is `db 0x06` with `valid = false` |
 | `string.pack` / `string.unpack` | standard Lua, the recommended way to (de)serialize |
 
 `os.exit` and stdin are disabled: Hexer has no stdin (`io.read`, `io.lines()`, `io.stdin`,
@@ -329,6 +331,8 @@ See "Selection: XOR with key" in `scripts/examples/commands.lua`.
 * Predefined before each line: `doc` (active document), `cur` (cursor offset),
   `sel` (`{start=, len=}`).
 * `hx.hex(doc:read(sel.start, sel.len))` dumps the selection; `doc:find("IDAT")` finds bytes.
+* `for _, i in ipairs(doc:disasm(cur, 8)) do print(("%X  %s"):format(i.address, i.text)) end`
+  lists eight instructions at the caret (the Disassembly panel does the same interactively).
 * Tables print readably: `{ a = 1, list = { 1, 2, 3 } }`.
 * Prototype a parser in a file and keep it open in your editor: every save hot-reloads it.
 * Commands and console code are stopped after 10 s (time waiting in `hx.prompt` doesn't count),

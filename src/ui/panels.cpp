@@ -179,6 +179,16 @@ void pick_follow_type(App& app, InspType type) {
                         "  (Ctrl+click / Ctrl+Enter in the hex view)");
 }
 
+// Double-click / Enter / "Edit value" on a row: starts the inline edit, or says why it cannot.
+void begin_inspector_edit(App& app, const Document& d, const InspRow& r, int i, uint64_t at) {
+    if (r.unreadable) {
+        set_status(app, std::string("Cannot edit ") + r.name + " at " + fmt_offset(at) +
+                            ": its bytes are unreadable (unmapped memory or an I/O error)");
+        return;
+    }
+    if (r.editable && !d.read_only()) app.insp_edit.begin(i, at, r.value);
+}
+
 void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, bool be) {
     const uint64_t cur = focus_offset(d.view());
     const PointerType pt = app.settings.pointer_type();
@@ -202,9 +212,10 @@ void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, 
         g_insp_hover.row = i;
         g_insp_hover.frame = ImGui::GetFrameCount();
     }
-    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && r.editable && !d.read_only())
-        app.insp_edit.begin(i, cur, r.value);
-    if (hovered && !editing && (r.size || is_int))
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) begin_inspector_edit(app, d, r, i, cur);
+    if (hovered && !editing && r.unreadable)
+        ImGui::SetItemTooltip("%s: unreadable (unmapped memory or an I/O error); not editable", r.name);
+    else if (hovered && !editing && (r.size || is_int))
         ImGui::SetItemTooltip("%s: %zu byte%s%s%s", r.name, r.size, r.size == 1 ? "" : "s",
                               r.editable ? "  (double-click or Enter to edit)" : "",
                               is_follow ? "\nThe follow-pointer type (Ctrl+click / Ctrl+Enter in the hex view)"
@@ -212,8 +223,8 @@ void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, 
                                         : "");
     if (ImGui::BeginPopupContextItem("##ctx")) {
         if (ImGui::MenuItem("Copy value")) ImGui::SetClipboardText(value);
-        if (ImGui::MenuItem("Edit value", nullptr, false, r.editable && !d.read_only()))
-            app.insp_edit.begin(i, cur, r.value);
+        if (ImGui::MenuItem("Edit value", nullptr, false, (r.editable || r.unreadable) && !d.read_only()))
+            begin_inspector_edit(app, d, r, i, cur);
         if (is_int) {
             ImGui::Separator();
             if (ImGui::MenuItem("Use as Follow Pointer Type", nullptr, is_follow)) pick_follow_type(app, r.type);
@@ -236,12 +247,14 @@ void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, 
         if (res < 0) app.insp_edit.end();
     } else {
         ImGui::PushFont(app.fonts.mono, 0.0f);
-        if (r.size == 0)
+        if (r.unreadable)
+            ImGui::TextColored(kErrColor, "%s", value);
+        else if (r.size == 0)
             ImGui::TextDisabled("%s", value);
         else
             ImGui::TextUnformatted(value);
         ImGui::PopFont();
-        if (is_follow && r.size) {
+        if (is_follow && r.size && !r.unreadable) {
             bool ok = false;
             const std::string tip = follow_tip(d, cur, pt, ok);
             if (follow_button(ok, tip)) follow_pointer_as(app, t, cur, pt);
@@ -285,9 +298,9 @@ void draw_inspector_panel(App& app) {
     const uint64_t at = focus_offset(d->view());  // selection start, else the caret byte
     ImGui::TextDisabled("@ %s", fmt_offset(at).c_str());
 
-    uint8_t buf[16] = {};
-    const size_t n = d->read(at, buf, sizeof buf);
-    const std::vector<InspRow> rows = inspect(buf, n, be);
+    uint8_t buf[16] = {}, bad[16] = {};
+    const size_t n = d->read(at, buf, sizeof buf, bad);
+    const std::vector<InspRow> rows = inspect(buf, n, be, bad);  // unreadable bytes: "??"
     if (app.insp_edit.row >= 0 && app.insp_edit.ctx != at) app.insp_edit.end();  // moved
 
     // Enter edits the selected row when the panel has focus (and no text field is active).
@@ -295,8 +308,7 @@ void draw_inspector_panel(App& app) {
         ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !ImGui::GetIO().WantTextInput &&
         !ImGui::GetIO().KeyCtrl &&  // Ctrl+Enter = Follow Pointer at Cursor
         (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-        const InspRow& r = rows[size_t(app.insp_sel)];
-        if (r.editable && !d->read_only()) app.insp_edit.begin(app.insp_sel, at, r.value);
+        begin_inspector_edit(app, *d, rows[size_t(app.insp_sel)], app.insp_sel, at);
     }
 
     // Room for the separator (1 px + spacing) and the two selection-info lines, so the panel
@@ -1621,6 +1633,127 @@ void draw_status_bar(App& app) {
         }
     }
     ImGui::End();
+}
+
+// =============================================================================================
+// Disassembly (self-contained panel, ui/panel_disasm.h)
+// =============================================================================================
+
+namespace {
+
+// The panel's options are extra settings.ini keys: Settings keeps keys it does not know
+// (unknown_keys) and writes them back, so they round-trip without a Settings member each.
+std::string disasm_setting(const Settings& s, const char* key) {
+    for (const auto& [k, v] : s.unknown_keys)
+        if (k == key) return v;
+    return {};
+}
+
+bool set_disasm_setting(Settings& s, const char* key, const std::string& value) {
+    for (auto& kv : s.unknown_keys)
+        if (kv.first == key) {
+            if (kv.second == value) return false;
+            kv.second = value;
+            return true;
+        }
+    s.unknown_keys.emplace_back(key, value);
+    return true;
+}
+
+void save_disasm_settings(App& app) {
+    const DisasmPanel& dp = app.disasm_panel;
+    Settings& s = app.settings;
+    bool changed = set_disasm_setting(s, "disasm_mode", dp.mode == 1 ? "64" : dp.mode == 2 ? "32" : "auto");
+    changed |= set_disasm_setting(s, "disasm_syntax", dp.syntax == DisasmSyntax::Att ? "att" : "intel");
+    changed |= set_disasm_setting(s, "disasm_uppercase", dp.uppercase ? "1" : "0");
+    changed |= set_disasm_setting(s, "disasm_follow", dp.follow ? "1" : "0");
+    changed |= set_disasm_setting(s, "disasm_bytes", dp.show_bytes ? "1" : "0");
+    if (changed) mark_settings_dirty(app);
+}
+
+}  // namespace
+
+void load_disasm_settings(App& app) {
+    DisasmPanel& dp = app.disasm_panel;
+    const Settings& s = app.settings;
+    const std::string m = disasm_setting(s, "disasm_mode");
+    dp.mode = m == "64" ? 1 : m == "32" ? 2 : 0;
+    dp.syntax = disasm_setting(s, "disasm_syntax") == "att" ? DisasmSyntax::Att : DisasmSyntax::Intel;
+    dp.uppercase = disasm_setting(s, "disasm_uppercase") == "1";
+    dp.follow = disasm_setting(s, "disasm_follow") != "0";
+    dp.show_bytes = disasm_setting(s, "disasm_bytes") != "0";
+}
+
+void draw_disasm_panel(App& app) {
+    dock_like(kWinStructure);  // the right column: a tall listing
+    if (!begin_panel(kWinDisasm, &app.show_disasm)) return;
+    Tab* t = active_tab(app);
+    DisasmPanel& dp = app.disasm_panel;
+    dp.mono = app.fonts.mono;
+    dp.ui_scale = app.ui_scale;
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    DisasmPanelCallbacks cb;
+    // A row click selects the instruction's bytes; not a jump (no history), the listing is local.
+    cb.select = [&app, doc_id](uint64_t off, uint64_t len) {
+        Tab* tab = find_tab(app, doc_id);
+        if (!tab || tab->doc->busy()) return;
+        const uint64_t size = tab->doc->size();
+        ViewState& v = tab->doc->view();
+        v.cursor = std::min(off, size);
+        v.anchor = len > size - v.cursor ? size : v.cursor + len;
+        v.low_nibble = false;
+        tab->doc->view_generation++;
+        tab->view.request_scroll_to(v.cursor, false);
+    };
+    cb.jump = [&app, doc_id](uint64_t off) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, 0, false);
+    };
+    cb.copy = [&app](const std::string& s) {
+        ImGui::SetClipboardText(s.c_str());
+        set_status(app, s.find('\n') == std::string::npos ? "Copied " + s : "Copied the listing");
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    const uint64_t caret = t && !t->doc->busy() ? focus_offset(t->doc->view()) : 0;
+    dp.draw(t ? t->doc.get() : nullptr, caret, cb);
+    save_disasm_settings(app);
+    ImGui::End();
+}
+
+void disasm_at_cursor(App& app) {
+    Document* d = usable_doc(app);
+    if (!d) return;
+    app.show_disasm = app.focus_disasm = true;
+    app.disasm_panel.show_at(*d, focus_offset(d->view()), true);
+    set_status(app, "Disassembly pinned at " + fmt_offset(focus_offset(d->view())) + " (Follow cursor is off)");
+}
+
+void disasm_follow_target(App& app) {
+    Tab* t = active_tab(app);
+    Document* d = usable_doc(app);
+    if (!d) return;
+    const uint64_t doc_id = d->id();
+    DisasmPanelCallbacks cb;
+    cb.jump = [&app, doc_id](uint64_t off) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, 0, true);
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    app.show_disasm = true;
+    app.disasm_panel.follow_at(*d, focus_offset(t->doc->view()), cb);
+}
+
+void disasm_go_to_entry(App& app) {
+    Tab* t = active_tab(app);
+    Document* d = usable_doc(app);
+    if (!d) return;
+    uint64_t off = 0;
+    if (!app.disasm_panel.entry_offset(*d, off)) {
+        set_status(app, "No entry point: not a PE / ELF file, or its header was rejected", 6.0);
+        return;
+    }
+    app.show_disasm = app.focus_disasm = true;
+    app.disasm_panel.show_at(*d, off, false);
+    reveal_range(app, *t, off, 0, true);
+    set_status(app, "Entry point 0x" + fmt_hex(app.disasm_panel.address_map(*d).entry) + " at offset " + fmt_offset(off));
 }
 
 }  // namespace hx

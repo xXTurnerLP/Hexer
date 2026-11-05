@@ -42,6 +42,14 @@
 //   hx.hash(algo, str) -> "cbf43926"   -- lowercase hex digest; algo: any of hx.hash_algorithms()
 //                                         (case and punctuation ignored: "sha256", "CRC-32C", "md5")
 //   hx.hash_algorithms() -> {"Sum-8", "XOR-8", "CRC-8", ..., "SHA-256", "SHA-512"}
+//   hx.disasm(bytes, address?, mode?) -> list of instructions (x86-64, or mode 32 / "x86" for
+//       32-bit code; address = of the first byte, default 0; at most 10000 per call), each
+//       { address=, offset= (0-based in bytes), length=, text=, bytes=, valid=, target=?, flow=? }:
+//         text   "mov rax, qword ptr [rip+0x2a]  ; 0x1031" (Intel, lowercase; RIP-relative
+//                operands get the resolved address as a comment), "call 0x1105", "db 0x06" for
+//                an invalid byte (valid = false, length 1)
+//         target branch target or RIP-relative / absolute memory address (nil if none)
+//         flow   "call" | "jmp" | "jcc" | "ret" | "int" (int / int3 / syscall) | nil
 //   string.pack / string.unpack       -- standard Lua; the recommended way to serialize
 //
 // Doc (userdata; every call raises "document closed" if its tab was closed):
@@ -60,6 +68,11 @@
 //   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")
 //   doc:hash(algo, off?, len?) -> hex   (default: the whole doc; clamped to EOF; at most 256 MiB per
 //                                         call since it blocks - the Hashes panel does any size)
+//   doc:disasm(off, count?, mode?) -> list of instructions like hx.disasm (count default 16, at
+//       most 10000; stops at EOF). offset = file offset; address / target use the document's
+//       address map (PE / ELF headers: virtual addresses, process memory: = offset, else = offset);
+//       entries also get section= (".text") when the map names one. mode defaults to the
+//       header's (PE32 / ELF32: 32), else 64. Unreadable bytes are 1-byte "??" entries.
 //   All script edits are undoable and respect read-only mode (error "document is read-only").
 //
 // Parser context `p` (argument of parse; reads relative to the parse range, cursor starts at 0):

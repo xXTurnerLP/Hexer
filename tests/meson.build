@@ -33,3 +33,8 @@ endforeach
 test_cstruct = executable('test_cstruct', 'test_cstruct.cpp', test_main,
   dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
 test('cstruct', test_cstruct, timeout : 300)
+
+# Disassembly (Zydis) + PE / ELF address maps + hx.disasm / doc:disasm + the headless Disassembly panel.
+test_disasm = executable('test_disasm', 'test_disasm.cpp', test_main,
+  dependencies : [script_dep, ui_view_dep, doctest_dep], cpp_args : conf_args)
+test('disasm', test_disasm, timeout : 300)
