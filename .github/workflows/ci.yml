@@ -53,7 +53,7 @@ jobs:
       - name: Setup
         run: |
           if [ -n "${{ matrix.cc }}" ]; then export CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}; fi
-          args="--buildtype=release -Dwerror=false --force-fallback-for=lua"
+          args="--buildtype=release -Dwerror=false -Db_colorout=never --force-fallback-for=lua"
           if [ "$RUNNER_OS" = "Windows" ]; then args="$args --vsenv"; else args="$args --prefix=/usr"; fi
           set +e
           meson setup build $args 2>&1 | tee setup.log
@@ -95,6 +95,7 @@ jobs:
         if: runner.os == 'Linux' && !cancelled() && steps.compile.outcome == 'success'
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
+          NO_AT_BRIDGE: '1'  # no accessibility bus under Xvfb (GTK would warn)
         run: |
           mkdir -p smoke
           xvfb=(xvfb-run -a -s "-screen 0 1600x1000x24")
@@ -116,7 +117,7 @@ jobs:
 
       - name: Upload screenshot
         if: runner.os == 'Linux' && always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: screenshot-${{ matrix.name }}
           path: smoke/
@@ -140,7 +141,7 @@ jobs:
 
       - name: Upload package
         if: matrix.package
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: hexer-${{ matrix.name }}
           path: hexer-*.*
