@@ -33,6 +33,14 @@ warnings)
     echo "::notice title=Warnings::$n_proj unique project warnings, $n_all unique in total (incl. subprojects)"
     if [ "$n_proj" -gt 0 ]; then
         echo "::warning title=Project warnings::$(printf '%s\n' "$proj" | head -n 100 | join)"
+        # Warnings reported inside system headers only name the header; the preceding
+        # "In function / inlined from / required from" lines say which project code caused them.
+        ctx=$(grep -E -B 25 ': warning:' "$log" | sed 's/\r$//' \
+            | grep -E 'In (member )?function|inlined from|required from|instantiated from|FAILED:|: warning:' \
+            | grep -v -i 'subprojects' | head -n 60)
+        if [ -n "$ctx" ]; then
+            echo "::warning title=Warning context::$(printf '%s\n' "$ctx" | join)"
+        fi
     fi
     ;;
 *)
