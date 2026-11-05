@@ -80,6 +80,27 @@ bool tmp_left_over(const TempDir& t) {
     return false;
 }
 
+// Deterministic clock for typing-run coalescing; restores the real clock and default limits.
+int64_t g_fake_ms = 0;
+int64_t fake_clock() { return g_fake_ms; }
+struct FakeClock {
+    FakeClock() {
+        g_fake_ms = 1000;
+        Document::set_clock_for_tests(&fake_clock);
+        Document::set_undo_merge(500, 32);
+    }
+    ~FakeClock() {
+        Document::set_clock_for_tests(nullptr);
+        Document::set_undo_merge(500, 32);
+    }
+};
+
+// Sets the app-wide backup policy for one test case; restores the defaults.
+struct BackupPolicy {
+    BackupPolicy(bool enabled, uint64_t max_bytes) { Document::set_backup_policy(enabled, max_bytes); }
+    ~BackupPolicy() { Document::set_backup_policy(true, 4ull << 30); }
+};
+
 }  // namespace
 
 // =============================================================================================
@@ -451,7 +472,7 @@ TEST_CASE("document: basic edits and range checks") {
     d->set_read_only(true);
     CHECK(!d->insert(0, ab, 1));
     CHECK(!d->undo());
-    CHECK(d->add_bookmark(Bookmark{1, 1, "ro ok", 0}));  // bookmarks allowed on read-only docs
+    CHECK(d->add_bookmark(Bookmark{1, 1, "ro ok", 0, ""}));  // bookmarks allowed on read-only docs
     d->set_read_only(false);
     while (d->undo()) {
     }
@@ -570,6 +591,7 @@ TEST_CASE("document: randomized edits/undo/redo/saves against reference") {
 }
 
 TEST_CASE("document: typing coalescing") {
+    FakeClock clk;
     auto d = Document::create_from_bytes("t", reinterpret_cast<const uint8_t*>("................"), 16);
     const uint8_t a = 'a', b = 'b', c = 'c';
     CHECK(d->insert(4, &a, 1, true));
@@ -598,6 +620,66 @@ TEST_CASE("document: typing coalescing") {
     CHECK(doc_bytes(*d) == dots);
 }
 
+TEST_CASE("document: typing runs break after a pause or at the byte limit") {
+    FakeClock clk;
+    Bytes dots(64, '.');
+    auto d = Document::create_from_bytes("t", dots.data(), dots.size());
+    const uint8_t a = 'a';
+    // Fast typing (each key within the window of the previous one) is one step, even though the
+    // run as a whole takes longer than the window.
+    for (uint64_t i = 0; i < 8; ++i) {
+        REQUIRE(d->insert(i, &a, 1, true));
+        g_fake_ms += 400;
+    }
+    CHECK(d->undo_stack().size() == 1);
+    // A pause longer than the window starts a new step at the same position.
+    g_fake_ms += 101;  // 501 ms since the last key
+    REQUIRE(d->insert(8, &a, 1, true));
+    CHECK(d->undo_stack().size() == 2);
+    g_fake_ms += 500;  // exactly the window: still merges
+    REQUIRE(d->insert(9, &a, 1, true));
+    CHECK(d->undo_stack().size() == 2);
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d).size() == 64 + 8);  // only the keys after the pause were undone
+    REQUIRE(d->redo());
+
+    // Insert-mode hex typing: high nibble inserts a byte, the low nibble overwrites it: one step.
+    g_fake_ms += 1000;
+    const uint8_t hi = 0x40, lo = 0x41;
+    REQUIRE(d->insert(20, &hi, 1, true));
+    g_fake_ms += 300;
+    REQUIRE(d->overwrite(20, &lo, 1, true));
+    CHECK(d->undo_stack().size() == 3);
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d).size() == 64 + 10);
+    REQUIRE(d->redo());
+
+    // Byte limit (no time limit): a run covering 4 bytes refuses to grow, but edits inside its
+    // bytes (the low nibble of its last byte) still merge.
+    Document::set_undo_merge(0, 4);
+    const size_t base = d->undo_stack().size();
+    g_fake_ms += 100000;
+    for (uint64_t i = 30; i < 34; ++i) REQUIRE(d->insert(i, &hi, 1, true));
+    CHECK(d->undo_stack().size() == base + 1);
+    REQUIRE(d->overwrite(33, &lo, 1, true));
+    CHECK(d->undo_stack().size() == base + 1);
+    REQUIRE(d->insert(34, &hi, 1, true));
+    CHECK(d->undo_stack().size() == base + 2);
+    for (uint64_t i = 35; i < 38; ++i) REQUIRE(d->insert(i, &hi, 1, true));
+    CHECK(d->undo_stack().size() == base + 2);
+    REQUIRE(d->overwrite(36, &lo, 1, true));  // inside the run (overwrite mode, cursor went back)
+    CHECK(d->undo_stack().size() == base + 2);
+
+    // Overwrite-mode typing obeys the same limits.
+    Document::set_undo_merge(500, 32);
+    g_fake_ms += 1000;
+    for (uint64_t i = 40; i < 40 + 40; ++i) REQUIRE(d->overwrite(i, &a, 1, true));
+    CHECK(d->undo_stack().size() == base + 4);  // 32 + 8 bytes
+    while (d->undo()) {
+    }
+    CHECK(doc_bytes(*d) == dots);
+}
+
 TEST_CASE("document: groups, bookmarks, cursor in history") {
     auto d = Document::create_empty("Untitled 1");
     CHECK(d->display_name() == "Untitled 1");
@@ -611,7 +693,7 @@ TEST_CASE("document: groups, bookmarks, cursor in history") {
     d->begin_group("inner");
     CHECK(d->overwrite(0, x.data(), 2));
     CHECK(d->erase(3, 2));
-    CHECK(d->add_bookmark(Bookmark{1, 2, "bm", rgba(1, 2, 3)}));
+    CHECK(d->add_bookmark(Bookmark{1, 2, "bm", rgba(1, 2, 3), ""}));
     d->end_group();
     CHECK(d->insert(0, x.data(), 1));
     d->end_group();
@@ -629,8 +711,8 @@ TEST_CASE("document: groups, bookmarks, cursor in history") {
     CHECK(d->view().cursor == 9);  // redo returns to the "after" state
 
     // Bookmark-only history.
-    CHECK(d->update_bookmark(0, Bookmark{4, 1, "renamed", 0}));
-    CHECK(d->add_bookmark(Bookmark{7, 1, "second", 0}));
+    CHECK(d->update_bookmark(0, Bookmark{4, 1, "renamed", 0, "a note"}));
+    CHECK(d->add_bookmark(Bookmark{7, 1, "second", 0, ""}));
     CHECK(d->remove_bookmark(0));
     CHECK(!d->remove_bookmark(5));
     REQUIRE(d->view().bookmarks.size() == 1);
@@ -640,6 +722,7 @@ TEST_CASE("document: groups, bookmarks, cursor in history") {
     CHECK(d->undo());
     CHECK(d->view().bookmarks.size() == 1);
     CHECK(d->view().bookmarks[0].name == "renamed");
+    CHECK(d->view().bookmarks[0].note == "a note");
     CHECK(d->undo());
     CHECK(d->view().bookmarks[0].name == "bm");
     CHECK(d->undo_stack().back().label == "inner");
@@ -1043,6 +1126,8 @@ TEST_CASE("document: >4 GiB sparse file") {
         std::string err;
         REQUIRE(d->save(nullptr, &err));
         CHECK(d->current_source() == 0);
+        CHECK(d->last_save_info().backup_skipped);  // above the default 4 GiB backup limit
+        CHECK_FALSE(os_stat(p + ".backup").exists);
         {
             auto f = OsFile::open(p, OsFile::Mode::Read);
             REQUIRE(f->size() == size);
@@ -1079,7 +1164,7 @@ TEST_CASE("session: round trip, skip unchanged, warnings") {
     Bytes ins = str_bytes("INSERTED");
     REQUIRE(a->insert(500, ins.data(), ins.size()));
     REQUIRE(a->overwrite(60000, ins.data(), 3));
-    REQUIRE(a->add_bookmark(Bookmark{42, 4, "magic", rgba(255, 0, 0)}));
+    REQUIRE(a->add_bookmark(Bookmark{42, 4, "magic", rgba(255, 0, 0), "PNG signature"}));
     REQUIRE(a->undo());  // leave something on the redo stack too
     a->view().cursor = 1234;
     a->view().anchor = 1200;
@@ -1129,6 +1214,8 @@ TEST_CASE("session: round trip, skip unchanged, warnings") {
         REQUIRE(ra.redo());
         CHECK(ra.view().bookmarks.size() == 1);
         CHECK(ra.view().bookmarks[0].name == "magic");
+        CHECK(ra.view().bookmarks[0].note == "PNG signature");
+        CHECK(ra.view().bookmarks[0].color == rgba(255, 0, 0));
         REQUIRE(ra.undo());
         REQUIRE(ra.undo());
         REQUIRE(ra.undo());
@@ -1368,6 +1455,7 @@ TEST_CASE("document: in-place save of a huge overwrite trims history instead of 
     TempDir t;
     std::string p = t.file("trim.bin");
     const uint64_t size = 520ull << 20;  // just above the preservation budget
+    BackupPolicy no_backup(false, 0);    // not about backups: skip the 520 MiB copy
     make_sparse(p, size);
     auto d = Document::open_file(p);
     REQUIRE(d);
@@ -1795,6 +1883,312 @@ TEST_CASE("document: Progress::committing is cleared after every save") {
     CHECK_FALSE(pr.committing.load());
 }
 
+// =============================================================================================
+// document: .backup on the first save
+// =============================================================================================
+TEST_CASE("os_file: os_copy_file copies, reports progress, cancels cleanly") {
+    TempDir t;
+    std::string a = t.file("src.bin"), b = t.file("dst.bin");
+    Bytes data = random_bytes((8 << 20) + 123, 77);
+    write_file(a, data);
+    write_file(b, str_bytes("stale"));
+    uint64_t last_done = 0, last_total = 0;
+    int calls = 0;
+    std::string err;
+    REQUIRE(os_copy_file(a, b, [&](uint64_t done, uint64_t total) {
+        ++calls;
+        CHECK(done >= last_done);
+        last_done = done;
+        last_total = total;
+        return true;
+    }, &err));
+    CHECK(calls >= 1);
+    CHECK(last_done == data.size());
+    CHECK(last_total == data.size());
+    CHECK(read_file(b) == data);
+    REQUIRE(os_copy_file(a, b, {}, &err));  // no callback, replaces the existing copy
+    CHECK(read_file(b) == data);
+
+    std::string c = t.file("cancelled.bin");
+    bool cancelled = false;
+    CHECK_FALSE(os_copy_file(a, c, [](uint64_t, uint64_t) { return false; }, &err, &cancelled));
+    CHECK(cancelled);
+    CHECK_FALSE(os_stat(c).exists);
+    cancelled = true;
+    CHECK_FALSE(os_copy_file(t.file("missing.bin"), c, {}, &err, &cancelled));
+    CHECK_FALSE(cancelled);
+    CHECK_FALSE(err.empty());
+    write_file(t.file("empty.bin"), {});
+    REQUIRE(os_copy_file(t.file("empty.bin"), c, {}, &err));
+    CHECK(os_stat(c).exists);
+    CHECK(os_stat(c).size == 0);
+}
+
+TEST_CASE("os_file: os_hard_link gives a file a second name") {
+    TempDir t;
+    std::string a = t.file("a.bin"), b = t.file("b.bin");
+    write_file(a, str_bytes("same file"));
+    std::string err;
+    REQUIRE(os_hard_link(a, b, &err));  // NTFS / ext4 / tmpfs all have hard links
+    CHECK(read_file(b) == str_bytes("same file"));
+    CHECK_FALSE(os_identity_differs(os_stat(a), os_stat(b)));
+    CHECK_FALSE(os_hard_link(a, b, &err));  // the new name must not exist
+    CHECK_FALSE(err.empty());
+    REQUIRE(os_remove(a));
+    CHECK(read_file(b) == str_bytes("same file"));
+}
+
+TEST_CASE("document: in-place save keeps the original as .backup, once") {
+    BackupPolicy policy(true, 4ull << 30);
+    TempDir t;
+    std::string p = t.file("ip.bin"), bak = p + ".backup";
+    Bytes orig = random_bytes(300000, 61);
+    write_file(p, orig);
+    write_file(bak, str_bytes("older backup"));  // replaced
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    CHECK_FALSE(d->last_save_info().backup_created);
+    const uint8_t v[3] = {1, 2, 3};
+    REQUIRE(d->overwrite(1000, v, 3));
+    Bytes s1 = doc_bytes(*d);
+    Progress pr;
+    std::string err;
+    REQUIRE(d->save(&pr, &err));
+    CHECK(d->current_source() == 0);  // in place
+    SaveInfo info = d->last_save_info();
+    CHECK(info.backup_created);
+    CHECK_FALSE(info.backup_skipped);
+    CHECK(read_file(info.backup_path) == orig);
+    CHECK(read_file(bak) == orig);
+    CHECK_FALSE(os_stat(bak + ".tmp").exists);
+    CHECK(read_file(p) == s1);
+    // Progress covers backup copy + preserved history bytes + written bytes.
+    CHECK(pr.total.load() == orig.size() + 3 + 3);
+    CHECK(pr.done.load() == pr.total.load());
+
+    // Second save: the backup keeps the original.
+    REQUIRE(d->overwrite(2000, v, 3));
+    Bytes s2 = doc_bytes(*d);
+    REQUIRE(d->save(&pr, &err));
+    CHECK_FALSE(d->last_save_info().backup_created);
+    CHECK(read_file(bak) == orig);
+    CHECK(read_file(p) == s2);
+    // A rewrite save later does not back up again either.
+    REQUIRE(d->insert(0, v, 1));
+    REQUIRE(d->save(&pr, &err));
+    CHECK(d->current_source() == 1);
+    CHECK_FALSE(d->last_save_info().backup_created);
+    CHECK(read_file(bak) == orig);
+    while (d->undo()) {
+    }
+    CHECK(doc_bytes(*d) == orig);
+
+    // A new Document object (reopened file) backs up again on its first save.
+    d.reset();
+    auto d2 = Document::open_file(p);
+    REQUIRE(d2->overwrite(5, v, 1));
+    Bytes before = read_file(p);
+    REQUIRE(d2->save(nullptr, &err));
+    CHECK(d2->last_save_info().backup_created);
+    CHECK(read_file(bak) == before);
+}
+
+TEST_CASE("document: rewrite save keeps the original file as .backup and history still reads it") {
+    BackupPolicy policy(true, 1000);  // the size limit only applies to in-place copies
+    TempDir t;
+    std::string p = t.file("rw.bin"), bak = p + ".backup";
+    Bytes orig = random_bytes(200000, 62);
+    write_file(p, orig);
+    FileStat before = os_stat(p);
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    auto old_snap = d->snapshot();
+    Bytes hello = str_bytes("hello");
+    REQUIRE(d->insert(10, hello.data(), hello.size()));
+    Bytes s1 = doc_bytes(*d);
+    Progress pr;
+    std::string err;
+    REQUIRE(d->save(&pr, &err));
+    CHECK(err.empty());
+    CHECK(d->current_source() == 1);
+    SaveInfo info = d->last_save_info();
+    CHECK(info.backup_created);
+    CHECK(read_file(bak) == orig);
+    CHECK(read_file(p) == s1);
+    CHECK(pr.done.load() == s1.size());
+    CHECK_FALSE(tmp_left_over(t));
+    // The backup IS the old file (hard link or rename, not a copy).
+    FileStat bst = os_stat(bak);
+    CHECK_FALSE(os_identity_differs(bst, before));
+    CHECK(bst.mtime_ns == before.mtime_ns);
+    CHECK_FALSE(d->changed_on_disk());
+
+    // Our handle on the old version (now named .backup) keeps reading it: undo + old snapshots.
+    Bytes os(orig.size());
+    REQUIRE(old_snap->read(0, os.data(), os.size()) == orig.size());
+    CHECK(os == orig);
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == orig);
+    REQUIRE(d->save(nullptr, &err));  // rewrite from the old version; no second backup
+    CHECK_FALSE(d->last_save_info().backup_created);
+    CHECK(read_file(p) == orig);
+    CHECK(read_file(bak) == orig);
+    REQUIRE(d->redo());
+    CHECK(doc_bytes(*d) == s1);
+    REQUIRE(d->save(nullptr, &err));
+    CHECK(read_file(p) == s1);
+    CHECK(read_file(bak) == orig);
+}
+
+TEST_CASE("document: a hot-exit restored document does not replace its .backup again") {
+    BackupPolicy policy(true, 4ull << 30);
+    TempDir t;
+    std::string sdir = t.file("session"), p = t.file("hb.bin"), bak = p + ".backup";
+    Bytes orig = random_bytes(5000, 63);
+    write_file(p, orig);
+    std::string err;
+    {
+        auto d = Document::open_file(p);
+        REQUIRE(d);
+        Bytes x = str_bytes("first");
+        REQUIRE(d->insert(0, x.data(), x.size()));  // rewrite save
+        REQUIRE(d->save(nullptr, &err));
+        CHECK(d->last_save_info().backup_created);
+        CHECK(read_file(bak) == orig);
+        CHECK_FALSE(os_stat(bak + ".tmp").exists);
+        REQUIRE(d->insert(0, x.data(), x.size()));  // unsaved edit for the session
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+    }
+    auto r = Session(sdir).load();
+    REQUIRE(r.docs.size() == 1);
+    Document& d2 = *r.docs[0];
+    REQUIRE(d2.save(nullptr, &err));
+    CHECK_FALSE(d2.last_save_info().backup_created);
+    CHECK(read_file(bak) == orig);  // still the original
+    // A document opened fresh (no shared history) starts over.
+    auto d3 = Document::open_file(p);
+    REQUIRE(d3);
+    const uint8_t z = 0;
+    REQUIRE(d3->overwrite(0, &z, 1));
+    REQUIRE(d3->save(nullptr, &err));
+    CHECK(d3->last_save_info().backup_created);
+}
+
+TEST_CASE("document: save_as backs up an existing different target; new files get none") {
+    BackupPolicy policy(true, 4ull << 30);
+    TempDir t;
+    std::string a = t.file("a.bin"), b = t.file("b.bin"), c = t.file("c.bin");
+    Bytes ab = random_bytes(5000, 63), bb = random_bytes(7000, 64);
+    write_file(a, ab);
+    write_file(b, bb);
+    auto d = Document::open_file(a);
+    const uint8_t v = 7;
+    REQUIRE(d->insert(0, &v, 1));
+    std::string err;
+    REQUIRE(d->save_as(b, nullptr, &err));
+    CHECK(d->last_save_info().backup_created);
+    CHECK(read_file(b + ".backup") == bb);
+    CHECK_FALSE(os_stat(a + ".backup").exists);  // a was never written
+    CHECK(read_file(a) == ab);
+    Bytes first = read_file(b);
+    REQUIRE(d->overwrite(0, &v, 1));
+    REQUIRE(d->insert(0, &v, 1));
+    REQUIRE(d->save(nullptr, &err));  // b again: already backed up
+    CHECK_FALSE(d->last_save_info().backup_created);
+    CHECK(read_file(b + ".backup") == bb);
+    REQUIRE(d->save_as(a, nullptr, &err));  // back onto a: first write there
+    CHECK(d->last_save_info().backup_created);
+    CHECK(read_file(a + ".backup") == ab);
+
+    // A target that did not exist gets no backup, now or on later saves.
+    REQUIRE(d->save_as(c, nullptr, &err));
+    CHECK_FALSE(d->last_save_info().backup_created);
+    REQUIRE(d->insert(0, &v, 1));
+    REQUIRE(d->save(nullptr, &err));
+    REQUIRE(d->overwrite(0, &v, 1));
+    REQUIRE(d->save(nullptr, &err));
+    CHECK_FALSE(os_stat(c + ".backup").exists);
+    auto u = Document::create_empty("Untitled 1");
+    REQUIRE(u->insert(0, &v, 1));
+    std::string n = t.file("new.bin");
+    REQUIRE(u->save_as(n, nullptr, &err));
+    REQUIRE(u->overwrite(0, &v, 1));
+    REQUIRE(u->insert(0, &v, 1));
+    REQUIRE(u->save(nullptr, &err));
+    CHECK_FALSE(u->last_save_info().backup_created);
+    CHECK_FALSE(os_stat(n + ".backup").exists);
+}
+
+TEST_CASE("document: backup size limit, disabled policy, cancel") {
+    TempDir t;
+    const uint8_t v = 9;
+    std::string err;
+    SUBCASE("files above the limit are saved in place without a backup, reported once") {
+        BackupPolicy policy(true, 1000);
+        std::string p = t.file("big.bin");
+        Bytes orig = random_bytes(10000, 65);
+        write_file(p, orig);
+        auto d = Document::open_file(p);
+        REQUIRE(d->overwrite(10, &v, 1));
+        Progress pr;
+        REQUIRE(d->save(&pr, &err));
+        SaveInfo info = d->last_save_info();
+        CHECK_FALSE(info.backup_created);
+        CHECK(info.backup_skipped);
+        CHECK(info.note.find("limit") != std::string::npos);
+        CHECK_FALSE(os_stat(p + ".backup").exists);
+        CHECK(pr.total.load() == 2);  // no backup bytes
+        REQUIRE(d->overwrite(11, &v, 1));
+        REQUIRE(d->save(&pr, &err));
+        CHECK_FALSE(d->last_save_info().backup_skipped);
+        CHECK_FALSE(os_stat(p + ".backup").exists);
+    }
+    SUBCASE("disabled: no backup; enabling later backs up on the next save") {
+        BackupPolicy policy(false, 0);
+        std::string p = t.file("off.bin");
+        Bytes orig = random_bytes(10000, 66);
+        write_file(p, orig);
+        auto d = Document::open_file(p);
+        REQUIRE(d->overwrite(10, &v, 1));
+        REQUIRE(d->save(nullptr, &err));
+        REQUIRE(d->insert(10, &v, 1));
+        REQUIRE(d->save(nullptr, &err));
+        CHECK_FALSE(d->last_save_info().backup_created);
+        CHECK_FALSE(d->last_save_info().backup_skipped);
+        CHECK_FALSE(os_stat(p + ".backup").exists);
+        Document::set_backup_policy(true, 0);
+        Bytes now = read_file(p);
+        REQUIRE(d->overwrite(10, &v, 1));
+        REQUIRE(d->overwrite(11, &v, 1));
+        REQUIRE(d->save(nullptr, &err));
+        CHECK(d->last_save_info().backup_created);
+        CHECK(read_file(p + ".backup") == now);
+    }
+    SUBCASE("cancel before/while copying the backup leaves the file and no backup") {
+        BackupPolicy policy(true, 0);
+        std::string p = t.file("cancel.bin");
+        Bytes orig = random_bytes(100000, 67);
+        write_file(p, orig);
+        auto d = Document::open_file(p);
+        REQUIRE(d->overwrite(10, &v, 1));
+        Progress pr;
+        pr.cancel = true;
+        CHECK_FALSE(d->save(&pr, &err));
+        CHECK(err.find("cancel") != std::string::npos);
+        CHECK_FALSE(pr.committing.load());
+        CHECK_FALSE(os_stat(p + ".backup").exists);
+        CHECK_FALSE(os_stat(p + ".backup.tmp").exists);
+        CHECK(read_file(p) == orig);
+        CHECK(d->dirty());
+        CHECK_FALSE(d->last_save_info().backup_created);
+        pr.cancel = false;
+        REQUIRE(d->save(&pr, &err));  // the cancelled attempt did not count as the backup
+        CHECK(d->last_save_info().backup_created);
+        CHECK(read_file(p + ".backup") == orig);
+    }
+}
+
 TEST_CASE("session: single-instance inbox (post, take, withdraw, leftovers)") {
     TempDir t;
     std::string sdir = t.file("session");
@@ -1845,4 +2239,37 @@ TEST_CASE("session: single-instance inbox (post, take, withdraw, leftovers)") {
     CHECK(msgs[0] == std::vector<std::string>{"/claimed.bin"});
     CHECK(msgs[1] == std::vector<std::string>{"/stale.bin"});
     CHECK(os_list_files(path_join(sdir, "inbox"), "").empty());
+}
+
+TEST_CASE("session: version 1 files (bookmarks without notes) still load") {
+    TempDir t;
+    std::string sdir = t.file("session");
+    // Without bookmarks a version 1 file differs from a version 2 one only in the version field
+    // and the tail (v2: edits_dropped u8 + backed-up target count u32; v1: nothing when false).
+    auto a = Document::create_from_bytes("Old", reinterpret_cast<const uint8_t*>("old!"), 4);
+    std::string err;
+    {
+        Session s(sdir);
+        REQUIRE(s.save({a.get()}, 0, &err));
+    }
+    auto files = os_list_files(sdir, ".hxs");
+    REQUIRE(files.size() == 1);
+    Bytes f = read_file(files[0]);
+    REQUIRE(f.size() > 12);
+    CHECK(f[4] == 2);  // current version
+    f[4] = 1;
+    f.erase(f.end() - 4 - 5, f.end() - 4);
+    const uint32_t crc = test_crc32(f.data(), f.size() - 4);
+    for (int i = 0; i < 4; ++i) f[f.size() - 4 + size_t(i)] = uint8_t(crc >> (8 * i));
+    write_file(files[0], f);
+    auto r = Session(sdir).load();
+    CHECK(r.warnings.empty());
+    REQUIRE(r.docs.size() == 1);
+    CHECK(doc_bytes(*r.docs[0]) == str_bytes("old!"));
+    f[4] = 9;  // a newer, unknown version is not read
+    const uint32_t crc9 = test_crc32(f.data(), f.size() - 4);
+    for (int i = 0; i < 4; ++i) f[f.size() - 4 + size_t(i)] = uint8_t(crc9 >> (8 * i));
+    write_file(files[0], f);
+    auto r9 = Session(sdir).load();
+    CHECK(r9.docs.empty());
 }

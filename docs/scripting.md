@@ -170,7 +170,8 @@ and while a save is running.
 |---|---|
 | `hx.version` | `"0.1.0"` |
 | `hx.parser{...}` `hx.command{...}` | registration (see above / below) |
-| `hx.run(name)` | runs a registered command exactly like the palette (one undo step on the active document); handy with `hexer --exec` |
+| `hx.run(name)` | runs a registered command exactly like the palette (one undo step on the active document); handy with `hexer --exec`. Called from inside a command, it runs the other command inline, as part of the caller's step |
+| `hx.prompt(title, default?, {hint=}?)` | asks the user for one line of text in a dialog; returns the text, or `nil` if cancelled. Commands only (see below) |
 | `print(...)` `hx.log(...)` `hx.warn(...)` `hx.error(...)` | console output; tables are pretty-printed. `hx.error` only logs, it does not raise. |
 | `hx.inspect(v, depth?)` | readable dump: nested and sorted, cycle-safe, strings quoted. `depth` is 1..64 (default 6); output stops after about 1 MiB |
 | `hx.clear_console()` | |
@@ -197,7 +198,9 @@ hx.command {
     name = "My protocol: build TEXT message",
     description = "shown in the palette",
     run = function(doc)                       -- active document or nil
-        local text = my_text or "hello"       -- no prompts: use globals set from the console
+        local text = hx.prompt("Message text", my_text or "hello")
+        if not text then return end           -- cancelled
+        my_text = text                        -- remembered as the next default
         local body = string.pack(">BBs2", 0xAB, 1, text)   -- s2 = u16be length + bytes
         local sum = 0
         for i = 1, #body do sum = sum + body:byte(i) end
@@ -210,8 +213,33 @@ hx.command {
 * To patch a structure in place (insert a record, then fix the length and CRC), wrap the edits
   in `doc:transaction(function() ... end)`. See "HXP: append TLV record at cursor" in
   `tlv_protocol.lua`.
-* Commands can't ask for input. Read a global with a default (`hx_xor_key = hx_xor_key or 0xFF`)
-  and set it from the console (`hx_xor_key = 0x5A`).
+
+### Asking for input: `hx.prompt`
+
+`hx.prompt(title, default?, { hint = "..." }?)` opens a dialog with a text field preset to
+`default` and returns what the user typed, or `nil` on Cancel / Escape. `hint` is a line (or
+several) shown under the title, a good place to say which formats you accept.
+
+```lua
+local text = hx.prompt("XOR key", last_key or "FF", { hint = 'hex bytes, or "text" in quotes' })
+if not text then return end
+local ok, key = pcall(hx.unhex, text)          -- lenient: "DE AD", "0xDE,0xAD", "b64:..."
+```
+
+* It works only inside commands (`hx.command` run functions, also when started with `hx.run`).
+  In the console, a parser or at load time it raises `hx.prompt is only available inside
+  commands`. It also can't be called inside `doc:transaction` (one undo step can't span the
+  dialog): prompt first, then edit.
+* While the dialog is open the command is suspended (it runs as a coroutine) and the editor
+  keeps running. The 10 s time limit counts Lua time only, separately before and after each
+  prompt.
+* Edits made before the prompt and after it are separate undo steps.
+* If the document's tab is closed while the dialog is open, the command's next `doc` call raises
+  `document closed` as usual. A script reload cancels the waiting command.
+* One dialog at a time: another command started while one waits is refused with a console
+  message.
+
+See "Selection: XOR with key" in `scripts/examples/commands.lua`.
 
 ---
 
@@ -224,8 +252,9 @@ hx.command {
 * `hx.hex(doc:read(sel.start, sel.len))` dumps the selection; `doc:find("IDAT")` finds bytes.
 * Tables print readably: `{ a = 1, list = { 1, 2, 3 } }`.
 * Prototype a parser in a file and keep it open in your editor: every save hot-reloads it.
-* Commands and console code are stopped after 10 s, so an accidental infinite loop does not
-  freeze Hexer. `pcall` cannot catch the time limit: once it fires, the script stops.
+* Commands and console code are stopped after 10 s (time waiting in `hx.prompt` doesn't count),
+  so an accidental infinite loop does not freeze Hexer. `pcall` cannot catch the time limit:
+  once it fires, the script stops.
 
 ## Lua 5.5 notes
 

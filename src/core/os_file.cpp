@@ -28,6 +28,10 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#ifdef __linux__
+#include <linux/fs.h>  // FICLONE
+#include <sys/ioctl.h>
+#endif
 #endif
 
 namespace fs = std::filesystem;
@@ -509,6 +513,17 @@ bool os_remove(const std::string& path) {
 #endif
 }
 
+bool os_hard_link(const std::string& existing, const std::string& link_path, std::string* err) {
+#ifdef _WIN32
+    if (CreateHardLinkW(win_path(link_path).c_str(), win_path(existing).c_str(), nullptr)) return true;
+    set_err(err, win_error(GetLastError()));
+#else
+    if (::link(existing.c_str(), link_path.c_str()) == 0) return true;
+    set_err(err, posix_error(errno));
+#endif
+    return false;
+}
+
 bool os_mkdirs(const std::string& path) {
     if (path.empty()) return false;
     std::error_code ec;
@@ -711,6 +726,182 @@ bool os_copy_permissions(const std::string& from, const std::string& to) {
     if (::stat(from.c_str(), &s) != 0) return false;
     return ::chmod(to.c_str(), s.st_mode & 07777) == 0;
 #endif
+}
+
+namespace {
+
+using CopyProgress = std::function<bool(uint64_t, uint64_t)>;
+
+bool copy_cancelled(std::string* err, bool* cancelled) {
+    if (cancelled) *cancelled = true;
+    set_err(err, "cancelled");
+    return false;
+}
+
+// Portable fallback: positional read/write in 4 MiB blocks (shares the source with any writer).
+bool copy_rw(const std::string& src, const std::string& dst, const CopyProgress& cb, std::string* err,
+             bool* cancelled) {
+    auto in = OsFile::open(src, OsFile::Mode::Read, err);
+    if (!in) return false;
+    auto out = OsFile::open(dst, OsFile::Mode::CreateTruncate, err);
+    if (!out) return false;
+    const uint64_t size = in->size();
+    std::vector<uint8_t> buf(size_t(std::min<uint64_t>(4u << 20, std::max<uint64_t>(size, 1))));
+    for (uint64_t off = 0; off < size;) {
+        if (cb && !cb(off, size)) return copy_cancelled(err, cancelled);
+        size_t n = size_t(std::min<uint64_t>(buf.size(), size - off));
+        int64_t got = in->read_at(off, buf.data(), n);
+        if (got < 0) {
+            set_err(err, "read error");
+            return false;
+        }
+        if (got == 0) break;  // the file shrank meanwhile
+        if (!out->write_at(off, buf.data(), size_t(got))) {
+            set_err(err, "write error (disk full?)");
+            return false;
+        }
+        off += uint64_t(got);
+    }
+    if (!out->flush()) {
+        set_err(err, "flush failed");
+        return false;
+    }
+    return true;
+}
+
+#ifdef _WIN32
+struct WinCopyCtx {
+    const CopyProgress* cb;
+    bool cancelled;
+};
+
+DWORD CALLBACK win_copy_progress(LARGE_INTEGER total, LARGE_INTEGER done, LARGE_INTEGER, LARGE_INTEGER, DWORD,
+                                 DWORD, HANDLE, HANDLE, LPVOID data) {
+    auto* c = static_cast<WinCopyCtx*>(data);
+    if (*c->cb && !(*c->cb)(uint64_t(done.QuadPart), uint64_t(total.QuadPart))) {
+        c->cancelled = true;
+        return PROGRESS_CANCEL;
+    }
+    return PROGRESS_CONTINUE;
+}
+#endif
+
+}  // namespace
+
+bool os_copy_file(const std::string& src, const std::string& dst, const CopyProgress& progress, std::string* err,
+                  bool* cancelled) {
+    if (cancelled) *cancelled = false;
+    os_remove(dst);  // a stale (possibly read-only) leftover would make the copy fail
+    bool use_rw = false;
+#ifdef _WIN32
+    const uint64_t size = os_stat(src).size;
+    // Unbuffered I/O keeps a multi-GB copy from evicting the whole file cache.
+    const DWORD flags = size >= (256ull << 20) ? COPY_FILE_NO_BUFFERING : 0;
+    WinCopyCtx ctx{&progress, false};
+    if (CopyFileExW(win_path(src).c_str(), win_path(dst).c_str(), win_copy_progress, &ctx, nullptr, flags)) {
+        // Durable before the caller overwrites the original (best effort if dst came out read-only).
+        if (auto f = OsFile::open(dst, OsFile::Mode::ReadWrite)) {
+            if (!f->flush()) {
+                f.reset();
+                os_remove(dst);
+                set_err(err, "flush failed");
+                return false;
+            }
+        }
+    } else {
+        const DWORD e = GetLastError();
+        os_remove(dst);
+        if (ctx.cancelled || e == ERROR_REQUEST_ABORTED) return copy_cancelled(err, cancelled);
+        // Another program has the file open without sharing it for reading by CopyFileExW.
+        if (e != ERROR_SHARING_VIOLATION && e != ERROR_LOCK_VIOLATION) {
+            set_err(err, win_error(e));
+            return false;
+        }
+        use_rw = true;
+    }
+#else
+    int in;
+    do {
+        in = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (in < 0 && errno == EINTR);
+    if (in < 0) {
+        set_err(err, posix_error(errno));
+        return false;
+    }
+    struct stat s {};
+    if (fstat(in, &s) != 0 || !S_ISREG(s.st_mode)) {
+        ::close(in);
+        set_err(err, "not a regular file");
+        return false;
+    }
+    const uint64_t size = uint64_t(s.st_size);
+    int out;
+    do {
+        out = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, s.st_mode & 0777);
+    } while (out < 0 && errno == EINTR);
+    if (out < 0) {
+        set_err(err, posix_error(errno));
+        ::close(in);
+        return false;
+    }
+    if (::fchmod(out, s.st_mode & 07777) != 0) {
+        // best effort (e.g. setuid bits on some filesystems)
+    }
+    int status = 0;  // 1 = copied, -1 = failed, 0 = not attempted / unsupported: use read/write
+#ifdef __linux__
+#ifdef FICLONE
+    if (::ioctl(out, FICLONE, in) == 0) status = 1;  // reflink: shares extents, instant
+#endif
+    for (uint64_t done = 0; status == 0 && done < size;) {
+        if (progress && !progress(done, size)) {
+            copy_cancelled(err, cancelled);
+            status = -1;
+            break;
+        }
+        size_t n = size_t(std::min<uint64_t>(size - done, 64u << 20));
+        ssize_t r = ::copy_file_range(in, nullptr, out, nullptr, n, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (done == 0 && (errno == EXDEV || errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP ||
+                              errno == EPERM))
+                break;  // not supported here: read/write fallback
+            set_err(err, posix_error(errno));
+            status = -1;
+            break;
+        }
+        if (r == 0) {
+            status = 1;  // the file shrank meanwhile
+            break;
+        }
+        done += uint64_t(r);
+        if (done >= size) status = 1;
+    }
+    if (status == 0 && size == 0) status = 1;
+#endif
+    if (status == 1 && ::fsync(out) != 0) {
+        set_err(err, posix_error(errno));
+        status = -1;
+    }
+    ::close(out);
+    ::close(in);
+    if (status < 0) {
+        os_remove(dst);
+        return false;
+    }
+    use_rw = status == 0;
+#endif
+    if (use_rw) {
+        if (!copy_rw(src, dst, progress, err, cancelled)) {
+            os_remove(dst);
+            return false;
+        }
+        os_copy_permissions(src, dst);
+    }
+    if (progress && !progress(size, size)) {
+        os_remove(dst);
+        return copy_cancelled(err, cancelled);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -14,9 +14,23 @@
 #include "imgui.h"
 #include "imgui_internal.h"  // ImGuiWindow::InnerRect (exact visible area of the child window)
 
+#include "core/util.h"
 #include "ui/theme.h"
 
 namespace hx {
+
+uint64_t caret_byte(const ViewState& v) { return v.cursor > v.anchor ? v.cursor - 1 : v.cursor; }
+
+uint64_t focus_offset(const ViewState& v) { return v.has_selection() ? v.sel_begin() : v.cursor; }
+
+std::string fmt_range(uint64_t begin, uint64_t len) {
+    std::string s = "0x" + fmt_hex(begin, 8);
+    if (len > 1) s += "-0x" + fmt_hex(begin + len - 1, 8);
+    s += " (";
+    if (len >= 1024) s += fmt_size(len) + ", ";
+    s += std::to_string(len) + (len == 1 ? " byte)" : " bytes)");
+    return s;
+}
 
 namespace {
 
@@ -87,7 +101,9 @@ void set_row_counts(Layout& L, uint64_t size) {
 
 // Places the columns at the child's (scrolled) origin.
 void place_columns(Layout& L, float scroll_x) {
-    L.base_x = L.inner_min.x - scroll_x;
+    // Whole pixels: with the mono font's whole-pixel advances every cell, separator and highlight
+    // edge then lands on the pixel grid (no blurry glyphs or 2-pixel lines).
+    L.base_x = std::floor(L.inner_min.x - scroll_x);
     const float a = L.adv;
     const int hc = hex_cells(L.bpr, L.group);
     L.off_x = L.base_x + a;
@@ -124,12 +140,21 @@ struct Hit {
     bool on_byte = false; // really over an existing byte cell (for hover)
 };
 
+// Byte under screen point `p`. Rows above the first one map to it; below the last row (the one
+// holding the EOF position) everything is EOF, so a click or drag into the empty area under the
+// data reaches the end of the file.
 Hit hit_test(const Layout& L, ImVec2 p, uint64_t top, uint64_t size) {
     Hit h;
     float rel_f = std::floor((p.y - L.rows_y) / L.line_h);
     int64_t rel = int64_t(std::clamp(rel_f, 0.0f, float(L.full_rows)));
-    bool row_inside = rel_f >= 0.0f && rel_f <= float(L.full_rows) && top + uint64_t(rel) < L.total_rows;
+    const bool below = top + uint64_t(rel) >= L.total_rows;
+    bool row_inside = rel_f >= 0.0f && rel_f <= float(L.full_rows) && !below;
     uint64_t row = std::min(top + uint64_t(rel), L.total_rows - 1);
+    if (below) {
+        h.off = size;
+        h.text = L.ascii && p.x >= L.sep2_x;
+        return h;
+    }
 
     int col = 0;
     bool col_inside = false;
@@ -139,9 +164,9 @@ Hit hit_test(const Layout& L, ImVec2 p, uint64_t top, uint64_t size) {
         col = int(std::clamp(c, 0.0f, float(L.bpr - 1)));
         col_inside = p.x >= L.text_x && p.x < L.text_end_x;
     } else {
-        // Each byte owns [start - adv/2, next start - adv/2): the gaps go to the left byte.
+        // The gap between two bytes (one cell, or two at a group boundary) is split in the middle.
         for (int i = L.bpr - 1; i > 0; --i)
-            if (p.x >= L.hex_byte_x(i) - 0.5f * L.adv) {
+            if (p.x >= 0.5f * (L.hex_byte_x(i - 1) + 2.0f * L.adv + L.hex_byte_x(i))) {
                 col = i;
                 break;
             }
@@ -334,8 +359,8 @@ void fill_range(ImDrawList* dl, const Layout& L, uint64_t top, uint64_t draw_row
         else flags = ImDrawFlags_RoundCornersNone;
         float y0 = L.row_y(row, top) + 1.0f, y1 = y0 + L.line_h - 2.0f;
         if (hex) {
-            float x0 = L.hex_byte_x(a) - 0.5f * L.adv + 1.0f;
-            float x1 = L.hex_byte_x(b - 1) + 2.5f * L.adv - 1.0f;
+            float x0 = std::floor(L.hex_byte_x(a) - 0.5f * L.adv) + 1.0f;
+            float x1 = std::floor(L.hex_byte_x(b - 1) + 2.5f * L.adv) - 1.0f;
             dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), color, rounding, flags);
         }
         if (text && L.ascii)
@@ -353,6 +378,17 @@ void format_hex(char* out, uint64_t v, int digits, const char* hexchars) {
 }  // namespace
 
 // ---- HexView -----------------------------------------------------------------------------------
+
+ImVec2 HexView::cell_pos(uint64_t off, bool text, float fx) const {
+    const HexViewGeometry& g = geo_;
+    const uint64_t bpr = uint64_t(std::max(1, g.bpr));
+    const int col = int(off % bpr);
+    const uint64_t row = off / bpr;
+    const float y = g.rows_y + g.line_h * (float(int64_t(row) - int64_t(g.top_row)) + 0.5f);
+    if (text) return ImVec2(g.text_x + g.adv * (float(col) + fx), y);
+    const int cell = col * 3 + (g.group ? col / g.group : 0);
+    return ImVec2(g.hex_x + g.adv * (float(cell) + 2.0f * fx), y);
+}
 
 void HexView::request_scroll_to(uint64_t offset, bool center) {
     has_scroll_request_ = true;
@@ -424,6 +460,16 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     L.full_rows = std::max(1, int((L.inner_max.y - L.rows_y) / L.line_h));
     place_columns(L, ImGui::GetScrollX());
     set_row_counts(L, size);
+    geo_.valid = true;
+    geo_.hex_x = L.hex_x;
+    geo_.text_x = L.text_x;
+    geo_.adv = L.adv;
+    geo_.rows_y = L.rows_y;
+    geo_.line_h = L.line_h;
+    geo_.bpr = L.bpr;
+    geo_.group = L.group;
+    geo_.full_rows = L.full_rows;
+    geo_.ascii = L.ascii;
 
     // Keep the first visible byte stable when bytes/row changes (auto-fit while resizing).
     if (last_bpr_ > 0 && last_bpr_ != L.bpr) v.top_row = v.top_row * uint64_t(last_bpr_) / uint64_t(L.bpr);
@@ -584,14 +630,26 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             v.cursor = std::min(nr * bpr + col, size);
         };
         auto nav = [&](ImGuiKey key) { return ImGui::IsKeyPressed(key, true); };
+        // A plain move with a selection starts from the caret as drawn (inside the selection) and
+        // collapses it; Shift+moves keep the anchor and move the cursor boundary.
+        const uint64_t cb = caret_byte(v);
+        auto collapse = [&] {
+            if (!shift && v.has_selection()) {
+                v.cursor = v.anchor = cb;
+                v.low_nibble = false;
+            }
+        };
+        const uint64_t cb_row_start = cb - cb % bpr;
 
         if (!io.KeyAlt) {
             if (nav(ImGuiKey_LeftArrow)) {
+                collapse();
                 // On the low nibble, Left first goes back to the high nibble of the same byte.
                 if (shift || !v.low_nibble || v.ascii_focus) v.cursor -= v.cursor > 0 ? 1 : 0;
                 moved = true;
             }
             if (nav(ImGuiKey_RightArrow)) {
+                collapse();
                 v.cursor = std::min(v.cursor + 1, size);
                 moved = true;
             }
@@ -599,6 +657,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                 if (ctrl) {
                     v.top_row = scroll_rows(v.top_row, -1, L);  // scroll without moving the caret
                 } else {
+                    collapse();
                     move_rows(-1);
                     moved = true;
                 }
@@ -607,32 +666,35 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                 if (ctrl) {
                     v.top_row = scroll_rows(v.top_row, 1, L);
                 } else {
+                    collapse();
                     move_rows(1);
                     moved = true;
                 }
             }
             if (nav(ImGuiKey_PageUp)) {
+                collapse();
                 move_rows(-int64_t(L.full_rows));
                 v.top_row = scroll_rows(v.top_row, -int64_t(L.full_rows), L);
                 moved = true;
             }
             if (nav(ImGuiKey_PageDown)) {
+                collapse();
                 move_rows(L.full_rows);
                 v.top_row = scroll_rows(v.top_row, L.full_rows, L);
                 moved = true;
             }
             if (nav(ImGuiKey_Home)) {
-                v.cursor = ctrl ? 0 : v.cursor - v.cursor % bpr;
+                v.cursor = ctrl ? 0 : cb_row_start;  // row of the drawn caret
                 moved = true;
             }
             if (nav(ImGuiKey_End)) {
-                const uint64_t row_start = v.cursor - v.cursor % bpr;
                 if (ctrl)
                     v.cursor = size;
                 else if (shift)  // half-open selection: end after the row's last byte
-                    v.cursor = std::min(row_start + bpr, size);
+                    v.cursor = std::min(cb_row_start + bpr, size);
                 else             // caret on the row's last byte (stays put on an empty last row)
-                    v.cursor = row_start + bpr - 1 < size ? row_start + bpr - 1 : (size > row_start ? size - 1 : size);
+                    v.cursor = cb_row_start + bpr - 1 < size ? cb_row_start + bpr - 1
+                                                             : (size > cb_row_start ? size - 1 : size);
                 moved = true;
             }
         }
@@ -684,10 +746,10 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     v.cursor = std::min(v.cursor, size);
     v.anchor = std::min(v.anchor, size);
     if (keep_caret_visible) {
-        v.top_row = ensure_row_visible(v.top_row, v.cursor / uint64_t(L.bpr), L);
+        v.top_row = ensure_row_visible(v.top_row, caret_byte(v) / uint64_t(L.bpr), L);
         // Horizontal too, when a fixed-width row is wider than the view (applies next frame).
         if (ImGui::GetScrollMaxX() > 0.0f) {
-            const int col = int(v.cursor % uint64_t(L.bpr));
+            const int col = int(caret_byte(v) % uint64_t(L.bpr));
             const float cx = v.ascii_focus ? L.text_byte_x(col) : L.hex_byte_x(col);
             const float cw = v.ascii_focus ? L.adv : 2.0f * L.adv;
             const float x0 = L.inner_min.x + L.adv, x1 = L.data_x1 - L.adv;
@@ -696,9 +758,11 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         }
     }
     v.top_row = clamp_top(v.top_row, L);
+    geo_.top_row = v.top_row;
 
     // ---- 3. drawing ----------------------------------------------------------------------------
     const uint64_t top = v.top_row;
+    const uint64_t caret = caret_byte(v);  // the byte the caret is drawn on
     const uint64_t bpr = uint64_t(L.bpr);
     const uint64_t draw_rows = std::min(uint64_t(L.full_rows) + 1, L.total_rows - top);
     const uint64_t vis_begin = top * bpr;
@@ -720,7 +784,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     dl->PushClipRect(L.inner_min, ImVec2(L.data_x1, L.rows_y), true);
     {
         const float y = L.inner_min.y + L.text_dy;
-        const uint64_t cur_col = v.cursor % bpr;
+        const uint64_t cur_col = caret % bpr;
         dl->AddText(L.font, L.font_px, ImVec2(L.off_x, y), C.header_text, "Offset");
         TextRun run(dl, L, L.hex_x, y);
         for (int i = 0; i < L.bpr; ++i) {
@@ -761,10 +825,12 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     if (v.has_selection())
         fill_range(dl, L, top, draw_rows, v.sel_begin(), v.sel_end(), C.selection, rounding, true, true);
 
-    // Caret geometry.
-    const uint64_t cur_row = v.cursor / bpr;
+    // Caret geometry. With a selection the caret is an outline on the selection's active end byte
+    // (the selection fill stays visible); without one it is the solid nibble/char box.
+    const bool sel_caret = v.has_selection();
+    const uint64_t cur_row = caret / bpr;
     const bool caret_visible = cur_row >= top && cur_row < top + draw_rows;
-    const int cur_col = int(v.cursor % bpr);
+    const int cur_col = int(caret % bpr);
     ImVec2 caret_hex_min, caret_hex_max, caret_txt_min, caret_txt_max;
     if (caret_visible) {
         float y0 = L.row_y(cur_row, top) + 1.0f, y1 = y0 + L.line_h - 2.0f;
@@ -773,7 +839,9 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         caret_hex_max = ImVec2(hx0 + 2.0f * L.adv + 2.0f, y1);
         caret_txt_min = ImVec2(L.text_byte_x(cur_col), y0);
         caret_txt_max = ImVec2(L.text_byte_x(cur_col) + L.adv, y1);
-        if (focused && !v.ascii_focus) {
+        if (sel_caret) {
+            // outline drawn after the bytes
+        } else if (focused && !v.ascii_focus) {
             dl->AddRectFilled(caret_hex_min, caret_hex_max, with_alpha(C.cursor, 90), 2.0f);
             float nx = hx0 + (v.low_nibble ? L.adv : 0.0f);
             dl->AddRectFilled(ImVec2(nx - (v.low_nibble ? 0.0f : 2.0f), y0),
@@ -784,8 +852,8 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     }
 
     // Bytes: offsets, hex digits, text. Modified bytes are tinted when configured.
-    const bool caret_solid_hex = focused && !v.ascii_focus;
-    const bool caret_solid_txt = focused && v.ascii_focus;
+    const bool caret_solid_hex = focused && !v.ascii_focus && !sel_caret;
+    const bool caret_solid_txt = focused && v.ascii_focus && !sel_caret;
     const uint32_t on_caret = rgba(0xff, 0xff, 0xff);
     for (uint64_t k = 0; k < draw_rows; ++k) {
         const uint64_t row = top + k;
@@ -829,10 +897,17 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         }
     }
 
-    // Caret outlines: inactive column (or both when the view is not focused).
+    // Caret outlines: inactive column (or both when the view is not focused); with a selection the
+    // focused column gets a bright outline on the active end byte.
     if (caret_visible) {
-        if (!caret_solid_hex) dl->AddRect(caret_hex_min, caret_hex_max, C.cursor_inactive, 2.0f);
-        if (L.ascii && !caret_solid_txt) dl->AddRect(caret_txt_min, caret_txt_max, C.cursor_inactive, 2.0f);
+        const bool hex_active = sel_caret && focused && !v.ascii_focus;
+        const bool txt_active = sel_caret && focused && v.ascii_focus;
+        if (!caret_solid_hex)
+            dl->AddRect(caret_hex_min, caret_hex_max, hex_active ? C.cursor : C.cursor_inactive, 2.0f, 0,
+                        hex_active ? 2.0f : 1.0f);
+        if (L.ascii && !caret_solid_txt)
+            dl->AddRect(caret_txt_min, caret_txt_max, txt_active ? C.cursor : C.cursor_inactive, 2.0f, 0,
+                        txt_active ? 2.0f : 1.0f);
     }
 
     // Bookmark markers in the offset gutter.
@@ -871,9 +946,28 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         auto tick_y = [&](uint64_t row) {
             return track_y0 + float(double(track_h) * (double(row) / double(L.total_rows)));
         };
+        const float mid_x = std::floor((t0.x + t1.x) * 0.5f);
+        // Search hits (right half): one binary search per pixel row of the track, so a million
+        // hits cost no more than a few.
+        if (cfg.tick_offsets && !cfg.tick_offsets->empty() && track_h > 0.0f) {
+            const std::vector<uint64_t>& hits = *cfg.tick_offsets;
+            const uint32_t hc = cfg.tick_color ? cfg.tick_color : C.search_hit;
+            const int px = int(track_h);
+            for (int y = 0; y < px; ++y) {
+                const uint64_t r0 = uint64_t(double(y) / double(track_h) * double(L.total_rows));
+                const uint64_t r1 = uint64_t(double(y + 1) / double(track_h) * double(L.total_rows));
+                const uint64_t lo = r0 * bpr, hi = std::max(r1, r0 + 1) * bpr;
+                auto it = std::lower_bound(hits.begin(), hits.end(), lo);
+                if (it == hits.end()) break;
+                if (*it >= hi) continue;
+                const float yy = track_y0 + float(y);
+                dl->AddRectFilled(ImVec2(mid_x, yy), ImVec2(t1.x, yy + 2.0f), with_alpha(hc, 230));
+            }
+        }
+        // Bookmarks (left half, slightly taller).
         for (const Bookmark& bm : v.bookmarks) {
-            float y = tick_y(bm.offset / bpr);
-            dl->AddRectFilled(ImVec2(t0.x + 1.0f, y - 1.0f), ImVec2(t1.x, y + 1.0f), bm.color ? bm.color : C.bookmark);
+            float y = std::floor(tick_y(bm.offset / bpr));
+            dl->AddRectFilled(ImVec2(t0.x + 1.0f, y - 1.0f), ImVec2(mid_x, y + 2.0f), bm.color ? bm.color : C.bookmark);
         }
         if (L.max_top > 0) {
             float thumb_y, thumb_h;

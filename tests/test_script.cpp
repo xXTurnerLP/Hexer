@@ -9,6 +9,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/document.h"
@@ -660,6 +661,171 @@ TEST_CASE("doc:transaction labels: inside a command the innermost label names th
     CHECK(d->undo_stack().size() == 4);
 }
 
+// ---- hx.prompt -----------------------------------------------------------------------------------------
+
+namespace {
+const char* kAskScript = R"LUA(
+hx.command { name = 'ask', run = function(doc)
+    doc:write(0, 'A')
+    local v = hx.prompt('Value?', 'def', { hint = 'one letter' })
+    got = v == nil and 'cancelled' or v
+    if v then doc:write(1, v) end
+end }
+hx.command { name = 'other', run = function(doc) doc:write(2, 'O') end }
+hx.command { name = 'outer', run = function(doc) hx.run('ask') doc:write(2, '!') end }
+hx.command { name = 'twice', run = function(doc)
+    local a = hx.prompt('first')
+    local b = hx.prompt('second', a)
+    got = tostring(a) .. '+' .. tostring(b)
+end }
+hx.command { name = 'in transaction', run = function(doc)
+    doc:transaction(function() hx.prompt('nope') end)
+end }
+hx.command { name = 'nested coroutine', run = function(doc)
+    local ok, e = coroutine.resume(coroutine.create(function() return hx.prompt('nope') end))
+    got = tostring(ok) .. ' ' .. tostring(e)
+end }
+hx.command { name = 'yield', run = function(doc) coroutine.yield() end }
+hx.parser { name = 'asks', parse = function(p) hx.prompt('nope') end }
+)LUA";
+}  // namespace
+
+TEST_CASE("hx.prompt: the command waits for answer_prompt; edits around it are separate steps") {
+    Fixture fx;
+    fx.load(kAskScript);
+    Document* d = fx.host.add("xyz");
+    fx.eng.run_command("ask");
+    const ScriptEngine::PendingPrompt* pp = fx.eng.pending_prompt();
+    REQUIRE(pp);
+    CHECK(pp->title == "Value?");
+    CHECK(pp->default_text == "def");
+    CHECK(pp->hint == "one letter");
+    CHECK(pp->command == "ask");
+    CHECK(bytes_of(*d) == "Ayz");
+    CHECK(d->undo_stack().size() == 1);
+    CHECK(!d->in_group());  // no undo group stays open while the user types
+    CHECK(d->can_undo());
+
+    // Nothing else may start meanwhile (palette, hx.run from the console).
+    fx.eng.run_command("other");
+    CHECK(fx.console_has("Command 'other' not started: 'ask' is waiting for input", ConsoleLine::Error));
+    fx.eng.exec("hx.run('other')");
+    CHECK(bytes_of(*d) == "Ayz");
+    fx.eng.exec("1 + 1");  // the console still works
+    CHECK(fx.last_result() == "2");
+
+    std::string q = "Q";
+    fx.eng.answer_prompt(&q);
+    CHECK(!fx.eng.pending_prompt());
+    CHECK(bytes_of(*d) == "AQz");
+    REQUIRE(d->undo_stack().size() == 2);
+    CHECK(d->undo_stack().back().label == "Script: ask");
+    fx.eng.exec("got");
+    CHECK(fx.last_result() == "\"Q\"");
+    fx.eng.answer_prompt(&q);  // no prompt pending: no-op
+    CHECK(bytes_of(*d) == "AQz");
+
+    // Cancel: hx.prompt returns nil.
+    fx.eng.run_command("ask");
+    fx.eng.answer_prompt(nullptr);
+    fx.eng.exec("got");
+    CHECK(fx.last_result() == "\"cancelled\"");
+    CHECK(!fx.eng.pending_prompt());
+
+    // Prompting twice; the second default comes from the first answer.
+    fx.eng.run_command("twice");
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->default_text.empty());
+    std::string one = "1";
+    fx.eng.answer_prompt(&one);
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->title == "second");
+    CHECK(fx.eng.pending_prompt()->default_text == "1");
+    fx.eng.answer_prompt(nullptr);
+    fx.eng.exec("got");
+    CHECK(fx.last_result() == "\"1+nil\"");
+
+    // hx.run inside a command runs inline: the prompt suspends the whole chain.
+    fx.eng.run_command("outer");
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->command == "outer");
+    std::string z = "Z";
+    fx.eng.answer_prompt(&z);
+    CHECK(bytes_of(*d) == "AZ!");
+    CHECK(fx.errors() == 2);  // just the two refused starts
+}
+
+TEST_CASE("hx.prompt: only inside commands, never inside doc:transaction") {
+    Fixture fx;
+    fx.load(kAskScript);
+    Document* d = fx.host.add("xyz");
+    fx.eng.exec("hx.prompt('x')");
+    CHECK(fx.console_has("hx.prompt is only available inside commands", ConsoleLine::Error));
+    ParseResult r = fx.eng.parse(*d, "asks");
+    CHECK(r.error.find("hx.prompt is only available inside commands") != std::string::npos);
+    fx.eng.run_command("in transaction");
+    CHECK(fx.console_has("hx.prompt: cannot ask here", ConsoleLine::Error));
+    CHECK(!d->in_group());
+    fx.eng.run_command("nested coroutine");  // a script's own coroutine is not the command
+    fx.eng.exec("got");
+    CHECK(fx.last_result() == "\"false test.lua:19: hx.prompt is only available inside commands\"");
+    fx.eng.run_command("yield");
+    CHECK(fx.console_has("Command 'yield': coroutine.yield() outside a coroutine", ConsoleLine::Error));
+    CHECK(!fx.eng.pending_prompt());
+    fx.eng.run_command("other");  // nothing is left waiting
+    CHECK(bytes_of(*d) == "xyO");
+}
+
+TEST_CASE("hx.prompt: closed document, reload while pending, errors after the answer") {
+    Fixture fx;
+    fx.load(kAskScript + std::string("hx.command { name = 'boom', run = function() hx.prompt('x') error('after') end }"));
+    Document* d = fx.host.add("xyz");
+    fx.eng.run_command("ask");
+    fx.host.close(d);
+    std::string q = "Q";
+    fx.eng.answer_prompt(&q);
+    CHECK(fx.console_has("Command 'ask': ", ConsoleLine::Error));
+    CHECK(fx.console_has("document closed", ConsoleLine::Error));
+    CHECK(!fx.eng.pending_prompt());
+
+    fx.eng.run_command("boom");
+    fx.eng.answer_prompt(&q);
+    CHECK(fx.console_has("Command 'boom': ", ConsoleLine::Error));
+    CHECK(fx.console_has("after", ConsoleLine::Error));
+    CHECK(fx.console_has("stack traceback:", ConsoleLine::Error));
+
+    Document* e = fx.host.add("xyz");
+    fx.eng.run_command("ask");
+    REQUIRE(fx.eng.pending_prompt());
+    fx.eng.reload();
+    CHECK(!fx.eng.pending_prompt());
+    CHECK(fx.console_has("Command 'ask' cancelled: scripts reloaded", ConsoleLine::Warn));
+    fx.eng.answer_prompt(&q);  // no-op
+    CHECK(bytes_of(*e) == "Ayz");
+    CHECK(!e->in_group());
+    fx.eng.run_command("other");
+    CHECK(bytes_of(*e) == "AyO");
+}
+
+TEST_CASE("hx.prompt: the time limit applies per slice, not to the time spent in the dialog") {
+    Fixture fx;
+    fx.eng.set_script_time_limit_ms(400);
+    fx.load("local function spin(s) local t = os.clock() while os.clock() - t < s do end end\n"
+            "hx.command { name = 'slow', run = function() spin(0.25) hx.prompt('x') spin(0.25) done = true end }\n"
+            "hx.command { name = 'too slow', run = function() spin(0.25) spin(0.25) spin(1) end }");
+    fx.host.add("xyz");
+    fx.eng.run_command("slow");
+    REQUIRE(fx.eng.pending_prompt());
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::string a = "a";
+    fx.eng.answer_prompt(&a);
+    fx.eng.exec("done");
+    CHECK(fx.last_result() == "true");
+    CHECK(fx.errors() == 0);
+    fx.eng.run_command("too slow");
+    CHECK(fx.console_has("time limit exceeded (400 ms)", ConsoleLine::Error));
+}
+
 // ---- bundled example scripts -------------------------------------------------------------------------
 
 struct Examples : Fixture {
@@ -733,6 +899,11 @@ TEST_CASE("examples: HXP build, parse, patch, undo") {
     std::string before = bytes_of(*d);
     d->view().cursor = d->view().anchor = 7;  // inside the first record of packet 0
     fx.eng.run_command("HXP: append TLV record at cursor");
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->title == "NAME record text");
+    std::string text = fx.eng.pending_prompt()->default_text;
+    CHECK(text == "added by hexer");
+    fx.eng.answer_prompt(&text);
     CHECK(fx.errors() == 0);
     ParseResult r2 = fx.eng.parse(*d, "HXP packet");
     REQUIRE(r2.error.empty());
@@ -783,12 +954,18 @@ TEST_CASE("examples: selection commands") {
     fx.eng.run_command("Selection: print as C array");
     CHECK(fx.console_has("0x31, 0x32, 0x33"));
     fx.eng.run_command("Selection: XOR with key");
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->default_text == "FF");
+    std::string key = fx.eng.pending_prompt()->default_text;  // OK on the default
+    fx.eng.answer_prompt(&key);
+    CHECK(!fx.eng.pending_prompt());
     CHECK(bytes_of(*d)[0] == char(0x31 ^ 0xFF));
     CHECK(bytes_of(*d)[8] == char(0x39 ^ 0xFF));
     d->undo();
     CHECK(bytes_of(*d) == "123456789");
-    fx.eng.exec("hx_xor_key = 'ab'");
     fx.eng.run_command("Selection: XOR with key");
+    key = "'ab'";
+    fx.eng.answer_prompt(&key);
     CHECK(bytes_of(*d)[0] == char('1' ^ 'a'));
     CHECK(bytes_of(*d)[1] == char('2' ^ 'b'));
     CHECK(fx.errors() == 0);
@@ -804,6 +981,68 @@ TEST_CASE("examples: selection commands") {
     CHECK(hs->items[0].length == 20);
     CHECK(hs->items[1].offset == 40);
     CHECK(hs->items[1].length == 16);
+}
+
+TEST_CASE("examples: XOR with key prompts, remembers the key, is one undo step") {
+    Examples fx;
+    std::string orig;
+    for (int i = 0; i < 300000; ++i) orig += char((i * 7 + i / 251) & 0xFF);
+    Document* d = fx.host.add(orig);
+    auto ref = [&](uint64_t start, uint64_t len, const std::string& key) {
+        std::string s = orig;
+        for (uint64_t i = 0; i < len; ++i)
+            s[size_t(start + i)] = char(s[size_t(start + i)] ^ key[size_t(i % key.size())]);
+        return s;
+    };
+    auto run = [&](uint64_t start, uint64_t len, const std::string& answer) {
+        d->view().anchor = start;
+        d->view().cursor = start + len;
+        fx.eng.run_command("Selection: XOR with key");
+        REQUIRE(fx.eng.pending_prompt());
+        fx.eng.answer_prompt(&answer);
+        CHECK(!fx.eng.pending_prompt());
+    };
+    size_t steps = d->undo_stack().size();
+    run(3, 19, "DE AD BE EF");  // multi-byte key; 19 bytes = 2 words + a tail
+    CHECK(bytes_of(*d) == ref(3, 19, "\xDE\xAD\xBE\xEF"));
+    REQUIRE(d->undo_stack().size() == steps + 1);
+    CHECK(d->undo_stack().back().label == "XOR selection");
+    d->undo();
+    CHECK(bytes_of(*d) == orig);
+
+    // The last key is the next default.
+    d->view().anchor = 0;
+    d->view().cursor = 1;
+    fx.eng.run_command("Selection: XOR with key");
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->default_text == "DE AD BE EF");
+    CHECK(fx.eng.pending_prompt()->hint.find("quotes") != std::string::npos);
+    fx.eng.answer_prompt(nullptr);  // cancel: nothing changes
+    CHECK(bytes_of(*d) == orig);
+
+    // Odd key lengths across chunk boundaries (the key stream repeats every lcm(len, 8) bytes).
+    run(5, 299990, "\"abcde\"");
+    CHECK(bytes_of(*d) == ref(5, 299990, "abcde"));
+    d->undo();
+    run(1, 200001, "0x01,0x02,0x03");
+    CHECK(bytes_of(*d) == ref(1, 200001, "\x01\x02\x03"));
+    d->undo();
+    run(0, 7, "FF");
+    CHECK(bytes_of(*d) == ref(0, 7, "\xFF"));
+    d->undo();
+    CHECK(bytes_of(*d) == orig);
+    CHECK(fx.errors() == 0);
+
+    // Bad keys and empty selections are refused with a message.
+    run(0, 4, "XYZ");
+    CHECK(fx.console_has("XOR: not hex bytes or a quoted text: XYZ", ConsoleLine::Error));
+    run(0, 4, "\"\"");
+    CHECK(fx.console_has("XOR: the key is empty", ConsoleLine::Error));
+    CHECK(bytes_of(*d) == orig);
+    d->view().anchor = d->view().cursor = 0;
+    fx.eng.run_command("Selection: XOR with key");
+    CHECK(!fx.eng.pending_prompt());
+    CHECK(fx.console_has("select some bytes first", ConsoleLine::Warn));
 }
 
 // ---- bundled examples on realistic inputs ------------------------------------------------------------
@@ -1171,11 +1410,15 @@ TEST_CASE("examples: HXP packets built by the serializer command parse into a fu
     CHECK(fld(r, "packet[0].payload.record[0].device_id").color == cyan);  // per-tag struct color
 
     // Serializer + parser together: append records to both packets, everything stays consistent.
-    fx.eng.exec("hxp_record_text = 'kitchen'");
+    std::string kitchen = "kitchen";
     d->view().cursor = d->view().anchor = 49;  // inside the last record of packet[1]: append at its end
     fx.eng.run_command("HXP: append TLV record at cursor");
+    fx.eng.answer_prompt(&kitchen);
     d->view().cursor = d->view().anchor = 0;
     fx.eng.run_command("HXP: append TLV record at cursor");
+    REQUIRE(fx.eng.pending_prompt());
+    CHECK(fx.eng.pending_prompt()->default_text == "kitchen");  // the last text is the default
+    fx.eng.answer_prompt(&kitchen);
     CHECK(fx.errors() == 0);
     ParseResult r2 = fx.eng.parse(*d, "HXP packet");
     INFO(tree_dump(r2));

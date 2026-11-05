@@ -154,11 +154,12 @@ struct MsgBox {
 struct PaletteItem {
     std::string label;
     std::string hint;                 // shortcut text shown right-aligned
-    int kind = 0;                     // 0 action, 1 script command, 2 parser, 3 recent file
-    int index = 0;                    // action index
+    int kind = 0;                     // 0 action, 1 script command, 2 parser, 3 recent file, 4 bookmark
+    int index = 0;                    // action index / bookmark index
     std::string arg;                  // command / parser name / path
     bool enabled = true;
     int score = 0;
+    uint64_t doc = 0;                 // bookmark: document id
 };
 
 struct App final : ScriptHost {
@@ -189,6 +190,9 @@ struct App final : ScriptHost {
     // Panels / layout.
     bool show_inspector = true, show_structure = true, show_console = true, show_results = true,
          show_bookmarks = true;
+    bool show_settings = false;       // Settings window (Edit > Settings..., Ctrl+,)
+    bool bm_all_files = false;        // Bookmarks panel lists every open file
+    bool focus_bookmarks = false;     // bring the Bookmarks panel to the front next frame
     bool build_layout = false;        // (re)build the default dock layout this frame
     int layout_focus_step = 0;        // after a layout build: front the Console tab, then the Editor
     bool focus_results = false;
@@ -199,7 +203,7 @@ struct App final : ScriptHost {
 
     // Popup requests (opened at the root ID stack in draw_popups()).
     bool req_goto = false, req_palette = false, req_fill = false, req_copy_as = false,
-         req_about = false;
+         req_about = false, req_bookmark_jump = false;
     uint64_t close_prompt_doc = 0;    // doc id awaiting Save/Discard/Cancel
     bool close_prompt_pending = false;
     uint64_t reload_prompt_doc = 0;   // doc id awaiting "Reload from disk and discard edits?"
@@ -222,6 +226,9 @@ struct App final : ScriptHost {
     std::vector<PaletteItem> palette_all, palette_view;
     int palette_sel = 0;
     bool palette_scroll = false;
+    bool palette_bookmarks = false;   // the palette lists bookmarks of all open files (Ctrl+Shift+B)
+    // hx.prompt modal (a script command waits for an answer).
+    std::string prompt_buf;
 
     // Console.
     std::string console_input;

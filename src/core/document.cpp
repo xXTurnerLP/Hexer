@@ -1,6 +1,7 @@
 #include "core/document.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace hx {
@@ -8,6 +9,18 @@ namespace hx {
 namespace {
 
 std::atomic<uint64_t> g_next_doc_id{1};
+
+// App-wide policies (Document::set_undo_merge / set_backup_policy).
+std::atomic<int> g_merge_ms{500};
+std::atomic<uint64_t> g_merge_max_bytes{32};
+std::atomic<bool> g_backup_enabled{true};
+std::atomic<uint64_t> g_backup_max_bytes{4ull << 30};
+
+int64_t steady_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+std::atomic<int64_t (*)()> g_clock{&steady_ms};
 
 constexpr size_t kSaveBlock = 4u << 20;              // streaming block for rewrite saves
 constexpr size_t kPreserveBlock = 1u << 20;          // in-place save: copy old bytes in 1 MiB pieces
@@ -184,6 +197,38 @@ uint64_t pieces_size(const std::vector<Piece>& ps) {
     return n;
 }
 
+std::string backup_path_for(const std::string& real) { return real + ".backup"; }
+
+// In-place save: copies `real` to "<real>.backup" through "<real>.backup.tmp" (so an interrupted
+// copy never replaces a good backup). Progress counts from 0; cancel aborts cleanly.
+bool copy_backup(const std::string& real, Progress* progress, std::string* err) {
+    if (progress && progress->cancel) return fail(err, "Save cancelled");
+    const std::string bak = backup_path_for(real), tmp = bak + ".tmp";
+    auto cb = [&](uint64_t done, uint64_t) {
+        if (!progress) return true;
+        progress->done = done;
+        return !progress->cancel.load();
+    };
+    std::string e;
+    bool cancelled = false;
+    if (!os_copy_file(real, tmp, cb, &e, &cancelled)) {
+        os_remove(tmp);
+        if (cancelled) return fail(err, "Save cancelled");
+        return fail(err, "Cannot back up the original to " + bak + " (" + e + "); nothing was changed");
+    }
+    if (progress && progress->cancel) {  // cancelled during the final flush
+        os_remove(tmp);
+        return fail(err, "Save cancelled");
+    }
+    if (!os_replace_file(tmp, bak, &e)) {
+        os_remove(tmp);
+        return fail(err, "Cannot create " + bak + " (" + e + "); nothing was changed");
+    }
+    return true;
+}
+
+std::string mib(uint64_t n) { return std::to_string((n + (1u << 20) - 1) >> 20) + " MiB"; }
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -359,6 +404,18 @@ bool Document::is_modified_range(uint64_t offset, uint64_t len) const {
 // ---------------------------------------------------------------------------------------------
 bool Document::editable() const { return !busy_.load() && !read_only_; }
 
+void Document::set_undo_merge(int ms, uint64_t max_bytes) {
+    g_merge_ms = std::max(ms, 0);
+    g_merge_max_bytes = max_bytes;
+}
+
+void Document::set_clock_for_tests(int64_t (*now_ms)()) { g_clock = now_ms ? now_ms : &steady_ms; }
+
+void Document::set_backup_policy(bool enabled, uint64_t max_bytes) {
+    g_backup_enabled = enabled;
+    g_backup_max_bytes = max_bytes;
+}
+
 UndoEntry Document::capture() const {
     UndoEntry e;
     e.pieces = table_.pieces();
@@ -401,10 +458,18 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, 
         group_pushed_ = true;
         return;
     }
+    const int64_t now = coalesce ? g_clock.load()() : 0;
     if (coalesce && coalesce_open_ && !undo_.empty()) {
         UndoEntry& top = undo_.back();
-        if (edit_begin >= top.coalesce_begin && edit_begin <= top.coalesce_end) {
+        const int ms = g_merge_ms.load();
+        const uint64_t cap = g_merge_max_bytes.load();
+        const bool continues = edit_begin >= top.coalesce_begin && edit_begin <= top.coalesce_end;
+        const bool recent = ms <= 0 || now - coalesce_last_ms_ <= ms;
+        // A full run only refuses edits that would grow it (the low nibble of its last byte merges).
+        const bool full = cap && edit_end > top.coalesce_end && top.coalesce_end - top.coalesce_begin >= cap;
+        if (continues && recent && !full) {
             top.coalesce_end = std::max(top.coalesce_end, edit_end);
+            coalesce_last_ms_ = now;
             return;
         }
     }
@@ -413,6 +478,7 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, 
     if (coalesce) {
         e.coalesce_begin = edit_begin;
         e.coalesce_end = edit_end;
+        coalesce_last_ms_ = now;
     }
     coalesce_open_ = coalesce;
     push_entry(undo_, std::move(e));
@@ -709,6 +775,7 @@ bool Document::save(Progress* progress, std::string* err, bool force) {
     BusyGuard guard{busy_};
 
     std::unique_lock<std::mutex> lk(mu_);
+    last_save_ = {};
     if (path_.empty()) return fail(err, "Untitled document: use Save As");
     if (read_only_) return fail(err, "Document is read-only");
     if (progress) {
@@ -749,6 +816,32 @@ bool Document::save(Progress* progress, std::string* err, bool force) {
                    : save_rewrite(path, true, *snap, progress, err);
 }
 
+SaveInfo Document::last_save_info() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return last_save_;
+}
+
+bool Document::need_backup_locked(const std::string& real, const FileStat& st, bool copy) {
+    if (!g_backup_enabled.load() || !st.exists || st.is_dir) return false;
+    if (std::find(backup_done_.begin(), backup_done_.end(), real) != backup_done_.end()) return false;
+    const uint64_t limit = g_backup_max_bytes.load();
+    std::string why;
+    if (st.is_device)
+        why = "No backup is made when saving to a device.";
+    else if (copy && limit && st.size > limit)
+        why = "No backup made: " + path_filename(real) + " (" + mib(st.size) + ") is larger than the backup size limit (" +
+              mib(limit) + ").";
+    if (why.empty()) return true;
+    backup_done_locked(real);  // reported once; later saves would not back up the original anyway
+    last_save_.backup_skipped = true;
+    last_save_.note = why;
+    return false;
+}
+
+void Document::backup_done_locked(const std::string& real) {
+    if (std::find(backup_done_.begin(), backup_done_.end(), real) == backup_done_.end()) backup_done_.push_back(real);
+}
+
 bool Document::save_as(const std::string& path, Progress* progress, std::string* err) {
     std::string target = os_absolute_path(path);
     if (target.empty()) return fail(err, "No file name given");
@@ -767,6 +860,7 @@ bool Document::save_as(const std::string& path, Progress* progress, std::string*
     std::shared_ptr<Snapshot> snap;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        last_save_ = {};
         snap = make_snapshot();
     }
     if (progress) {
@@ -785,11 +879,6 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
         if (snap.pieces[i].src == Piece::Add) w.push_back({snap.starts[i], snap.pieces[i].len});
     merge_ranges(w);
 
-    std::string e;
-    auto out = OsFile::open(path, OsFile::Mode::ReadWrite, &e);
-    if (!out) return fail(err, "Cannot open " + path + " for writing: " + e);
-    if (out->size() != src->size()) return fail(err, "File size changed on disk; save aborted");
-
     // History states are only touched by this thread while busy, so copies are consistent.
     std::vector<UndoEntry> undo, redo;
     {
@@ -807,13 +896,37 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
     for (const Range& r : need) need_bytes += r.len;
     for (const Range& r : w) write_bytes += r.len;
     bool trim = need_bytes > kMaxPreserve;
-    if (progress) progress->total = (trim ? 0 : need_bytes) + write_bytes;
+
+    const std::string real = os_resolve_symlinks(path);
+    FileStat disk = os_stat(path);
+    if (src->stat_at_open().is_device) disk.is_device = true;
+    bool backup;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        backup = need_backup_locked(real, disk, true);
+    }
+    const uint64_t backup_bytes = backup ? disk.size : 0;
+    if (progress) progress->total = backup_bytes + (trim ? 0 : need_bytes) + write_bytes;
+    // Before opening the file for writing (CopyFileExW does not share it with a writer).
+    if (backup) {
+        if (!copy_backup(real, progress, err)) return false;
+        if (progress) progress->done = backup_bytes;
+        std::lock_guard<std::mutex> lk(mu_);
+        backup_done_locked(real);
+        last_save_.backup_created = true;
+        last_save_.backup_path = backup_path_for(real);
+    }
+
+    std::string e;
+    auto out = OsFile::open(path, OsFile::Mode::ReadWrite, &e);
+    if (!out) return fail(err, "Cannot open " + path + " for writing: " + e);
+    if (out->size() != src->size()) return fail(err, "File size changed on disk; save aborted");
 
     bool history_changed = false;
     if (!trim) {
         std::vector<Preserved> map;
         std::vector<uint8_t> buf(kPreserveBlock);
-        uint64_t done = 0;
+        uint64_t done = backup_bytes;
         for (const Range& r : need) {
             for (uint64_t o = r.off; o < r.end();) {
                 if (progress && progress->cancel) return fail(err, "Save cancelled");
@@ -936,18 +1049,48 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
             return fail(err, why);
         }
     }
-    if (os_stat(real).exists) os_copy_permissions(real, tmp);
+    const FileStat real_st = os_stat(real);
+    if (real_st.exists) os_copy_permissions(real, tmp);
 
     std::shared_ptr<FileSource> old_cur;
+    bool backup;
     {
         std::lock_guard<std::mutex> lk(mu_);
         old_cur = sources_.back();
+        backup = need_backup_locked(real, real_st, false);
     }
     // Point of no return: the rename replaces the target; cancel is no longer checked.
     CommitGuard commit{progress};
     commit.begin();
     std::string rerr;
-    if (!os_replace_file(tmp, real, &rerr)) {
+    const std::string bak = backup_path_for(real);
+    bool replaced = false;
+    if (backup) {
+        // Keep the previous version as .backup. Preferred: give it that second name (hard link,
+        // atomically replacing an older .backup); the replace below then swaps the target in one
+        // step, so it is never missing. Without hard links (FAT, some shares): rename it away
+        // first, then move the new file into place (rolled back if that fails).
+        const std::string link = bak + ".tmp";
+        os_remove(link);
+        if (!(os_hard_link(real, link) && os_replace_file(link, bak))) {
+            os_remove(link);
+            if (!os_replace_file(real, bak, &rerr)) {
+                os_remove(tmp);
+                return fail(err, "Cannot keep the original as " + bak + " (" + rerr +
+                                     "); nothing was changed. Turn off backups in Settings to save without one.");
+            }
+            if (!os_replace_file(tmp, real, &rerr)) {
+                std::string e2;
+                const bool restored = os_replace_file(bak, real, &e2);
+                if (restored) os_remove(tmp);
+                return fail(err, "Cannot replace " + target + ": " + rerr +
+                                     (restored ? std::string("; nothing was changed")
+                                               : "; the original is now " + bak + " and the new contents " + tmp));
+            }
+            replaced = true;
+        }
+    }
+    if (!replaced && !os_replace_file(tmp, real, &rerr)) {
         // Some filesystems cannot replace a file we still hold open: release ours and retry.
         bool ok = false;
         if (same_file && old_cur) {
@@ -959,6 +1102,16 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
             os_remove(tmp);
             return fail(err, "Cannot replace " + target + ": " + rerr);
         }
+    }
+    if (backup) {
+        std::lock_guard<std::mutex> lk(mu_);
+        backup_done_locked(real);
+        last_save_.backup_created = true;
+        last_save_.backup_path = bak;
+    }
+    if (!real_st.exists) {
+        std::lock_guard<std::mutex> lk(mu_);
+        backup_done_locked(real);  // we created this file: there is no original to keep
     }
 
     std::string oerr;
@@ -1077,6 +1230,7 @@ PersistedDoc Document::persist() const {
     d.view = view_;
     d.read_only = read_only_;
     d.dirty = state_id_ != saved_state_id_;
+    d.backup_done = backup_done_;
 
     const uint32_t cur = current_source();
     const bool has_src = sources_.back() != nullptr;
@@ -1175,6 +1329,7 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
     d->display_name_ = st.path.empty() ? st.display_name : std::string();
     d->read_only_ = st.read_only;
     d->view_ = st.view;
+    d->backup_done_ = st.backup_done;
     for (const auto& c : st.add_chunks) d->add_.push_chunk(c.data(), c.size());
 
     bool has_original = false;

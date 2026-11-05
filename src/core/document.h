@@ -69,6 +69,7 @@ struct Bookmark {
     uint64_t length = 1;
     std::string name;
     uint32_t color = 0;  // 0 = default
+    std::string note;    // free text shown in the Bookmarks panel ("" = none)
 };
 
 // Per-document UI state; persisted by the session so tabs reopen exactly where you left them.
@@ -97,7 +98,8 @@ struct UndoEntry {
     uint64_t state_id = 0;
     // Typing-run coalescing: an edit with coalesce=true merges into this entry when it is still the
     // top of the undo stack, nothing else happened since, and the edit starts inside
-    // [coalesce_begin, coalesce_end] (so "insert nibble, then overwrite same byte" is one step).
+    // [coalesce_begin, coalesce_end] (so "insert nibble, then overwrite same byte" is one step),
+    // within the time / size limits of Document::set_undo_merge().
     uint64_t coalesce_begin = UINT64_MAX;
     uint64_t coalesce_end = UINT64_MAX;
     std::string label;                   // "Typing", "Paste", "Fill", "Add bookmark", "Script: ..."
@@ -117,6 +119,9 @@ struct PersistedDoc {
     // persist() could not export the unsaved current state (it referenced too many bytes of an
     // older file version) and exported the last saved state instead.
     bool edits_dropped = false;
+    // Targets this document already backed up (or created) on its first save: a restored tab does
+    // not replace "<file>.backup" (the original) again.
+    std::vector<std::string> backup_done;
 };
 
 struct Progress {
@@ -130,6 +135,14 @@ struct Progress {
         uint64_t t = total.load();
         return t ? double(done.load()) / double(t) : 0.0;
     }
+};
+
+// What the last save()/save_as() did about the "<target>.backup" copy of the previous file.
+struct SaveInfo {
+    bool backup_created = false;  // the previous on-disk contents are now at backup_path
+    bool backup_skipped = false;  // a backup was due but not made (device, size limit); see note
+    std::string backup_path;      // "<target>.backup" when created
+    std::string note;             // human-readable reason when skipped
 };
 
 class Document {
@@ -197,6 +210,15 @@ public:
     const std::vector<UndoEntry>& redo_stack() const { return redo_; }
     static constexpr size_t kMaxUndo = 10000;
 
+    // Typing-run limits (app-wide; the app sets them from Settings). A coalesced edit starts a new
+    // undo step when the previous one of the run was more than `ms` ago, or when it would grow a
+    // run that already covers `max_bytes` bytes (edits inside the run's bytes, e.g. the low nibble
+    // of its last byte, still merge). 0 = no limit. Defaults: 500 ms, 32 bytes.
+    static void set_undo_merge(int ms, uint64_t max_bytes);
+    // Test hook: monotonic clock in milliseconds used by typing-run coalescing; null restores
+    // std::chrono::steady_clock.
+    static void set_clock_for_tests(int64_t (*now_ms)());
+
     // ---- state -------------------------------------------------------------------------------
     bool dirty() const;                // differs from the last saved/opened state
     uint64_t generation() const { return generation_; }  // bumps on every content change (incl. undo)
@@ -224,8 +246,25 @@ public:
     // of both versions. `force` saves anyway (our edits on top of the current disk contents).
     // If the file was replaced (other inode), the rewrite path streams from the still-open old
     // version. Devices (block devices, raw Windows disks) only accept in-place saves.
+    //
+    // Backup on first save: the first time this Document (also across hot-exit restarts) writes
+    // over an existing file (per target path: save_as onto another existing file backs that one
+    // up too), the previous on-disk contents are kept as "<target>.backup" (replacing an older one):
+    //   * rewrite: the current file gets the second name .backup (hard link), then the new one is
+    //     renamed over the target as usual (atomic; no copy; our open handle keeps reading the old
+    //     version, so history still works). Without hard links the current file is renamed to
+    //     .backup first and the new one moved into place; if that fails the first is rolled back.
+    //   * in-place: the file is first copied to ".backup.tmp" with the fastest OS copy (reflink /
+    //     copy_file_range / CopyFileExW), then renamed to .backup. The copy counts toward progress
+    //     and can be cancelled (nothing is changed then). Files above the size limit are skipped.
+    //   * devices are never backed up; targets this document created itself are not either.
+    // A failed backup aborts the save before the file is touched. last_save_info() reports it.
     bool save(Progress* progress, std::string* err, bool force = false);
     bool save_as(const std::string& path, Progress* progress, std::string* err);
+    SaveInfo last_save_info() const;  // of the last save()/save_as() call (thread-safe)
+    // App-wide backup policy (the app sets it from Settings; thread-safe). max_bytes limits the
+    // in-place backup copy (0 = no limit). Defaults: enabled, 4 GiB.
+    static void set_backup_policy(bool enabled, uint64_t max_bytes);
 
     // ---- external change detection -----------------------------------------------------------
     // True if the file on disk no longer matches what we opened (size or mtime changed).
@@ -286,6 +325,10 @@ private:
                       const Snapshot& snap, Progress* progress, std::string* err);
     bool save_rewrite(const std::string& target, bool same_file, const Snapshot& snap,
                       Progress* progress, std::string* err);
+    // True if this save must first keep `real` (stat `st`) as "<real>.backup"; records skips in
+    // last_save_. `copy`: the backup would be a copy (size limit applies).
+    bool need_backup_locked(const std::string& real, const FileStat& st, bool copy);
+    void backup_done_locked(const std::string& real);
 
     // Guards table_, add_, sources_, undo_/redo_ (+ pending), path_, display_name_, state ids and
     // disk_stat_ against the save worker. The UI thread takes it in every public method that
@@ -293,6 +336,9 @@ private:
     mutable std::mutex mu_;
     std::string group_label_;
     bool coalesce_open_ = false;          // top undo entry is an open typing run
+    int64_t coalesce_last_ms_ = 0;        // clock time of the run's latest edit
+    std::vector<std::string> backup_done_;  // targets already backed up (or created) by this doc
+    SaveInfo last_save_;
     uint64_t next_state_id_ = 1;
     FileStat disk_stat_;                  // stat of the current file version as we last wrote/opened it
     std::vector<UndoEntry> pend_undo_, pend_redo_;  // history rewritten by a save, not yet installed

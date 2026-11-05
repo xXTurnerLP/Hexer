@@ -1,6 +1,7 @@
 #pragma once
 // Dark theme, fonts and the hex-view color palette.
 #include <cstdint>
+#include <string>
 
 struct ImFont;
 
@@ -9,11 +10,21 @@ namespace hx {
 struct Fonts {
     ImFont* ui = nullptr;    // proportional UI font (Segoe UI / DejaVu Sans / Inter..., fallback default)
     ImFont* mono = nullptr;  // monospace (Cascadia Mono / Consolas / JetBrains Mono / DejaVu Sans Mono..., fallback default)
+    bool freetype = false;   // rasterised by FreeType (hinted); false = stb_truetype fallback
+    std::string ui_path, mono_path;  // files actually loaded ("" = ImGui's built-in font)
 };
 
-// Must be called after ImGui::CreateContext() and before the first frame. Searches common system
-// font paths on Windows and Linux; falls back to ImGui's built-in font if none found.
-Fonts load_fonts(float ui_size_px, float mono_size_px);
+struct FontOptions {
+    std::string ui_path, mono_path;  // font files; "" = auto-detect from the system font dirs
+    std::string hinting = "normal";  // FreeType hinting: "none" | "light" | "normal" | "mono"
+};
+
+// Must be called after ImGui::CreateContext() and before the first frame. Uses FreeType (hinted,
+// crisp at small sizes) and falls back to stb_truetype if FreeType cannot load the font. Missing or
+// unreadable option paths fall back to auto-detection (common system font paths on Windows and
+// Linux), then to ImGui's built-in font. The mono font's advances are snapped to whole pixels so
+// cell-based layouts (hex view) land every glyph on the pixel grid.
+Fonts load_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt = {});
 void apply_dark_theme(float ui_scale);
 
 // Colors used by the hex view (packed IM_COL32 / core rgba()).

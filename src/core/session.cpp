@@ -13,7 +13,9 @@ namespace hx {
 namespace {
 
 constexpr char kMagic[4] = {'H', 'X', 'S', '1'};
-constexpr uint32_t kVersion = 1;
+// 2: bookmarks carry a note; edits_dropped is always written, then the backed-up targets.
+// Version 1 files are still read.
+constexpr uint32_t kVersion = 2;
 constexpr const char* kIndexFile = "session.ini";
 
 uint32_t crc32(const uint8_t* p, size_t n) {
@@ -64,6 +66,7 @@ struct Writer {
             u64(bm.length);
             str(bm.name);
             u32(bm.color);
+            str(bm.note);
         }
     }
     void entries(const std::vector<UndoEntry>& es) {
@@ -86,6 +89,7 @@ struct Reader {
     size_t n;
     size_t pos = 0;
     bool ok = true;
+    uint32_t version = kVersion;  // format version of the file being read
 
     bool need(size_t k) {
         if (!ok || n - pos < k) ok = false;
@@ -141,6 +145,7 @@ struct Reader {
             b.length = u64();
             b.name = str();
             b.color = u32();
+            if (version >= 2) b.note = str();
         }
         return bs;
     }
@@ -188,7 +193,9 @@ std::string serialize(const PersistedDoc& d) {
     w.bookmarks(d.view.bookmarks);
     w.u8(d.dirty);
     w.u8(d.read_only);
-    if (d.edits_dropped) w.u8(1);  // optional trailing flag (absent in older files)
+    w.u8(d.edits_dropped);
+    w.u32(uint32_t(d.backup_done.size()));
+    for (const std::string& b : d.backup_done) w.str(b);
     w.u32(crc32(reinterpret_cast<const uint8_t*>(w.b.data()), w.b.size()));
     return std::move(w.b);
 }
@@ -205,7 +212,8 @@ Parse deserialize(const std::string& data, PersistedDoc& d) {
 
     Reader r{p, body};
     r.pos = 4;
-    if (r.u32() != kVersion) return Parse::Unsupported;
+    r.version = r.u32();
+    if (r.version < 1 || r.version > kVersion) return Parse::Unsupported;
     d.path = r.str();
     d.display_name = r.str();
     d.file_stat.exists = r.u8() != 0;
@@ -232,7 +240,13 @@ Parse deserialize(const std::string& data, PersistedDoc& d) {
     d.view.bookmarks = r.bookmarks();
     d.dirty = r.u8() != 0;
     d.read_only = r.u8() != 0;
-    if (r.ok && r.pos < body) d.edits_dropped = r.u8() != 0;
+    if (r.version >= 2) {
+        d.edits_dropped = r.u8() != 0;
+        d.backup_done.resize(r.count(4));
+        for (std::string& b : d.backup_done) b = r.str();
+    } else if (r.ok && r.pos < body) {
+        d.edits_dropped = r.u8() != 0;  // v1: optional trailing flag
+    }
     return r.ok && r.pos == body ? Parse::Ok : Parse::Unsupported;
 }
 

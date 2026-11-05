@@ -32,6 +32,10 @@ threads_dep = dependency('threads')
 lua_dep     = dependency('lua', fallback : ['lua', 'lua_dep'])
 glfw_dep    = dependency('glfw3')
 imgui_dep   = dependency('imgui-docking')
+# FreeType (hinted font rasteriser) only reads plain TTF/OTF files here: no optional codecs.
+# Its own sources are third-party code: build them without warnings when it is a subproject.
+freetype_dep = dependency('freetype2', default_options : ['png=disabled', 'zlib=disabled',
+  'bzip2=disabled', 'brotli=disabled', 'harfbuzz=disabled', 'tests=disabled', 'warning_level=0'])
 nfd_dep     = dependency('nativefiledialog-extended')
 doctest_dep = dependency('doctest', required : get_option('tests'))
 

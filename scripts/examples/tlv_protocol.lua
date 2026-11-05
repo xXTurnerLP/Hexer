@@ -220,8 +220,8 @@ local function packet_at(doc, off)
     return nil
 end
 
--- Text of the record appended by the command below. Change it from the console, e.g.
---   hxp_record_text = "kitchen"
+-- Text of the record appended by the command below: it asks for it (hx.prompt), with the last
+-- text as the default.
 hxp_record_text = hxp_record_text or "added by hexer"
 
 hx.command {
@@ -242,7 +242,11 @@ hx.command {
         end
         at = math.min(at, stop)
 
-        local rec = record("NAME", hxp_record_text)
+        local text = hx.prompt("NAME record text", hxp_record_text,
+            { hint = string.format("Inserted at 0x%X into the packet at 0x%X", at, pkt) })
+        if not text then return end                  -- cancelled
+        hxp_record_text = text
+        local rec = record("NAME", text)
         if len + #rec > 0xFFFF then return hx.error("packet would exceed 65535 payload bytes") end
 
         -- All three edits become ONE undo step (Ctrl+Z reverts the whole patch). A command already is

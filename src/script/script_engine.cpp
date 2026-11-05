@@ -182,9 +182,22 @@ bool parse_char_literal(const std::string& text, std::string& out) {
 
 // ---- Impl ---------------------------------------------------------------------------------------
 
+void ScriptEngine::Impl::drop_waiting() {
+    if (L && waiting_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, waiting_ref);
+    waiting = false;
+    waiting_ref = LUA_NOREF;
+    waiting_co = nullptr;
+    waiting_doc = 0;
+    prompt = {};
+}
+
 void ScriptEngine::Impl::close_state() {
+    drop_waiting();
     if (L) lua_close(L);
     L = nullptr;
+    cmd_thread = nullptr;
+    inline_runs = 0;
+    prompt_requested = false;
     parser_refs.clear();
     command_refs.clear();
     ref_pack = ref_unpack = ref_packsize = LUA_NOREF;
@@ -248,6 +261,78 @@ bool ScriptEngine::Impl::pcall(int nargs, int nresults, int time_limit_ms, std::
     lua_remove(L, fn);  // the handler (results, if any, sit above it)
     if (depth == 0) flush_highlights();
     return ok;
+}
+
+int ScriptEngine::Impl::resume(lua_State* co, int nargs, std::string* err) {
+    // Same deadline bookkeeping as pcall: every resume is a fresh slice of script_limit_ms (the
+    // time the user spends in a prompt does not count), nested ones keep an earlier deadline.
+    auto saved_deadline = deadline;
+    bool saved_on = deadline_on;
+    int saved_limit = limit_ms;
+    auto mine = std::chrono::steady_clock::now() + std::chrono::milliseconds(script_limit_ms);
+    if (!deadline_on || mine < deadline) {
+        deadline = mine;
+        limit_ms = script_limit_ms;
+    }
+    deadline_on = true;
+    lua_sethook(co, lua_time_hook, LUA_MASKCOUNT, timed_out ? 1 : kHookCount);
+    lua_State* saved_thread = cmd_thread;
+    cmd_thread = co;
+
+    ++depth;
+    int nres = 0;
+    int st = lua_resume(co, L, nargs, &nres);
+    --depth;
+
+    cmd_thread = saved_thread;
+    deadline = saved_deadline;
+    deadline_on = saved_on;
+    limit_ms = saved_limit;
+    if (timed_out && (!deadline_on || std::chrono::steady_clock::now() < deadline)) timed_out = false;
+    if (!deadline_on) lua_sethook(L, nullptr, 0, 0);
+    else if (!timed_out) lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, kHookCount);
+
+    if (st == LUA_OK || st == LUA_YIELD) {
+        lua_pop(co, nres);
+    } else if (err) {
+        // The dead coroutine keeps its stack, so the traceback can be taken after the fact.
+        const char* msg = lua_tostring(co, -1);
+        if (msg && std::strstr(msg, "\nstack traceback:")) {
+            *err = msg;
+        } else {
+            if (!msg) msg = lua_pushfstring(L, "(error object is a %s value)", luaL_typename(co, -1));
+            else lua_pushnil(L);  // keeps the pops below symmetric
+            luaL_traceback(L, co, msg, 0);
+            *err = lua_tostring(L, -1);
+            lua_pop(L, 2);
+        }
+    }
+    if (depth == 0) flush_highlights();
+    return st;
+}
+
+void ScriptEngine::Impl::step_command(lua_State* co, int ref, const std::string& name, uint64_t doc_id, int nargs) {
+    ScriptHost* host = eng.host_;
+    Document* d = doc_id && host ? host->find_document(doc_id) : nullptr;
+    if (d) d->begin_group("Script: " + name);  // the command (up to a prompt) is one undo step
+    prompt_requested = false;
+    std::string err;
+    int st = resume(co, nargs, &err);
+    if (d)
+        if (Document* again = host->find_document(doc_id)) again->end_group();
+    if (st == LUA_YIELD && prompt_requested && !waiting && L) {
+        prompt_requested = false;
+        prompt.command = name;
+        waiting = true;
+        waiting_ref = ref;
+        waiting_co = co;
+        waiting_doc = doc_id;
+        return;
+    }
+    prompt_requested = false;
+    if (st == LUA_YIELD) eng.log(ConsoleLine::Error, "Command '" + name + "': coroutine.yield() outside a coroutine");
+    else if (st != LUA_OK) eng.log(ConsoleLine::Error, "Command '" + name + "': " + err);
+    if (L) luaL_unref(L, LUA_REGISTRYINDEX, ref);
 }
 
 void ScriptEngine::Impl::register_parser(ParserInfo info, int ref) {
@@ -329,7 +414,7 @@ void ScriptEngine::add_lib_paths() {
     }
     lua_pushlstring(L, prefix.data(), prefix.size());
     std::string err;
-    if (!impl_->pcall(1, 0, kScriptTimeLimitMs, &err)) log(ConsoleLine::Error, err);
+    if (!impl_->pcall(1, 0, impl_->script_limit_ms, &err)) log(ConsoleLine::Error, err);
 }
 
 void ScriptEngine::reload() {
@@ -338,6 +423,8 @@ void ScriptEngine::reload() {
         return;
     }
     bool first = reload_count_ == 0;
+    if (impl_->waiting)
+        log(ConsoleLine::Warn, "Command '" + impl_->prompt.command + "' cancelled: scripts reloaded");
     parsers_.clear();
     commands_.clear();
     impl_->new_state();
@@ -366,7 +453,7 @@ void ScriptEngine::reload() {
         }
         impl_->loading_file = f.w.path;
         std::string err;
-        if (!impl_->pcall(0, 0, kScriptTimeLimitMs, &err)) {
+        if (!impl_->pcall(0, 0, impl_->script_limit_ms, &err)) {
             log(ConsoleLine::Error, err);
             ++failed;
         }
@@ -462,7 +549,7 @@ void ScriptEngine::exec(const std::string& code_in) {
         }
     }
     std::string err;
-    if (!impl_->pcall(0, LUA_MULTRET, kScriptTimeLimitMs, &err)) {
+    if (!impl_->pcall(0, LUA_MULTRET, impl_->script_limit_ms, &err)) {
         log(ConsoleLine::Error, trim_traceback(err));
         lua_settop(L, base);
         return;
@@ -634,7 +721,7 @@ bool ScriptEngine::edit_field(Document& doc, const Field& field, const std::stri
         lua_pushinteger(L, lua_Integer(iv));
     }
     std::string perr;
-    if (!impl_->pcall(2, 1, kScriptTimeLimitMs, &perr)) return fail("encode failed: " + error_head(perr));
+    if (!impl_->pcall(2, 1, impl_->script_limit_ms, &perr)) return fail("encode failed: " + error_head(perr));
     size_t n = 0;
     const char* bytes = lua_tolstring(L, -1, &n);
     std::string data(bytes ? bytes : "", n);
@@ -661,19 +748,43 @@ void ScriptEngine::run_command(const std::string& name_in) {
         log(ConsoleLine::Error, "Unknown command '" + name + "'");
         return;
     }
+    if (impl_->waiting) {
+        log(ConsoleLine::Error, "Command '" + name + "' not started: '" + impl_->prompt.command +
+                                    "' is waiting for input");
+        return;
+    }
     Document* d = host_ ? host_->active_document() : nullptr;
     uint64_t id = d ? d->id() : 0;
-    if (d) d->begin_group("Script: " + name);  // the whole command is one undo step
-    int top = lua_gettop(L);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, it->second);
-    if (d) push_doc(L, id);
-    else lua_pushnil(L);
-    std::string err;
-    if (!impl_->pcall(1, 0, kScriptTimeLimitMs, &err)) log(ConsoleLine::Error, "Command '" + name + "': " + err);
-    lua_settop(L, top);
-    if (d)
-        if (Document* again = host_->find_document(id)) again->end_group();
+    // A coroutine, so hx.prompt can suspend the command until the UI answers.
+    lua_State* co = lua_newthread(L);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_rawgeti(co, LUA_REGISTRYINDEX, it->second);
+    if (d) push_doc(co, id);
+    else lua_pushnil(co);
+    impl_->step_command(co, ref, name, id, 1);
 }
+
+const ScriptEngine::PendingPrompt* ScriptEngine::pending_prompt() const {
+    return impl_->waiting ? &impl_->prompt : nullptr;
+}
+
+void ScriptEngine::answer_prompt(const std::string* text) {
+    if (!impl_->waiting || impl_->depth > 0 || !impl_->L) return;
+    lua_State* co = impl_->waiting_co;
+    int ref = impl_->waiting_ref;
+    uint64_t doc_id = impl_->waiting_doc;
+    std::string name = impl_->prompt.command;
+    impl_->waiting = false;  // the ref now belongs to step_command
+    impl_->waiting_ref = LUA_NOREF;
+    impl_->waiting_co = nullptr;
+    impl_->waiting_doc = 0;
+    impl_->prompt = {};
+    if (text) lua_pushlstring(co, text->data(), text->size());
+    else lua_pushnil(co);
+    impl_->step_command(co, ref, name, doc_id, 1);
+}
+
+void ScriptEngine::set_script_time_limit_ms(int ms) { impl_->script_limit_ms = std::max(1, ms); }
 
 const HighlightSet* ScriptEngine::script_highlights(uint64_t doc_id) const {
     auto it = highlights_.find(doc_id);

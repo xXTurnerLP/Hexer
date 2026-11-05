@@ -17,6 +17,7 @@
 #include "core/inspector.h"
 #include "core/util.h"
 #include "ui/app_internal.h"
+#include "ui/hex_view.h"
 
 namespace hx {
 
@@ -114,7 +115,7 @@ void commit_inspector_edit(App& app, Document& d, const InspRow& r, bool be) {
         retry_edit(app, app.insp_edit, err);
         return;
     }
-    const uint64_t at = d.view().cursor;
+    const uint64_t at = focus_offset(d.view());
     // Same size: overwrite in place. Variable-length types (LEB128) may change the byte count.
     const bool ok = (r.size == 0 || out.size() == r.size) ? d.overwrite(at, out.data(), out.size())
                                                           : d.replace(at, r.size, out.data(), out.size());
@@ -129,7 +130,7 @@ void commit_inspector_edit(App& app, Document& d, const InspRow& r, bool be) {
 }
 
 void draw_inspector_row(App& app, Document& d, const InspRow& r, int i, bool be) {
-    const uint64_t cur = d.view().cursor;
+    const uint64_t cur = focus_offset(d.view());
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::PushID(i);
@@ -171,13 +172,13 @@ void draw_inspector_row(App& app, Document& d, const InspRow& r, int i, bool be)
 void draw_selection_info(Document& d) {
     const ViewState& v = d.view();
     if (!v.has_selection()) {
-        ImGui::TextDisabled("No selection  \xC2\xB7  cursor %s of %s", fmt_offset(v.cursor).c_str(),
+        ImGui::TextDisabled("No selection  \xC2\xB7  caret %s of %s", fmt_offset(v.cursor).c_str(),
                             fmt_offset(d.size()).c_str());
+        ImGui::TextDisabled("Values decode from the caret byte.");
         return;
     }
-    ImGui::Text("Selection: %llu bytes (0x%s)", ull(v.sel_len()), fmt_hex(v.sel_len()).c_str());
-    ImGui::TextDisabled("[%s, %s)  %s", fmt_offset(v.sel_begin()).c_str(), fmt_offset(v.sel_end()).c_str(),
-                        fmt_size(v.sel_len()).c_str());
+    ImGui::Text("Selection %s", fmt_range(v.sel_begin(), v.sel_len()).c_str());
+    ImGui::TextDisabled("Values decode from the first selected byte.");
 }
 
 }  // namespace
@@ -200,19 +201,20 @@ void draw_inspector_panel(App& app) {
         mark_settings_dirty(app);
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("@ %s", fmt_offset(d->view().cursor).c_str());
+    const uint64_t at = focus_offset(d->view());  // selection start, else the caret byte
+    ImGui::TextDisabled("@ %s", fmt_offset(at).c_str());
 
     uint8_t buf[16] = {};
-    const size_t n = d->read(d->view().cursor, buf, sizeof buf);
+    const size_t n = d->read(at, buf, sizeof buf);
     const std::vector<InspRow> rows = inspect(buf, n, be);
-    if (app.insp_edit.row >= 0 && app.insp_edit.ctx != d->view().cursor) app.insp_edit.end();  // cursor moved
+    if (app.insp_edit.row >= 0 && app.insp_edit.ctx != at) app.insp_edit.end();  // moved
 
     // Enter edits the selected row when the panel has focus (and no text field is active).
     if (app.insp_sel >= 0 && app.insp_sel < int(rows.size()) && app.insp_edit.row < 0 &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !ImGui::GetIO().WantTextInput &&
         (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
         const InspRow& r = rows[size_t(app.insp_sel)];
-        if (r.editable && !d->read_only()) app.insp_edit.begin(app.insp_sel, d->view().cursor, r.value);
+        if (r.editable && !d->read_only()) app.insp_edit.begin(app.insp_sel, at, r.value);
     }
 
     // Room for the separator (1 px + spacing) and the two selection-info lines, so the panel
@@ -478,7 +480,8 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
 void draw_field_table(App& app, Tab& t, Document& d) {
     StructureState& st = t.st;
     const int hover_field = t.ev.has_hover ? field_at(st, t.ev.hover_offset) : -1;
-    int cur_field = d.view().cursor < d.size() ? field_at(st, d.view().cursor) : -1;
+    const uint64_t at = focus_offset(d.view());  // same byte as the Inspector
+    int cur_field = at < d.size() ? field_at(st, at) : -1;
     // Highlights exist for leaves only: after clicking a container row, the caret byte maps to
     // its first leaf. Keep the container selected (and collapsed) until the caret moves.
     if (st.clicked_field >= 0) {
@@ -747,7 +750,7 @@ void draw_search_results_panel(App& app) {
         ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 150.0f * app.ui_scale);
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
-        const uint64_t cur = d->view().cursor;
+        const uint64_t cur = focus_offset(d->view());
         ImGuiListClipper clip;
         clip.Begin(int(std::min<size_t>(h.offsets.size(), size_t(INT_MAX))));
         uint8_t buf[16];
@@ -782,6 +785,117 @@ void draw_search_results_panel(App& app) {
 
 namespace {
 
+// One change requested while drawing the table, applied after it (the lists must not change
+// while they are being iterated).
+struct BookmarkChange {
+    enum Kind { None, Name, Note, Remove } kind = None;
+    uint64_t doc = 0;
+    size_t index = 0;
+    std::string text;
+};
+
+// The Name / Note cell: text (double-click edits) or the in-place editor. `field` 0 = name, 1 = note.
+void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, bool selected,
+                        BookmarkChange& change) {
+    Document& d = *t.doc;
+    const int row = int(i) * 2 + field;
+    if (app.bm_edit.active(row, d.id())) {
+        const int res = inline_edit_input(app.bm_edit, true);
+        if (res > 0) change = {field == 0 ? BookmarkChange::Name : BookmarkChange::Note, d.id(), i, app.bm_edit.buf};
+        if (res != 0) app.bm_edit.end();
+        return;
+    }
+    const std::string& text = field == 0 ? b.name : b.note;
+    if (field == 0) {
+        draw_swatch(b.color ? b.color : hex_colors().bookmark);
+        ImGuiSelectableFlags fl = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap |
+                                  ImGuiSelectableFlags_AllowDoubleClick;
+        if (ImGui::Selectable(text.empty() ? "(unnamed)" : text.c_str(), selected, fl)) {
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                app.bm_edit.begin(row, d.id(), b.name);
+            else
+                reveal_range(app, t, b.offset, b.length, false);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("%s\n%s", fmt_range(b.offset, b.length).c_str(),
+                              "Click: select it  \xC2\xB7  double-click the name or note to edit");
+        return;
+    }
+    // Note: plain text; a double-click anywhere in the cell edits it.
+    ImGui::PushID("note");
+    const float w = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##hit", ImVec2(w, ImGui::GetTextLineHeight()), ImGuiButtonFlags_AllowOverlap);
+    const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    if (ImGui::IsItemClicked() && !dbl) reveal_range(app, t, b.offset, b.length, false);
+    ImGui::SetCursorScreenPos(p);
+    if (text.empty())
+        ImGui::TextDisabled("%s", dbl ? "" : "-");
+    else
+        ImGui::TextUnformatted(text.c_str());
+    ImGui::PopID();
+    if (dbl) app.bm_edit.begin(row, d.id(), b.note);
+}
+
+void draw_bookmark_rows(App& app, Tab& t, BookmarkChange& change) {
+    Document& d = *t.doc;
+    const std::vector<Bookmark>& bms = d.view().bookmarks;
+    const uint64_t at = focus_offset(d.view());
+    ImGuiListClipper clip;
+    clip.Begin(int(bms.size()));
+    uint8_t buf[8];
+    while (clip.Step()) {
+        for (int k = clip.DisplayStart; k < clip.DisplayEnd; ++k) {
+            const size_t i = size_t(k);
+            const Bookmark& b = bms[i];
+            ImGui::TableNextRow();
+            ImGui::PushID(k);
+            const bool selected = &t == active_tab(app) && at >= b.offset && at - b.offset < std::max<uint64_t>(b.length, 1);
+            ImGui::TableSetColumnIndex(0);
+            bookmark_text_cell(app, t, b, i, 0, selected, change);
+            ImGui::TableSetColumnIndex(1);
+            bookmark_text_cell(app, t, b, i, 1, selected, change);
+            ImGui::PushFont(app.fonts.mono, 0.0f);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(fmt_offset(b.offset).c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%llu", ull(b.length));
+            ImGui::TableSetColumnIndex(4);
+            const size_t n = d.read(b.offset, buf, size_t(std::min<uint64_t>(b.length, sizeof buf)));
+            std::string pv = hex_preview(buf, n);
+            if (b.length > sizeof buf) pv += " \xE2\x80\xA6";
+            ImGui::TextDisabled("%s", pv.c_str());
+            ImGui::PopFont();
+            ImGui::TableSetColumnIndex(5);
+            if (ImGui::SmallButton("x")) change = {BookmarkChange::Remove, d.id(), i, {}};
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete bookmark (undoable)");
+            ImGui::PopID();
+        }
+    }
+}
+
+void apply_bookmark_change(App& app, const BookmarkChange& c) {
+    if (c.kind == BookmarkChange::None) return;
+    Tab* t = find_tab(app, c.doc);
+    if (!t || t->doc->busy()) return;
+    Document& d = *t->doc;
+    const auto& bms = d.view().bookmarks;
+    if (c.index >= bms.size()) return;
+    bool ok = true;
+    if (c.kind == BookmarkChange::Remove) {
+        ok = d.remove_bookmark(c.index);
+    } else {
+        Bookmark b = bms[c.index];
+        std::string& field = c.kind == BookmarkChange::Name ? b.name : b.note;
+        if (field == c.text) return;
+        field = c.text;
+        ok = d.update_bookmark(c.index, b);
+    }
+    if (!ok) report_edit_failure(app, d);
+}
+
+}  // namespace
+
 void add_bookmark_here(App& app, Document& d) {
     const ViewState& v = d.view();
     if (d.size() == 0) {
@@ -792,90 +906,87 @@ void add_bookmark_here(App& app, Document& d) {
     b.offset = std::min(v.has_selection() ? v.sel_begin() : v.cursor, d.size() - 1);
     b.length = v.has_selection() ? v.sel_len() : 1;
     b.name = "Bookmark " + std::to_string(v.bookmarks.size() + 1);
-    if (!d.add_bookmark(b)) report_edit_failure(app, d);
+    if (d.add_bookmark(b))
+        set_status(app, "Added " + b.name + " at " + fmt_range(b.offset, b.length));
+    else
+        report_edit_failure(app, d);
 }
 
-}  // namespace
-
 void draw_bookmarks_panel(App& app) {
+    if (app.focus_bookmarks) {
+        ImGui::SetNextWindowFocus();
+        app.focus_bookmarks = false;
+    }
     if (!begin_panel(kWinBookmarks, &app.show_bookmarks)) return;
     Tab* t = active_tab(app);
     Document* d = usable_doc(app);
-    if (!d) {
-        empty_note(app, "No document.");
-        ImGui::End();
-        return;
-    }
-    if (ImGui::SmallButton("Add at cursor")) add_bookmark_here(app, *d);
+    ImGui::BeginDisabled(!d);
+    if (ImGui::SmallButton("Add") && d) add_bookmark_here(app, *d);
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Bookmark the selection, or the byte at the caret (Ctrl+B)");
     ImGui::SameLine();
-    ImGui::TextDisabled("Ctrl+B toggles  \xC2\xB7  F2 / Shift+F2 jump  \xC2\xB7  double-click a name to rename");
-    const std::vector<Bookmark>& bms = d->view().bookmarks;
-    if (bms.empty()) {
-        ImGui::TextDisabled("No bookmarks.");
+    ImGui::Checkbox("All open files", &app.bm_all_files);
+    ImGui::SameLine();
+    ImGui::TextDisabled("Ctrl+B toggle  \xC2\xB7  F2 / Shift+F2 next / previous  \xC2\xB7  Ctrl+Shift+B find  \xC2\xB7  "
+                        "double-click name or note to edit");
+
+    // The tabs to list: the active one, or every open (not saving) one.
+    std::vector<Tab*> tabs;
+    size_t total = 0;
+    if (app.bm_all_files) {
+        for (auto& tp : app.tabs)
+            if (!tp->doc->busy() && !tp->doc->view().bookmarks.empty()) {
+                tabs.push_back(tp.get());
+                total += tp->doc->view().bookmarks.size();
+            }
+    } else if (d) {
+        tabs.push_back(t);
+        total = d->view().bookmarks.size();
+    }
+    if (total == 0) {
+        ImGui::Spacing();
+        if (!d && !app.bm_all_files)
+            empty_note(app, "No document.");
+        else
+            ImGui::TextDisabled(app.bm_all_files ? "No bookmarks in the open files." : "No bookmarks in this file.");
+        ImGui::TextDisabled("Ctrl+B adds a bookmark at the cursor/selection.");
         ImGui::End();
         return;
     }
-    int remove = -1, rename = -1;
-    std::string new_name;
+    BookmarkChange change;
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_Resizable;
-    if (ImGui::BeginTable("##bms", 4, flags)) {
+    if (ImGui::BeginTable("##bms", 6, flags)) {
         const float s = app.ui_scale;
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 150.0f * s);
-        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
-        ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 28.0f * s);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+        ImGui::TableSetupColumn("Note", ImGuiTableColumnFlags_WidthStretch, 0.65f);
+        ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 96.0f * s);
+        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, 64.0f * s);
+        ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 200.0f * s);
+        ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 24.0f * s);
         ImGui::TableHeadersRow();
-        const uint64_t cur = d->view().cursor;
-        ImGuiListClipper clip;
-        clip.Begin(int(bms.size()));
-        while (clip.Step()) {
-            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
-                const Bookmark& b = bms[size_t(i)];
-                ImGui::TableNextRow();
-                ImGui::PushID(i);
+        for (Tab* tab : tabs) {
+            ImGui::PushID(int(tab->doc->id()));
+            if (app.bm_all_files) {  // file header row
+                ImGui::TableNextRow(ImGuiTableRowFlags_None);
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImGuiCol_TableHeaderBg));
                 ImGui::TableSetColumnIndex(0);
-                if (app.bm_edit.active(i, d->id())) {
-                    int res = inline_edit_input(app.bm_edit, true);
-                    if (res > 0) {
-                        rename = i;
-                        new_name = app.bm_edit.buf;
-                    }
-                    if (res != 0) app.bm_edit.end();
-                } else {
-                    draw_swatch(b.color ? b.color : hex_colors().bookmark);
-                    const bool sel = cur >= b.offset && cur - b.offset < std::max<uint64_t>(b.length, 1);
-                    if (ImGui::Selectable(b.name.empty() ? "(unnamed)" : b.name.c_str(), sel,
-                                          ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap |
-                                              ImGuiSelectableFlags_AllowDoubleClick)) {
-                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                            app.bm_edit.begin(i, d->id(), b.name);
-                        else
-                            reveal_range(app, *t, b.offset, b.length, false);
-                    }
-                }
-                ImGui::PushFont(app.fonts.mono, 0.0f);
+                const bool is_active = tab == t;
+                ImGui::TextColored(is_active ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
+                                             : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled),
+                                   "%s", tab->label.c_str());
+                if (ImGui::IsItemHovered() && !tab->path.empty()) ImGui::SetTooltip("%s", tab->path.c_str());
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(fmt_offset(b.offset).c_str());
-                ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%llu", ull(b.length));
-                ImGui::PopFont();
-                ImGui::TableSetColumnIndex(3);
-                if (ImGui::SmallButton("x")) remove = i;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete bookmark (undoable)");
-                ImGui::PopID();
+                const size_t n = tab->doc->view().bookmarks.size();
+                ImGui::TextDisabled("%zu bookmark%s", n, n == 1 ? "" : "s");
             }
+            draw_bookmark_rows(app, *tab, change);
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }
-    // Mutate only after drawing: `bms` must not change while it is being iterated.
-    if (rename >= 0 && rename < int(bms.size()) && bms[size_t(rename)].name != new_name) {
-        Bookmark b = bms[size_t(rename)];
-        b.name = new_name;
-        if (!d->update_bookmark(size_t(rename), b)) report_edit_failure(app, *d);
-    }
-    if (remove >= 0 && !d->remove_bookmark(size_t(remove))) report_edit_failure(app, *d);
+    apply_bookmark_change(app, change);
     ImGui::End();
 }
 
@@ -894,18 +1005,19 @@ void status_sep() {
 void draw_doc_status(App& app, Tab& t) {
     Document& d = *t.doc;
     const ViewState& v = d.view();
-    ImGui::Text("Offset %s (%llu)", fmt_offset(v.cursor).c_str(), ull(v.cursor));
+    // Offset and Byte describe the same byte as the Inspector: the selection start, else the caret.
+    const uint64_t at = focus_offset(v);
+    ImGui::Text("Offset %s (%llu)", fmt_offset(at).c_str(), ull(at));
     if (ImGui::IsItemClicked()) app.req_goto = true;
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go to offset (Ctrl+G)");
     status_sep();
     if (v.has_selection())
-        ImGui::Text("Sel %llu bytes [%s, %s)", ull(v.sel_len()), fmt_offset(v.sel_begin()).c_str(),
-                    fmt_offset(v.sel_end()).c_str());
+        ImGui::Text("Sel %s", fmt_range(v.sel_begin(), v.sel_len()).c_str());
     else
         ImGui::TextDisabled("No selection");
     status_sep();
     uint8_t b = 0, bad = 0;
-    const bool have = v.cursor < d.size() && d.read(v.cursor, &b, 1, &bad) == 1;
+    const bool have = at < d.size() && d.read(at, &b, 1, &bad) == 1;
     if (have && bad) {
         ImGui::TextColored(kErrColor, "Byte ??");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("This byte could not be read from disk");

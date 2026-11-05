@@ -1408,6 +1408,45 @@ int l_crc32(lua_State* L) {
     return 1;
 }
 
+// Continuation of an inline hx.run (stack: name, message handler, [error]).
+int run_inline_k(lua_State* L, int status, lua_KContext) {
+    Impl& im = impl_of(L);
+    --im.inline_runs;
+    if (status != LUA_OK && status != LUA_YIELD) {
+        {
+            const char* msg = lua_tostring(L, -1);
+            im.eng.log(ConsoleLine::Error, std::string("Command '") + lua_tostring(L, 1) + "': " + (msg ? msg : "(error)"));
+        }
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+// hx.prompt(title, default?, {hint=}?) -> string | nil: suspends the running command's coroutine;
+// the engine records the request, the UI asks the user, answer_prompt() resumes with the result.
+int l_prompt(lua_State* L) {
+    const char* title = luaL_checkstring(L, 1);
+    const char* def = luaL_optstring(L, 2, "");
+    const char* hint = "";
+    if (lua_istable(L, 3)) {
+        if (lua_getfield(L, 3, "hint") == LUA_TSTRING || lua_isnumber(L, -1)) hint = lua_tostring(L, -1);
+        else if (!lua_isnil(L, -1)) return luaL_error(L, "hx.prompt: opts.hint must be a string");
+    } else if (!lua_isnoneornil(L, 3)) {
+        luaL_checktype(L, 3, LUA_TTABLE);
+    }
+    Impl& im = impl_of(L);
+    if (L != im.cmd_thread) return luaL_error(L, "hx.prompt is only available inside commands");
+    if (im.waiting) return luaL_error(L, "hx.prompt: another prompt is already open");
+    if (!lua_isyieldable(L))
+        return luaL_error(L, "hx.prompt: cannot ask here (not inside doc:transaction, metamethods or iterators)");
+    im.prompt.title = title;
+    im.prompt.default_text = def;
+    im.prompt.hint = hint;
+    im.prompt.command.clear();
+    im.prompt_requested = true;
+    return lua_yield(L, 0);  // resumed by answer_prompt with the text (or nil) as our result
+}
+
 // hx.run(name): run a registered command exactly like the palette does (one undo step on the
 // active document). Lets automation (--exec) and other scripts chain commands.
 int l_run(lua_State* L) {
@@ -1418,9 +1457,22 @@ int l_run(lua_State* L) {
         known = im.command_refs.count(std::string(name)) != 0;
     }
     if (!known) return luaL_error(L, "hx.run: unknown command '%s'", name);
-    if (im.depth > 16) return luaL_error(L, "hx.run: commands nested too deeply");
-    im.eng.run_command(name);
-    return 0;
+    if (im.depth > 16 || im.inline_runs >= 16) return luaL_error(L, "hx.run: commands nested too deeply");
+    if (L != im.cmd_thread) {
+        im.eng.run_command(name);
+        return 0;
+    }
+    // Inside a command: run it inline on the same coroutine, so an hx.prompt in it suspends the
+    // whole chain; its edits join the caller's undo step. Errors are logged, not propagated.
+    lua_settop(L, 1);
+    lua_pushcfunction(L, lua_msg_handler);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, im.command_refs.find(name)->second);
+    ScriptHost* host = im.eng.host();
+    Document* d = host ? host->active_document() : nullptr;
+    if (d) push_doc(L, d->id());
+    else lua_pushnil(L);
+    ++im.inline_runs;
+    return run_inline_k(L, lua_pcallk(L, 1, 0, 2, 0, run_inline_k), 0);
 }
 
 const luaL_Reg kHexerFuncs[] = {
@@ -1430,7 +1482,7 @@ const luaL_Reg kHexerFuncs[] = {
     {"new_doc", l_new_doc},   {"highlight", l_highlight},
     {"clear_highlights", l_clear_highlights},           {"color", l_color},
     {"hex", l_hex},           {"unhex", l_unhex},       {"crc32", l_crc32},
-    {"run", l_run},
+    {"run", l_run},           {"prompt", l_prompt},
     {nullptr, nullptr},
 };
 
@@ -1744,6 +1796,8 @@ void lua_time_hook(lua_State* L, lua_Debug* ar) {
     im.timed_out = true;
     if (lua_gethookcount(L) != 1) lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, 1);
     if (im.L && im.L != L && lua_gethookcount(im.L) != 1) lua_sethook(im.L, lua_time_hook, LUA_MASKCOUNT, 1);
+    if (im.cmd_thread && im.cmd_thread != L && lua_gethookcount(im.cmd_thread) != 1)
+        lua_sethook(im.cmd_thread, lua_time_hook, LUA_MASKCOUNT, 1);
     if (lua_getinfo(L, "Sl", ar) && ar->currentline > 0)
         lua_pushfstring(L, "%s:%d: script time limit exceeded (%d ms)", ar->short_src, ar->currentline, im.limit_ms);
     else

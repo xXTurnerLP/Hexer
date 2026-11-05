@@ -42,6 +42,14 @@ bool parse_int(const std::string& v, int lo, int hi, int& out) {
     return true;
 }
 
+bool parse_u64(const std::string& v, uint64_t& out) {
+    uint64_t x = 0;
+    auto r = std::from_chars(v.data(), v.data() + v.size(), x);
+    if (r.ec != std::errc() || r.ptr != v.data() + v.size()) return false;
+    out = x;
+    return true;
+}
+
 bool parse_float(const std::string& v, float lo, float hi, float& out) {
     float x = 0;
     auto r = std::from_chars(v.data(), v.data() + v.size(), x);
@@ -104,6 +112,17 @@ bool Settings::load(const std::string& path) {
         else if (key == "session_autosave_seconds") parse_int(v, 1, 3600, session_autosave_seconds);
         else if (key == "goto_default_hex") parse_bool(v, goto_default_hex);
         else if (key == "highlight_modified") parse_bool(v, highlight_modified);
+        else if (key == "undo_merge_ms") parse_int(v, 0, 600000, undo_merge_ms);
+        else if (key == "undo_merge_max_bytes") parse_int(v, 0, 1 << 30, undo_merge_max_bytes);
+        else if (key == "backup_on_save") parse_bool(v, backup_on_save);
+        else if (key == "backup_max_bytes") parse_u64(v, backup_max_bytes);
+        // fonts
+        else if (key == "mono_font") mono_font = v;
+        else if (key == "ui_font") ui_font = v;
+        else if (key == "font_hinting") {
+            const std::string h = lower(v);
+            if (h == "none" || h == "light" || h == "normal" || h == "mono") font_hinting = h;
+        }
         else if (key.size() > 6 && key.compare(0, 6, "recent") == 0) {
             int idx = -1;
             if (parse_int(key.substr(6), -1, 1000, idx) && idx >= 0 && size_t(idx) < kMaxRecent) recent[size_t(idx)] = v;
@@ -141,6 +160,13 @@ bool Settings::save(const std::string& path) const {
     put("session_autosave_seconds", std::to_string(session_autosave_seconds));
     put("goto_default_hex", b(goto_default_hex));
     put("highlight_modified", b(highlight_modified));
+    put("undo_merge_ms", std::to_string(undo_merge_ms));
+    put("undo_merge_max_bytes", std::to_string(undo_merge_max_bytes));
+    put("backup_on_save", b(backup_on_save));
+    put("backup_max_bytes", std::to_string(backup_max_bytes));
+    put("mono_font", mono_font);  // fonts
+    put("ui_font", ui_font);
+    put("font_hinting", font_hinting);
     for (size_t i = 0; i < recent_files.size() && i < kMaxRecent; ++i)
         put(("recent" + std::to_string(i)).c_str(), recent_files[i]);
     for (const auto& [k, v] : unknown_keys) put(k.c_str(), v);

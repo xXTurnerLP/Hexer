@@ -29,15 +29,26 @@ script_lib = static_library('hexer_script',
 )
 script_dep = declare_dependency(link_with : script_lib, dependencies : [core_dep, lua_dep])
 
-# ---- ui: ImGui application ----
-ui_lib = static_library('hexer_ui',
+# ---- ui view: theme/fonts + the hex view widget (no window, no Lua; tests/test_ui.cpp drives it) ----
+ui_view_lib = static_library('hexer_ui_view',
   'ui/theme.cpp',
   'ui/hex_view.cpp',
+  'ui/third_party/imgui_freetype.cpp',  # vendored from imgui misc/freetype (MIT)
+  include_directories : inc,
+  cpp_args : conf_args,
+  dependencies : [core_dep, imgui_dep, freetype_dep],
+)
+ui_view_dep = declare_dependency(link_with : ui_view_lib, include_directories : inc,
+  dependencies : [core_dep, imgui_dep, freetype_dep])
+
+# ---- ui: ImGui application ----
+ui_lib = static_library('hexer_ui',
   'ui/panels.cpp',
   'ui/app.cpp',
   include_directories : inc,
   cpp_args : conf_args,
-  dependencies : [script_dep, imgui_dep, glfw_dep, nfd_dep],
+  link_with : ui_view_lib,
+  dependencies : [script_dep, imgui_dep, glfw_dep, nfd_dep, freetype_dep],
 )
 
 hexer_src = ['main.cpp']

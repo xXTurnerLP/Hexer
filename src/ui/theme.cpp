@@ -4,7 +4,12 @@
 #include <string>
 #include <vector>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
 #include "imgui.h"
+#include "imgui_internal.h"  // ImFontAtlasGetFontLoaderForStbTruetype
+#include "ui/third_party/imgui_freetype.h"
 
 #include "core/highlight.h"
 #include "core/os_file.h"
@@ -57,10 +62,39 @@ std::vector<std::string> font_dirs() {
     return dirs;
 }
 
-ImFont* add_font_file(const std::string& path, float size_px, bool merge) {
+// Light text on a dark background blended in gamma space looks thinner than the glyph coverage
+// says; a mild coverage boost compensates (the theme is dark-only).
+constexpr float kTextContrast = 1.2f;
+
+// FreeType loader flags for a hinting mode (unknown modes = normal).
+unsigned freetype_flags(const std::string& hinting) {
+    if (hinting == "none") return ImGuiFreeTypeLoaderFlags_NoHinting;
+    if (hinting == "light") return ImGuiFreeTypeLoaderFlags_LightHinting;  // vertical-only snapping
+    if (hinting == "mono") return ImGuiFreeTypeLoaderFlags_MonoHinting | ImGuiFreeTypeLoaderFlags_Monochrome;
+    return 0;  // normal: the font's own hinting (crisp stems), auto-hinter for unhinted fonts
+}
+
+// FT_Init_FreeType only fails when out of memory, but imgui_freetype does not survive a failed
+// loader init, so probe first and stay on stb_truetype if it fails.
+bool freetype_works() {
+    FT_Library lib = nullptr;
+    if (FT_Init_FreeType(&lib) != 0) return false;
+    FT_Done_FreeType(lib);
+    return true;
+}
+
+// Adds a font with the atlas loader (FreeType); a file FreeType rejects is retried with stb_truetype.
+// `snap` rounds advances to whole pixels (monospace cell layouts).
+ImFont* add_font_file(const std::string& path, float size_px, bool merge, bool snap = false) {
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
     ImFontConfig cfg;
     cfg.MergeMode = merge;
-    return ImGui::GetIO().Fonts->AddFontFromFileTTF(path.c_str(), size_px, &cfg);
+    cfg.PixelSnapH = snap;
+    cfg.RasterizerMultiply = kTextContrast;
+    if (ImFont* f = atlas->AddFontFromFileTTF(path.c_str(), size_px, &cfg)) return f;
+    if (atlas->FontLoader == ImFontAtlasGetFontLoaderForStbTruetype()) return nullptr;
+    cfg.FontLoader = ImFontAtlasGetFontLoaderForStbTruetype();
+    return atlas->AddFontFromFileTTF(path.c_str(), size_px, &cfg);
 }
 
 // Merges a broad symbol font into the font added last, for glyphs (arrows, box drawing, ...) the
@@ -79,6 +113,7 @@ void merge_symbol_fallback(const std::vector<std::string>& dirs, const std::stri
 ImFont* add_default_font(float size_px) {
     ImFontConfig cfg;
     cfg.SizePixels = size_px;
+    cfg.RasterizerMultiply = kTextContrast;
     return ImGui::GetIO().Fonts->AddFontDefaultVector(&cfg);
 }
 
@@ -86,10 +121,18 @@ ImVec4 col(uint32_t c) { return ImGui::ColorConvertU32ToFloat4(c); }
 
 }  // namespace
 
-Fonts load_fonts(float ui_size_px, float mono_size_px) {
+Fonts load_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt) {
     if (ui_size_px <= 0.0f) ui_size_px = 16.0f;
     if (mono_size_px <= 0.0f) mono_size_px = 16.0f;
     const std::vector<std::string> dirs = font_dirs();
+
+    Fonts f;
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    f.freetype = freetype_works();
+    if (f.freetype) {
+        atlas->SetFontLoader(ImGuiFreeType::GetFontLoader());
+        atlas->FontLoaderFlags = freetype_flags(opt.hinting);
+    }
 
 #ifdef _WIN32
     std::string ui_path = find_font(dirs, {"segoeui.ttf"});
@@ -102,19 +145,26 @@ Fonts load_fonts(float ui_size_px, float mono_size_px) {
                                              "LiberationMono-Regular.ttf", "NotoSansMono-Regular.ttf",
                                              "UbuntuMono-R.ttf"});
 #endif
+    if (!opt.ui_path.empty() && font_file_exists(opt.ui_path)) ui_path = opt.ui_path;
+    if (!opt.mono_path.empty() && font_file_exists(opt.mono_path)) mono_path = opt.mono_path;
 
-    Fonts f;
     // The UI font is added first so it becomes the default font (Fonts[0]).
     if (!ui_path.empty()) {
         f.ui = add_font_file(ui_path, ui_size_px, false);
-        if (f.ui) merge_symbol_fallback(dirs, ui_path, ui_size_px);
+        if (f.ui) {
+            f.ui_path = ui_path;
+            merge_symbol_fallback(dirs, ui_path, ui_size_px);
+        }
     }
     const bool ui_is_default = !f.ui;
     if (!f.ui) f.ui = add_default_font(ui_size_px);
 
     if (!mono_path.empty()) {
-        f.mono = add_font_file(mono_path, mono_size_px, false);
-        if (f.mono) merge_symbol_fallback(dirs, mono_path, mono_size_px);
+        f.mono = add_font_file(mono_path, mono_size_px, false, true);
+        if (f.mono) {
+            f.mono_path = mono_path;
+            merge_symbol_fallback(dirs, mono_path, mono_size_px);
+        }
     }
     // ImGui's built-in ProggyForever is monospace, so a default UI font can double as mono.
     if (!f.mono) f.mono = ui_is_default ? f.ui : add_default_font(mono_size_px);

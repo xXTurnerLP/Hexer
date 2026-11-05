@@ -18,14 +18,27 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   Edited bytes are tinted amber.
 - **Full undo history.** `Ctrl+Z` / `Ctrl+Y` covers every content and bookmark change: typing,
   paste, fill, inspector and structure edits, and script commands (one undo step each). The
-  history survives saves and restarts.
+  history survives saves and restarts. Typing is grouped into one step per run of keys: a pause
+  of more than 500 ms, or more than 32 typed bytes, starts a new step (both in Settings).
 - **Safe, fast saving.** If the size is unchanged, Hexer patches only the changed bytes in place.
   Otherwise it writes a temp file and renames it over the original. Saves run in the background
   with progress and Cancel (until the last step, when the dialog shows "Finishing..."). If another
   program changed the file since you opened it, saving asks first: Save As, **Overwrite anyway**,
   Reload or Cancel.
+- **Backup on the first save.** The first time Hexer writes over an existing file (per open tab,
+  also across hot-exit restarts), the previous contents are kept as `<file>.backup` next to it (an
+  older `.backup` is replaced). A save that rewrites the file just gives the original that second
+  name (a hard link, or a rename where links are unsupported), so this costs nothing; an in-place save copies the
+  file first (fast OS copy, counted in the progress, cancellable), and skips files above the size
+  limit (4 GiB by default; a notification says so). The status bar shows "Saved ... (backup:
+  name.backup)". Files Hexer created itself and devices get no backup. Turn it off or change the
+  limit in Edit > Settings > Saving.
 - **Hot exit** (as in Sublime Text). Closing Hexer never asks "save changes?". Open tabs, unsaved
   edits, undo history, cursor, scroll position and bookmarks are restored on the next launch.
+- **Selection.** Dragging over bytes a..b selects exactly those bytes; the caret is drawn on the
+  last byte you dragged to (inside the selection). The Inspector, the status bar's Offset/Byte
+  and inspector edits all work on the **first selected byte** (else the caret byte), and ranges
+  are shown the same way everywhere, inclusive: `0x00000010-0x0000001F (16 bytes)`.
 - **Data inspector.** Integers (8 to 64 bit, plus 24 bit), half/float/double, LEB128 and zigzag,
   binary, characters (ASCII, UTF-8, UTF-16), GUID, and Unix, FILETIME and DOS timestamps.
   Little or big endian. Double-click a value to edit it.
@@ -37,10 +50,22 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Smart Go to.** `0x1F00`, `1F00h`, `#1234` (decimal), `+0x10` (relative), `end-0x100`, `50%`,
   `cur+4*0x10`.
 - **Copy as** hex, C array, Python bytes, Base64 or an escaped string.
-- **Bookmarks** with names, kept in the session. `Ctrl+B` toggles one, `F2` / `Shift+F2` jump.
+- **Bookmarks** with a name and a note, kept in the session and undoable. `Ctrl+B` toggles one on
+  the selection or caret, `F2` / `Shift+F2` jump, `Ctrl+Shift+B` fuzzy-finds a bookmark in any open
+  file. The Bookmarks panel (bottom dock) lists name, note, offset, length and the first bytes,
+  for this file or **all open files**; double-click a name or note to edit it. The Bookmarks menu
+  lists the active file's bookmarks. Bookmarks (and Find All hits) show as ticks on the scrollbar.
+- **Settings window** (Edit > Settings..., `Ctrl+,`): bytes per row, grouping, font size, UI
+  scale, undo grouping, backups, hot exit, autosave interval and fonts. Changes apply right away
+  (fonts after a restart) and are saved to `settings.ini`.
+- **Fonts** are rasterised with FreeType (hinted, pixel-snapped hex cells). `font_hinting`
+  (`normal`, `light`, `none`, `mono`), `mono_font` and `ui_font` (file paths, empty = auto) are
+  in the Settings window and `settings.ini`.
 - **Command palette** (`Ctrl+Shift+P`) with fuzzy search over actions, script commands,
   parsers and recent files.
 - **Lua console** (REPL), script commands, and hot reload: save a `.lua` file and it reloads.
+  Commands can ask for a value with `hx.prompt(title, default)` (a small dialog; Enter = OK,
+  Esc = Cancel), e.g. *Selection: XOR with key* asks for the key.
 - Tabs, drag and drop, recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
   banner when the file changes on disk, a read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
 - **One window** (as in Sublime Text). Opening files while Hexer runs (`hexer file.bin`, "Open
@@ -106,6 +131,7 @@ hexer [options] [files...]
   --no-session         do not restore or write the hot-exit session
   --new-instance       open a new window even if Hexer is already running
   --exec "LUA"         run Lua in the console after startup
+  --action "NAME"      run a menu/palette action after startup, e.g. "Settings..." (repeatable)
   --screenshot OUT.ppm render, save the window as a PPM and exit
   --frames N           exit after N frames
 ```
@@ -126,22 +152,26 @@ hexer [options] [files...]
 | `Ins` | Toggle insert / overwrite |
 | `Delete` / `Backspace` | Delete the selection, else the byte at / before the cursor (without a selection, `Backspace` only moves left in overwrite mode) |
 | `Tab` | Switch between the hex and text columns |
-| Arrows, `PgUp` / `PgDn` | Move the cursor (hold `Shift` to select) |
-| `Home` / `End` | Start / end of row (`Shift+End` selects to the end of the row) |
+| Arrows, `PgUp` / `PgDn` | Move the cursor (hold `Shift` to select; with a selection a plain arrow moves from the drawn caret and clears it) |
+| `Home` / `End` | Start / end of the caret's row (`Shift+End` selects to the end of the row) |
 | `Ctrl+Home` / `Ctrl+End` | Start / end of file |
 | `Ctrl+Up` / `Ctrl+Down` | Scroll without moving the cursor |
 | `Ctrl+F` | Find bar (`Enter` next, `Shift+Enter` previous, `Esc` closes) |
 | `F3` / `Shift+F3` | Find next / previous |
 | `Ctrl+G` | Go to offset (`Shift+Enter` selects from the cursor) |
-| `Ctrl+B` | Toggle bookmark |
+| `Ctrl+B` | Toggle bookmark (on the selection, else the caret byte) |
 | `F2` / `Shift+F2` | Next / previous bookmark |
+| `Ctrl+Shift+B` | Jump to a bookmark in any open file (fuzzy search) |
+| `Ctrl+,` | Settings |
 | `Ctrl+Shift+P` | Command palette |
 | `F5` | Re-parse structure |
 | `Ctrl+=` or `Ctrl++` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Zoom in / out / reset |
 | `Ctrl+L` (in the console) | Clear console |
 
-Mouse: click and drag to select, `Shift+click` extends the selection, double-click selects the
-field under the mouse, right-click opens the context menu.
+Mouse: click and drag to select (bytes a..b inclusive; clicking the second hex digit puts the
+caret on the low nibble; clicking below the last row puts it at the end of the file),
+`Shift+click` extends the selection from its fixed end, double-click selects the field under the
+mouse, right-click opens the context menu.
 
 ## Hot exit
 
@@ -165,8 +195,8 @@ after each change, so a crash loses almost nothing. The next launch restores eve
 - Closing a single **tab** with unsaved changes still asks Save / Discard / Cancel. A discarded
   tab can be brought back with `Ctrl+Shift+T` until you quit.
 - `<config>` is `%APPDATA%\Hexer` on Windows and `~/.config/hexer` on Linux (or
-  `$XDG_CONFIG_HOME/hexer`). Hot exit can be switched off with `restore_session = false` in
-  `settings.ini`.
+  `$XDG_CONFIG_HOME/hexer`). Hot exit can be switched off in Edit > Settings (or with
+  `restore_session = false` in `settings.ini`).
 
 ## Scripting quickstart
 
@@ -205,5 +235,6 @@ See **[docs/scripting.md](docs/scripting.md)** for the full guide and API refere
 
 `src/core` holds documents, streaming I/O, the piece table, undo, saving, the session, search,
 the inspector and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
-live in `tests/`, one executable per module. See `CLAUDE.md` for contributor notes and `TODO.md`
+live in `tests/`, one executable per module; `tests/test_ui.cpp` drives the hex view headlessly
+(simulated mouse and keyboard, no window). See `CLAUDE.md` for contributor notes and `TODO.md`
 for the roadmap.

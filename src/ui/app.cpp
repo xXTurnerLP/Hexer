@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,7 @@ const char* const kPopOverwrite = "File changed on disk###overwriteprompt";
 const char* const kPopSaving = "Saving###saving";
 const char* const kPopMessage = "###message";
 const char* const kPopAbout = "About Hexer###about";
+const char* const kPopPrompt = "###script_prompt";  // hx.prompt (title = the script's title)
 
 std::vector<std::string> command_line_utf8(int argc, char** argv);  // bottom of file
 void allow_foreground_handoff();                                    // bottom of file
@@ -63,7 +65,8 @@ const char* const kUsage =
     "  --new-instance       open a new window even if Hexer is already running\n"
     "  --screenshot OUT.ppm render, save the window as a binary PPM and exit\n"
     "  --frames N           exit after N frames (default 30 with --screenshot)\n"
-    "  --exec \"LUA\"         run Lua in the console after startup";
+    "  --exec \"LUA\"         run Lua in the console after startup\n"
+    "  --action \"NAME\"      run a menu/palette action after startup, e.g. \"Settings...\" (repeatable)";
 
 }  // namespace
 
@@ -101,6 +104,10 @@ bool parse_args(int argc, char** argv, AppOptions& out, std::string* err) {
             if (!value(out.screenshot) || out.screenshot.empty()) return fail("--screenshot needs an output path");
         } else if (a == "--exec") {
             if (!value(out.run_lua)) return fail("--exec needs Lua code");
+        } else if (a == "--action") {
+            std::string v;
+            if (!value(v) || v.empty()) return fail("--action needs an action name");
+            out.actions.push_back(v);
         } else if (a == "--frames") {
             std::string v;
             if (!value(v)) return fail("--frames needs a number");
@@ -173,6 +180,12 @@ void show_message(App& app, const std::string& title, const std::string& text) {
 
 void mark_settings_dirty(App& app) {
     if (app.settings_dirty_at < 0.0) app.settings_dirty_at = now_s();
+}
+
+// Settings the core reads app-wide: typing-run undo merging and backups. Call after changes.
+static void apply_core_settings(const Settings& s) {
+    Document::set_undo_merge(s.undo_merge_ms, uint64_t(std::max(0, s.undo_merge_max_bytes)));
+    Document::set_backup_policy(s.backup_on_save, s.backup_max_bytes);
 }
 
 void report_edit_failure(App& app, const Document& doc) {
@@ -537,7 +550,18 @@ void poll_save(App& app) {
     if (s.ok) {
         char buf[64];
         std::snprintf(buf, sizeof buf, " in %.1f s", secs);
-        set_status(app, "Saved " + t->label + buf);
+        const SaveInfo info = t->doc->last_save_info();
+        if (info.backup_created) {
+            // First save over this file: the original is kept next to it.
+            set_status(app, "Saved " + t->label + buf + " (backup: " + path_filename(info.backup_path) + ")", 10.0);
+            log_console(app, ConsoleLine::Info, t->label + ": the original file was kept as " + info.backup_path);
+        } else {
+            set_status(app, "Saved " + t->label + buf);
+        }
+        if (info.backup_skipped && !info.note.empty()) {
+            log_console(app, ConsoleLine::Warn, t->label + ": " + info.note);
+            notify(app, info.note + "\nThe limit is in Edit > Settings > Saving.", false);
+        }
         if (!s.err.empty()) {  // saved, but e.g. undo history before the save had to be dropped
             log_console(app, ConsoleLine::Warn, t->label + ": " + s.err);
             notify(app, t->label + ": " + s.err, false);
@@ -830,7 +854,7 @@ void toggle_bookmark(App& app) {
     b.length = std::max<uint64_t>(1, len);
     b.name = "Bookmark " + std::to_string(bms.size() + 1);
     if (d->add_bookmark(b))
-        set_status(app, "Added " + b.name + " at " + fmt_offset(b.offset));
+        set_status(app, "Added " + b.name + " at " + fmt_range(b.offset, b.length));
     else
         report_edit_failure(app, *d);
 }
@@ -1048,6 +1072,7 @@ const Action kActions[] = {
     {"Fill Selection...", {0, 0}, [](App& a) { a.req_fill = true; }, has_selection, false, false},
     {"Toggle Insert / Overwrite", {ImGuiKey_Insert, 0}, [](App& a) { toggle_insert_mode(a); }, has_tab, false, false},
     {"Toggle Read-only", {0, 0}, [](App& a) { toggle_read_only(a); }, has_doc, false, false},
+    {"Settings...", {C(ImGuiKey_Comma), 0}, [](App& a) { a.show_settings = !a.show_settings; }, nullptr, true, false},
     // Search & navigation
     {"Find...", {C(ImGuiKey_F), 0}, [](App& a) { open_find_bar(a); }, has_tab, true, false},
     {"Find Next", {ImGuiKey_F3, 0}, [](App& a) { find_start(a, SearchJob::Mode::Next); }, has_doc, true, true},
@@ -1057,6 +1082,10 @@ const Action kActions[] = {
     {"Toggle Bookmark", {C(ImGuiKey_B), 0}, [](App& a) { toggle_bookmark(a); }, has_doc, false, false},
     {"Next Bookmark", {ImGuiKey_F2, 0}, [](App& a) { jump_bookmark(a, true); }, has_doc, false, true},
     {"Previous Bookmark", {S(ImGuiKey_F2), 0}, [](App& a) { jump_bookmark(a, false); }, has_doc, false, true},
+    {"Jump to Bookmark...", {CS(ImGuiKey_B), 0}, [](App& a) { a.req_bookmark_jump = true; }, nullptr, true, false},
+    {"Show All Bookmarks", {0, 0}, [](App& a) {
+         a.show_bookmarks = a.bm_all_files = a.focus_bookmarks = true;
+     }, nullptr, true, false},
     {"Next Tab", {C(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, +1); }, nullptr, true, true},
     {"Previous Tab", {CS(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, -1); }, nullptr, true, true},
     // View
@@ -1193,6 +1222,41 @@ void draw_edit_menu(App& app) {
     Tab* t = active_tab(app);
     menu_action(app, "Toggle Insert / Overwrite", "Insert Mode", t && t->insert_mode);
     menu_action(app, "Toggle Read-only", "Read-only", d && d->read_only());
+    ImGui::Separator();
+    menu_action(app, "Settings...", nullptr, app.show_settings);
+}
+
+// The active document's bookmarks (first 30) plus the bookmark actions.
+void draw_bookmarks_menu(App& app) {
+    menu_action(app, "Toggle Bookmark", "Add / Remove Bookmark");
+    menu_action(app, "Next Bookmark");
+    menu_action(app, "Previous Bookmark");
+    menu_action(app, "Jump to Bookmark...");
+    menu_action(app, "Show All Bookmarks", "Show All Bookmarks...");
+    Tab* t = active_tab(app);
+    Document* d = usable_doc(app);
+    if (!d) return;
+    const auto& bms = d->view().bookmarks;
+    ImGui::Separator();
+    if (bms.empty()) {
+        ImGui::TextDisabled("No bookmarks in %s", t->label.c_str());
+        return;
+    }
+    constexpr size_t kMenuMax = 30;
+    int jump = -1;
+    for (size_t i = 0; i < bms.size() && i < kMenuMax; ++i) {
+        const Bookmark& b = bms[i];
+        ImGui::PushID(int(i));
+        const std::string off = fmt_offset(b.offset);
+        if (ImGui::MenuItem(b.name.empty() ? "(unnamed)" : b.name.c_str(), off.c_str())) jump = int(i);
+        if (!b.note.empty()) ImGui::SetItemTooltip("%s", b.note.c_str());
+        ImGui::PopID();
+    }
+    if (bms.size() > kMenuMax) {
+        const std::string more = std::to_string(bms.size() - kMenuMax) + " more...";
+        if (ImGui::MenuItem(more.c_str())) app.show_bookmarks = app.focus_bookmarks = true;
+    }
+    if (jump >= 0) reveal_range(app, *t, bms[size_t(jump)].offset, bms[size_t(jump)].length, true);
 }
 
 void draw_view_menu(App& app) {
@@ -1252,8 +1316,9 @@ void draw_scripts_menu(App& app) {
     // Run after the loop, with a copy of the name: a command may register commands, which
     // reallocates the engine's list this loop (and a reference into it) points into.
     std::string run;
+    const bool can_run = idle(app) && !app.engine->pending_prompt();  // one command waits for input at a time
     for (const ScriptCommand& c : cmds) {
-        if (ImGui::MenuItem(c.name.c_str(), nullptr, false, idle(app))) run = c.name;
+        if (ImGui::MenuItem(c.name.c_str(), nullptr, false, can_run)) run = c.name;
         if (!c.description.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s", c.description.c_str());
     }
@@ -1288,10 +1353,10 @@ void draw_main_menu(App& app) {
         menu_action(app, "Find All");
         ImGui::Separator();
         menu_action(app, "Go to Offset...");
-        ImGui::Separator();
-        menu_action(app, "Toggle Bookmark");
-        menu_action(app, "Next Bookmark");
-        menu_action(app, "Previous Bookmark");
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Bookmarks")) {
+        draw_bookmarks_menu(app);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -1497,7 +1562,9 @@ HexViewConfig make_view_config(App& app, const Tab& t) {
     cfg.insert_mode = t.insert_mode;
     cfg.highlight_modified = app.settings.highlight_modified;
     cfg.mono = app.fonts.mono;
-    cfg.font_size = app.settings.font_size * app.ui_scale;
+    // Whole pixels: a fractional size (e.g. 16 px at 125 %) would rasterise blurrier glyphs.
+    cfg.font_size = std::round(app.settings.font_size * app.ui_scale);
+    if (!t.hits.offsets.empty()) cfg.tick_offsets = &t.hits.offsets;
     return cfg;
 }
 
@@ -1658,8 +1725,37 @@ bool center_next_window(App& app, float width, float y_frac = 0.25f) {
 
 // ---- command palette ---------------------------------------------------------------------
 
+// Ctrl+Shift+B: every bookmark of every open (not saving) document, the active one first.
+void build_bookmark_palette(App& app) {
+    std::vector<Tab*> order;
+    if (Tab* t = active_tab(app)) order.push_back(t);
+    for (auto& t : app.tabs)
+        if (t.get() != active_tab(app)) order.push_back(t.get());
+    for (Tab* t : order) {
+        if (t->doc->busy()) continue;
+        const auto& bms = t->doc->view().bookmarks;
+        for (size_t i = 0; i < bms.size(); ++i) {
+            const Bookmark& b = bms[i];
+            PaletteItem it;
+            it.label = (b.name.empty() ? std::string("(unnamed)") : b.name);
+            if (!b.note.empty()) it.label += "  \xC2\xB7  " + b.note;
+            it.label += "  \xC2\xB7  " + t->label;
+            it.hint = fmt_offset(b.offset);
+            it.kind = 4;
+            it.index = int(i);
+            it.doc = t->doc->id();
+            app.palette_all.push_back(std::move(it));
+        }
+    }
+}
+
 void build_palette(App& app) {
     app.palette_all.clear();
+    if (app.palette_bookmarks) {
+        build_bookmark_palette(app);
+        app.palette_last_query = "\x01";
+        return;
+    }
     for (int i = 0; i < kActionCount; ++i) {
         const Action& a = kActions[i];
         PaletteItem it;
@@ -1670,14 +1766,15 @@ void build_palette(App& app) {
         it.enabled = action_enabled(app, a);
         app.palette_all.push_back(std::move(it));
     }
+    const bool can_run = idle(app) && !app.engine->pending_prompt();
     for (const ScriptCommand& c : app.engine->commands())
-        app.palette_all.push_back({"Script: " + c.name, c.description, 1, 0, c.name, idle(app), 0});
+        app.palette_all.push_back({"Script: " + c.name, c.description, 1, 0, c.name, can_run, 0, 0});
     const bool doc = has_doc(app);
-    app.palette_all.push_back({"Parser: Auto-detect", "", 2, 0, "", doc, 0});
+    app.palette_all.push_back({"Parser: Auto-detect", "", 2, 0, "", doc, 0, 0});
     for (const ParserInfo& p : app.engine->parsers())
-        app.palette_all.push_back({"Parser: " + p.name, "", 2, 0, p.name, doc, 0});
+        app.palette_all.push_back({"Parser: " + p.name, "", 2, 0, p.name, doc, 0, 0});
     for (const std::string& r : app.settings.recent_files)
-        app.palette_all.push_back({"Open recent: " + r, "", 3, 0, r, true, 0});
+        app.palette_all.push_back({"Open recent: " + r, "", 3, 0, r, true, 0, 0});
     app.palette_last_query = "\x01";  // force re-filter
 }
 
@@ -1711,6 +1808,17 @@ void run_palette_item(App& app, const PaletteItem& it) {
             }
             break;
         case 3: open_path(app, it.arg); break;
+        case 4:
+            if (Tab* t = find_tab(app, it.doc); t && !t->doc->busy()) {
+                const auto& bms = t->doc->view().bookmarks;
+                if (size_t(it.index) < bms.size()) {
+                    const Bookmark b = bms[size_t(it.index)];
+                    reveal_range(app, *t, b.offset, b.length, true);
+                    set_status(app, (b.name.empty() ? std::string("Bookmark") : b.name) + ": " +
+                                        fmt_range(b.offset, b.length));
+                }
+            }
+            break;
         default: break;
     }
 }
@@ -1720,8 +1828,9 @@ void draw_palette(App& app) {
     if (!ImGui::BeginPopup(kPopPalette)) return;
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    const bool enter = ImGui::InputTextWithHint("##q", "Type a command, script, parser or recent file...",
-                                                &app.palette_query, ImGuiInputTextFlags_EnterReturnsTrue);
+    const char* hint = app.palette_bookmarks ? "Jump to a bookmark in any open file (name, note or file)..."
+                                             : "Type a command, script, parser or recent file...";
+    const bool enter = ImGui::InputTextWithHint("##q", hint, &app.palette_query, ImGuiInputTextFlags_EnterReturnsTrue);
     filter_palette(app);
     const int n = int(app.palette_view.size());
     if (n > 0) {
@@ -1758,7 +1867,10 @@ void draw_palette(App& app) {
                 ImGui::PopID();
             }
         }
-        if (n == 0) ImGui::TextDisabled("No matches");
+        if (n == 0)
+            ImGui::TextDisabled("%s", app.palette_bookmarks && app.palette_all.empty()
+                                          ? "No bookmarks in the open files (Ctrl+B adds one at the cursor/selection)"
+                                          : "No matches");
     }
     ImGui::EndChild();
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
@@ -1834,8 +1946,7 @@ void draw_fill(App& app) {
         return;
     }
     const ViewState& v = d->view();
-    ImGui::Text("Fill %s .. %s (%s)", fmt_offset(v.sel_begin()).c_str(), fmt_offset(v.sel_end()).c_str(),
-                fmt_size(v.sel_len()).c_str());
+    ImGui::Text("Fill %s", fmt_range(v.sel_begin(), v.sel_len()).c_str());
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(360.0f * app.ui_scale);
     const bool enter = ImGui::InputTextWithHint("##pattern", "hex pattern, e.g. 00 or DE AD BE EF", &app.fill_input,
@@ -2064,6 +2175,48 @@ void draw_about(App& app) {
     ImGui::EndPopup();
 }
 
+// hx.prompt: a script command waits for a value. Enter = OK, Esc = Cancel. While it is open the
+// app's shortcuts are off (handle_shortcuts skips them while any popup is open).
+void draw_script_prompt(App& app) {
+    const ScriptEngine::PendingPrompt* p = app.engine->pending_prompt();
+    center_next_window(app, 0.0f, 0.25f);
+    const std::string id = (p && !p->title.empty() ? p->title : std::string("Script input")) + kPopPrompt;
+    if (!ImGui::BeginPopupModal(id.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (!p) {  // cancelled by the engine (scripts reloaded): nothing to answer
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const float w = 480.0f * app.ui_scale;
+    ImGui::TextDisabled("Script command: %s", p->command.c_str());
+    if (!p->hint.empty()) {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w);
+        ImGui::TextUnformatted(p->hint.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::Spacing();
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(w);
+    const bool enter = ImGui::InputText("##answer", &app.prompt_buf,
+                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    ImGui::Spacing();
+    int answer = enter ? 1 : 0;  // 1 = OK, -1 = Cancel
+    if (ImGui::Button("OK")) answer = 1;
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) answer = -1;
+    ImGui::SameLine();
+    ImGui::TextDisabled("Enter: OK    Esc: cancel");
+    if (answer) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    // Runs the command on (synchronously); it may ask again, which reopens the modal next frame.
+    if (answer > 0) {
+        const std::string text = app.prompt_buf;
+        app.engine->answer_prompt(&text);
+    } else if (answer < 0) {
+        app.engine->answer_prompt(nullptr);
+    }
+}
+
 // Opens at most one pending popup per frame, and only when no popup is open: OpenPopup at the
 // same (root) level would otherwise replace the open one.
 void open_pending_popup(App& app) {
@@ -2096,8 +2249,14 @@ void open_pending_popup(App& app) {
         ImGui::OpenPopup(kPopOverwrite);
         return;
     }
-    if (app.req_palette) {
-        app.req_palette = false;
+    if (const ScriptEngine::PendingPrompt* p = app.engine->pending_prompt()) {  // a script command asks for input
+        app.prompt_buf = p->default_text;
+        ImGui::OpenPopup(kPopPrompt);
+        return;
+    }
+    if (app.req_palette || app.req_bookmark_jump) {
+        app.palette_bookmarks = !app.req_palette;
+        app.req_palette = app.req_bookmark_jump = false;
         app.palette_query.clear();
         build_palette(app);
         ImGui::OpenPopup(kPopPalette);
@@ -2132,6 +2291,134 @@ void draw_popups(App& app) {
     draw_fill(app);
     draw_copy_as_popup(app);
     draw_about(app);
+    draw_script_prompt(app);
+}
+
+// ---- settings window ---------------------------------------------------------------------
+
+bool combo_int(const char* label, int& value, std::initializer_list<int> options, const char* zero_label) {
+    const std::string preview = value == 0 ? std::string(zero_label) : std::to_string(value);
+    bool changed = false;
+    if (ImGui::BeginCombo(label, preview.c_str())) {
+        for (int n : options) {
+            const std::string item = n == 0 ? std::string(zero_label) : std::to_string(n);
+            if (ImGui::Selectable(item.c_str(), value == n)) {
+                changed = value != n;
+                value = n;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+void help_marker(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    ImGui::SetItemTooltip("%s", text);
+}
+
+// One window, a few sections. Every change applies right away and is saved (settings.ini).
+void draw_settings_window(App& app) {
+    if (!app.show_settings) return;
+    const float s = app.ui_scale;
+    center_next_window(app, 0.0f, 0.12f);
+    if (!ImGui::Begin("Settings###settings", &app.show_settings,
+                      ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
+        return;
+    }
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !ImGui::IsAnyItemActive() &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        app.show_settings = false;
+    Settings& st = app.settings;
+    bool changed = false, core = false;
+    ImGui::PushItemWidth(200.0f * s);
+
+    ImGui::SeparatorText("Hex view");
+    changed |= combo_int("Bytes per row", st.bytes_per_row, {0, 8, 16, 24, 32, 48, 64}, "Auto-fit");
+    changed |= combo_int("Group size", st.group_size, {0, 2, 4, 8, 16}, "No grouping");
+    changed |= ImGui::Checkbox("Uppercase hex", &st.uppercase_hex);
+    ImGui::SameLine();
+    changed |= ImGui::Checkbox("Text column", &st.show_ascii);
+    ImGui::SameLine();
+    changed |= ImGui::Checkbox("Tint modified bytes", &st.highlight_modified);
+    int font_px = int(st.font_size);
+    if (ImGui::SliderInt("Font size", &font_px, int(kMinFont), int(kMaxFont), "%d px")) {
+        st.font_size = std::clamp(float(font_px), kMinFont, kMaxFont);
+        changed = true;
+    }
+    help_marker("Hex view font (also Ctrl +/-, Ctrl+wheel, Ctrl+0).");
+    ImGui::SliderFloat("UI scale", &st.ui_scale, 0.5f, 3.0f, "%.2fx");
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        st.ui_scale = std::clamp(std::round(st.ui_scale * 20.0f) / 20.0f, 0.5f, 3.0f);
+        app.dpi_changed = true;  // re-applied between frames
+        changed = true;
+    }
+    help_marker("On top of the monitor's own scale (DPI).");
+
+    ImGui::SeparatorText("Editing");
+    changed |= ImGui::Checkbox("New tabs start in insert mode", &st.insert_mode);
+    changed |= ImGui::Checkbox("Go to: bare numbers are hex", &st.goto_default_hex);
+    if (ImGui::InputInt("Undo: typing pause (ms)", &st.undo_merge_ms, 50, 250)) {
+        st.undo_merge_ms = std::clamp(st.undo_merge_ms, 0, 600000);
+        changed = core = true;
+    }
+    help_marker("Typing becomes a new undo step after a pause longer than this (0 = never).");
+    if (ImGui::InputInt("Undo: max bytes per step", &st.undo_merge_max_bytes, 8, 64)) {
+        st.undo_merge_max_bytes = std::clamp(st.undo_merge_max_bytes, 0, 1 << 20);
+        changed = core = true;
+    }
+    help_marker("A typing run longer than this many bytes starts a new undo step (0 = no limit).");
+
+    ImGui::SeparatorText("Saving");
+    if (ImGui::Checkbox("Keep the original as <file>.backup on the first save", &st.backup_on_save))
+        changed = core = true;
+    ImGui::BeginDisabled(!st.backup_on_save);
+    int mib = int(std::min<uint64_t>(st.backup_max_bytes >> 20, uint64_t(INT_MAX)));
+    if (ImGui::InputInt("Backup size limit (MiB)", &mib, 256, 1024)) {
+        st.backup_max_bytes = uint64_t(std::max(0, mib)) << 20;
+        changed = core = true;
+    }
+    ImGui::EndDisabled();
+    help_marker("Saves that patch the file in place copy it first; files larger than this are not "
+                "copied (0 = no limit). Saves that rewrite the file rename the original instead (free).");
+    ImGui::BeginDisabled(app.session == nullptr);
+    if (ImGui::Checkbox("Hot exit: restore tabs and unsaved edits on start", &st.restore_session)) {
+        app.hot_exit = app.session && st.restore_session;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::InputInt("Session autosave (s)", &st.session_autosave_seconds, 1, 10)) {
+        st.session_autosave_seconds = std::clamp(st.session_autosave_seconds, 1, 3600);
+        changed = true;
+    }
+
+    ImGui::SeparatorText("Fonts (restart Hexer to apply)");
+    static const char* kHinting[] = {"normal", "light", "none", "mono"};
+    if (ImGui::BeginCombo("Hinting", st.font_hinting.c_str())) {
+        for (const char* h : kHinting)
+            if (ImGui::Selectable(h, st.font_hinting == h)) {
+                st.font_hinting = h;
+                changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    help_marker("normal: crispest (the font's own hints)  light: truer shapes  none: soft  mono: aliased");
+    ImGui::PushItemWidth(360.0f * s);
+    changed |= ImGui::InputTextWithHint("Hex font file", "auto (Cascadia Mono, Consolas, ...)", &st.mono_font);
+    changed |= ImGui::InputTextWithHint("UI font file", "auto (Segoe UI, Inter, ...)", &st.ui_font);
+    ImGui::PopItemWidth();
+    ImGui::TextDisabled("Loaded: %s, %s (%s)", app.fonts.mono_path.empty() ? "built-in" : path_filename(app.fonts.mono_path).c_str(),
+                        app.fonts.ui_path.empty() ? "built-in" : path_filename(app.fonts.ui_path).c_str(),
+                        app.fonts.freetype ? "FreeType" : "stb_truetype");
+    ImGui::PopItemWidth();
+    ImGui::Spacing();
+    ImGui::TextDisabled("Changes apply right away and are saved to settings.ini.");
+    ImGui::SetItemTooltip("%s", paths::settings_file().c_str());
+    if (changed) mark_settings_dirty(app);
+    if (core) apply_core_settings(st);
+    ImGui::End();
 }
 
 // ---- notifications (toasts, bottom-right) ------------------------------------------------
@@ -2400,6 +2687,7 @@ void frame(App& app) {
     draw_dockspace(app);
     draw_editor(app);
     draw_panels(app);
+    draw_settings_window(app);
     draw_notifications(app);
     draw_popups(app);
     handle_shortcuts(app);
@@ -2422,11 +2710,24 @@ void on_drop(GLFWwindow* w, int count, const char** paths) {
         if (paths[i]) app->pending_open.emplace_back(paths[i]);
 }
 
+// Scale for sizes in window coordinates. Where the framebuffer is denser than window coordinates
+// (macOS Retina, Wayland) ImGui already rasterises fonts at framebuffer density, so only the rest
+// of the monitor's content scale applies; on Windows/X11 (density 1) it is the content scale.
+float ui_dpi_scale(GLFWwindow* w, float content_scale) {
+    int ww = 0, wh = 0, fw = 0, fh = 0;
+    glfwGetWindowSize(w, &ww, &wh);
+    glfwGetFramebufferSize(w, &fw, &fh);
+    const float density = (ww > 0 && fw > 0) ? float(fw) / float(ww) : 1.0f;
+    return content_scale > 0.0f ? std::max(0.25f, content_scale / density) : 1.0f;
+}
+
 // Monitor DPI changed (window moved to another monitor, system scale changed).
 void on_content_scale(GLFWwindow* w, float sx, float /*sy*/) {
     App* app = static_cast<App*>(glfwGetWindowUserPointer(w));
-    if (!app || sx <= 0.0f || sx == app->dpi_scale) return;
-    app->dpi_scale = sx;
+    if (!app || sx <= 0.0f) return;
+    const float s = ui_dpi_scale(w, sx);
+    if (s == app->dpi_scale) return;
+    app->dpi_scale = s;
     app->dpi_changed = true;
 }
 
@@ -2479,7 +2780,8 @@ void restore_session(App& app) {
 // scopes it to that directory, so test runs never reach the user's instance. If the running
 // instance does not respond within a few seconds, the message is withdrawn and we start normally.
 bool forward_to_running_instance(const AppOptions& opts) {
-    if (opts.no_session || opts.new_instance || !opts.run_lua.empty() || !opts.screenshot.empty() || opts.frames > 0)
+    if (opts.no_session || opts.new_instance || !opts.run_lua.empty() || !opts.actions.empty() || !opts.screenshot.empty() ||
+        opts.frames > 0)
         return false;
     const std::string dir = paths::session_dir();
     if (!session_primary_running(dir)) return false;
@@ -2575,6 +2877,7 @@ int run_app(const AppOptions& opts) {
     paths::ensure_dirs();
     app.settings.load(paths::settings_file());
     if (forward_to_running_instance(opts)) return 0;
+    apply_core_settings(app.settings);
 
     glfwSetErrorCallback(on_glfw_error);
     if (!glfwInit()) {
@@ -2597,9 +2900,9 @@ int run_app(const AppOptions& opts) {
     // every start and followed at runtime (on_content_scale).
     float sx = 1.0f, sy = 1.0f;
     glfwGetWindowContentScale(app.window, &sx, &sy);
-    app.dpi_scale = sx > 0.0f ? sx : 1.0f;
+    app.dpi_scale = ui_dpi_scale(app.window, sx);
     // Older versions stored the monitor scale itself as ui_scale on first run: make it 1.0 once.
-    if (app.settings.migrate_ui_scale(app.dpi_scale)) app.settings.save(paths::settings_file());
+    if (app.settings.migrate_ui_scale(sx > 0.0f ? sx : 1.0f)) app.settings.save(paths::settings_file());
     app.ui_scale = std::clamp(app.dpi_scale * app.settings.ui_scale, 0.5f, 4.0f);
     app.settings.font_size = std::clamp(app.settings.font_size, kMinFont, kMaxFont);
 
@@ -2614,15 +2917,29 @@ int run_app(const AppOptions& opts) {
     GImGui->ConfigNavWindowingKeyNext = 0;  // Ctrl+Tab switches document tabs instead
     GImGui->ConfigNavWindowingKeyPrev = 0;
 
-    app.fonts = load_fonts(kUiFontPx * app.ui_scale, app.settings.font_size * app.ui_scale);
+    FontOptions font_opt;
+    font_opt.ui_path = app.settings.ui_font;
+    font_opt.mono_path = app.settings.mono_font;
+    font_opt.hinting = app.settings.font_hinting;
+    app.fonts = load_fonts(kUiFontPx * app.ui_scale, app.settings.font_size * app.ui_scale, font_opt);
     apply_dark_theme(app.ui_scale);
     ImGui_ImplGlfw_InitForOpenGL(app.window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
     const bool nfd_ok = NFD_Init() == NFD_OKAY;
 
     startup(app);
+    {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.2f", double(app.dpi_scale));
+        log_console(app, ConsoleLine::Info,
+                    std::string("Fonts: ") + (app.fonts.freetype ? "FreeType, hinting " + app.settings.font_hinting : "stb_truetype") +
+                        ", monitor scale " + buf + ", mono " +
+                        (app.fonts.mono_path.empty() ? "built-in" : app.fonts.mono_path) + ", ui " +
+                        (app.fonts.ui_path.empty() ? "built-in" : app.fonts.ui_path));
+    }
 
     int frame_no = 0, exit_code = 0, extra_frames = 2;
+    bool actions_done = opts.actions.empty();
     const ImVec4 clear = col4(hex_colors().background);
     while (!app.quit) {
         if (opts.frames > 0 || app.wants_poll) {
@@ -2656,6 +2973,19 @@ int run_app(const AppOptions& opts) {
 
         ++frame_no;
         if (frame_no == 1 && !opts.run_lua.empty()) app.engine->exec(opts.run_lua);
+        // --action: once the first layout has settled (its focus changes would close popups).
+        if (!actions_done && frame_no >= 2 && app.layout_focus_step == 0) {
+            actions_done = true;
+            for (const std::string& name : opts.actions) {
+                const Action* a = find_action(name.c_str());
+                if (!a)
+                    std::fprintf(stderr, "hexer: --action: unknown action '%s'\n", name.c_str());
+                else if (!action_enabled(app, *a))
+                    std::fprintf(stderr, "hexer: --action: '%s' is not available now\n", name.c_str());
+                else
+                    a->run(app);
+            }
+        }
         if (opts.frames > 0 && frame_no >= opts.frames) {
             if (!opts.screenshot.empty() && !write_ppm(opts.screenshot, fw, fh)) exit_code = 1;
             app.quit = true;

@@ -1,6 +1,7 @@
 #pragma once
 // User settings + per-OS directories. Settings are a plain "key = value" text file so they are
 // easy to hand-edit; unknown keys are preserved-ignored, missing keys keep defaults.
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +23,21 @@ struct Settings {
     int session_autosave_seconds = 3;  // crash-safety interval while dirty
     bool goto_default_hex = true;
     bool highlight_modified = true;    // tint bytes that differ from disk
+    // Typing-run undo coalescing: a pause longer than undo_merge_ms, or a run already covering
+    // undo_merge_max_bytes bytes, starts a new undo step (0 = no limit). See Document::set_undo_merge.
+    int undo_merge_ms = 500;
+    int undo_merge_max_bytes = 32;
+    // First save over an existing file keeps the previous contents as "<file>.backup". In-place
+    // saves of files larger than backup_max_bytes skip that copy (0 = no limit).
+    bool backup_on_save = true;
+    uint64_t backup_max_bytes = 4ull << 30;
+    // ---- Fonts (read at startup) ----
+    std::string mono_font;              // monospace font file path; "" = auto (Cascadia Mono, Consolas, JetBrains Mono, DejaVu Sans Mono...)
+    std::string ui_font;                // UI font file path; "" = auto (Segoe UI, Inter, DejaVu Sans...)
+    // FreeType hinting: "normal" (font's own hints, crispest) | "light" (vertical only, truer
+    // shapes) | "none" (blurry, like stb_truetype) | "mono" (aliased); other values keep the default.
+    std::string font_hinting = "normal";
+    // ---- end fonts ----
     std::vector<std::string> recent_files;  // most recent first, max 20
     // Keys this version does not know (e.g. written by a newer Hexer); written back unchanged by save().
     std::vector<std::pair<std::string, std::string>> unknown_keys;

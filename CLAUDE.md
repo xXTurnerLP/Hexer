@@ -29,7 +29,8 @@ src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, 
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
-tests/       doctest; one exe per module: test_core, test_util, test_script
+tests/       doctest; one exe per module: test_core, test_util, test_script, test_search,
+             test_ui (headless ImGui: drives HexView with simulated mouse/keyboard)
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion)
 ```
 Headers are the module contracts. Changing a public signature means updating every caller —
@@ -55,8 +56,24 @@ Visual smoke test (no human needed):
 build\src\hexer.exe --config-dir <tmp> --no-session --screenshot shot.ppm --frames 30 some.bin
 python tools\ppm2png.py shot.ppm shot.png      # then view the PNG
 ```
-Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`.
-Script commands can be driven from `--exec` with `hx.run("<command name>")`.
+Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`,
+`--action "<name>"` (run a menu/palette action once the layout settled, e.g. `"Settings..."`,
+`"Show All Bookmarks"`, `"Jump to Bookmark..."`; repeatable).
+Script commands can be driven from `--exec` with `hx.run("<command name>")`; a command that calls
+`hx.prompt` leaves its modal open in the screenshot.
+
+Headless UI tests (`tests/test_ui.cpp`, target `test_ui`): an ImGui context with no window/GL
+(`io.DisplaySize` set by hand, `ImGuiBackendFlags_RendererHasTextures` so fonts bake without a
+renderer). The `Ui` fixture owns a Document + HexView in a full-size host window; `ui.click(pos,
+mods)`, `ui.drag(a, b)`, `ui.key(ImGuiKey_X, mods)`, `ui.type("ab")` queue io events one frame each,
+and `ui.hex(off)` / `ui.txt(off)` give the screen position of a drawn byte (`HexView::cell_pos`).
+Every change to input handling or hit testing in `ui/hex_view.cpp` gets a case there.
+Use `Document::set_clock_for_tests` for undo-merge timing.
+
+Selection convention (one for the whole UI, see `ui/hex_view.h`): `ViewState` selection is
+half-open `[sel_begin, sel_end)`; the caret is drawn on `caret_byte()` (inside the selection);
+the Inspector/status bar/inspector edits use `focus_offset()` (selection start, else caret);
+ranges are displayed with `fmt_range()` (inclusive end).
 
 ## Conventions
 - namespace `hx`; 4-space indent; `snake_case` functions/vars, `PascalCase` types, `trailing_` members.

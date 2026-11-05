@@ -3,6 +3,7 @@
 // All paths are UTF-8; converted to UTF-16 internally on Windows.
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,6 +58,9 @@ FileStat os_stat(const std::string& path);
 // (FAT/exFAT/SMB). POSIX: rename + fsync of the directory.
 bool os_replace_file(const std::string& src, const std::string& dst, std::string* err = nullptr);
 bool os_remove(const std::string& path);
+// Creates `link_path` as another name (hard link) of the existing file `existing`. Fails where the
+// filesystem has no hard links (FAT/exFAT, some network shares) or `link_path` exists.
+bool os_hard_link(const std::string& existing, const std::string& link_path, std::string* err = nullptr);
 bool os_mkdirs(const std::string& path);  // like mkdir -p; true if it exists afterwards
 // Non-recursive listing of regular files whose name ends with `ext` (e.g. ".lua", case-insensitive).
 // Returns full paths sorted by name.
@@ -75,6 +79,14 @@ std::string os_absolute_path(const std::string& p);            // absolute + lex
 std::string os_resolve_symlinks(const std::string& p);
 // POSIX: copy permission bits from `from` to `to` (used when a save replaces a file). Windows: no-op.
 bool os_copy_permissions(const std::string& from, const std::string& to);
+// Copies the regular file `src` to `dst` (created or replaced) with the fastest method available:
+// Windows CopyFileExW (unbuffered for big files); Linux FICLONE reflink (instant on btrfs/xfs), then
+// copy_file_range; else a read/write loop. Permission bits are kept (POSIX) and dst is flushed.
+// `progress(done, total)` (may be empty) is called now and then, finally with done == total;
+// returning false cancels. On failure dst is removed; *cancelled says whether it was a cancel.
+bool os_copy_file(const std::string& src, const std::string& dst,
+                  const std::function<bool(uint64_t done, uint64_t total)>& progress,
+                  std::string* err = nullptr, bool* cancelled = nullptr);
 
 // Exclusive inter-process lock on `path` (created if missing), held until the object is destroyed
 // and released by the OS if the process dies. Returns null if it cannot be taken; *held_elsewhere

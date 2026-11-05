@@ -16,7 +16,14 @@
 - [x] Smart Goto (Ctrl+G): hex/dec, relative, %, end-N, expressions
 - [x] Search (Ctrl+F, F3/Shift+F3): hex with `??`, text, UTF-16, case-insensitive; background; find-all list
 - [x] Copy as (hex, C array, Python bytes, Base64, escaped); lenient paste parsing
-- [x] Bookmarks with names/notes (Ctrl+B, F2 / Shift+F2), persisted
+- [x] Bookmarks with names and notes (Ctrl+B, F2 / Shift+F2), persisted; Bookmarks panel (this file /
+      all open files, preview bytes), Bookmarks menu, Ctrl+Shift+B quick jump, scrollbar ticks
+- [x] Backup on the first save (`<file>.backup`; hard link / rename for rewrites, fast copy for in-place, size limit)
+- [x] Settings window (Edit > Settings..., Ctrl+,): view, undo grouping, backups, session, fonts
+- [x] Typing undo grouping limits (pause / bytes per step)
+- [x] One selection convention: caret drawn inside the selection, Inspector/status at the first
+      selected byte, inclusive ranges everywhere; headless UI tests for mouse/keyboard input
+- [x] Script prompts (`hx.prompt`) with a modal dialog; XOR-with-key asks for the key
 - [x] Lua scripting: parsers → structure tree + colored highlights, editable fields (serializer),
       commands, console REPL, hot reload, example scripts
 - [x] Status bar: offset hex/dec, selection, size, INS/OVR, parser, save progress
@@ -47,7 +54,10 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Disassembly at cursor (Capstone: x86/x64/ARM/AArch64/...)
 - [ ] Live tail mode for growing files (captures, logs)
 - [ ] XOR / rotate brute-force helpers to find simple obfuscation
-- [ ] Script API: `doc:view_range()` (visible bytes) and a prompt/input call so commands can ask for values
+- [ ] Script API: `doc:view_range()` (visible bytes); bookmark access from Lua
+- [ ] "Restore from .backup" command (swap the file with its `.backup`, or open the backup side by side)
+- [ ] Live font reload from the Settings window (font file / hinting changes need a restart now)
+- [ ] Settings: remember the Bookmarks panel's "All open files" toggle
 - [ ] Linux CI + AppImage; Windows portable zip
 - [ ] Run parsers on a worker thread over a Snapshot (a parse slower than ~50 ms is currently
       not re-run after edits; the Structure panel shows it as stale until F5)

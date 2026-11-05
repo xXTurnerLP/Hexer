@@ -19,6 +19,13 @@
 
 namespace hx {
 
+constexpr int kParseTimeLimitMs = 2000;
+constexpr int kDetectTimeLimitMs = 1000;
+constexpr int kScriptTimeLimitMs = 10000;   // script load, commands, console
+constexpr int kGcTimeLimitMs = 1000;        // each __gc finalizer (also at reload / exit)
+constexpr int kHookCount = 4096;            // instructions between time checks
+constexpr size_t kMaxFields = 200000;
+
 struct ScriptEngine::Impl {
     explicit Impl(ScriptEngine& e) : eng(e) {}
     ~Impl() { close_state(); }
@@ -51,6 +58,26 @@ struct ScriptEngine::Impl {
     bool timed_out = false;
     int limit_ms = 0;              // for the timeout message
     int depth = 0;                 // nesting of protected calls (callbacks may re-enter the engine)
+
+    int script_limit_ms = kScriptTimeLimitMs;  // script load, commands, console
+
+    // Commands run on a coroutine so hx.prompt can suspend them (see run_command / answer_prompt).
+    lua_State* cmd_thread = nullptr;  // command coroutine running right now (hx.prompt yields it)
+    int inline_runs = 0;              // hx.run nesting inside cmd_thread
+    bool prompt_requested = false;    // set by hx.prompt right before it yields
+    PendingPrompt prompt;             // its request; valid while waiting
+    bool waiting = false;             // a command is suspended in hx.prompt
+    int waiting_ref = LUA_NOREF;      // registry ref keeping its coroutine alive
+    lua_State* waiting_co = nullptr;
+    uint64_t waiting_doc = 0;         // document that gets the command's undo group (0 = none)
+    void drop_waiting();              // forget the suspended command (state reset / reload)
+
+    // Resumes `co` (nargs pushed) under the script time limit, as pcall does. Returns the
+    // lua_resume status; on error sets *err to "msg\nstack traceback..". Yielded values are popped.
+    int resume(lua_State* co, int nargs, std::string* err);
+    // Resumes a command coroutine (ref = its registry ref) inside the command's undo group on
+    // doc `doc_id`; records the prompt if it yields in hx.prompt, else logs errors and frees it.
+    void step_command(lua_State* co, int ref, const std::string& name, uint64_t doc_id, int nargs);
 
     std::unordered_set<uint64_t> hl_dirty;  // doc ids whose script highlights need finalize()
     std::string warn_buf;          // pieces of a multi-part lua_warning message
@@ -97,12 +124,5 @@ std::string format_float(double v, bool is_f32);
 
 // Splits a pcall error ("file:line: msg\nstack traceback:...") into its first part.
 std::string error_head(const std::string& full);
-
-constexpr int kParseTimeLimitMs = 2000;
-constexpr int kDetectTimeLimitMs = 1000;
-constexpr int kScriptTimeLimitMs = 10000;   // script load, commands, console
-constexpr int kGcTimeLimitMs = 1000;        // each __gc finalizer (also at reload / exit)
-constexpr int kHookCount = 4096;            // instructions between time checks
-constexpr size_t kMaxFields = 200000;
 
 }  // namespace hx

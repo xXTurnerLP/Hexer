@@ -17,7 +17,17 @@
 //   hx.version                          "0.1.0"
 //   hx.parser{ name=, extensions={"png",..}, detect=function(doc) -> bool, parse=function(p, doc) }
 //   hx.command{ name=, description=, run=function(doc) }   -- shown in palette + Scripts menu
-//   hx.run(name)                        -- run a registered command (as the palette does)
+//   hx.run(name)                        -- run a registered command (as the palette does); inside
+//                                          a command it runs inline, as part of the caller's step
+//   hx.prompt(title, default?, {hint=}?) -> string | nil   -- ask the user for one line of text
+//       (nil = cancelled). Only inside commands (else error "hx.prompt is only available inside
+//       commands"): the command is suspended (a coroutine) while the dialog is open, the time limit
+//       applies to each slice of Lua time separately, edits before and after the prompt are
+//       separate undo steps, and a doc closed meanwhile raises "document closed" as usual. Not
+//       inside doc:transaction (one undo step cannot span the dialog). One prompt at a time:
+//       starting another command while one waits is refused; a script reload cancels it.
+//         local key = hx.prompt("XOR key", "FF", { hint = "hex bytes" })
+//         if not key then return end
 //   print(...) / hx.log(...) / hx.warn(...) / hx.error(...)  -- to the console; tables pretty-printed
 //   hx.inspect(v, depth?) -> string    -- pretty-printer used by print (depth 1..64, default 6;
 //                                         output stops at ~1 MiB of keys/values)
@@ -184,7 +194,23 @@ public:
 
     // ---- commands & highlights ---------------------------------------------------------------
     const std::vector<ScriptCommand>& commands() const { return commands_; }
+    // Runs the command on a coroutine; refused (console error) while a prompt is pending.
     void run_command(const std::string& name);
+
+    // ---- hx.prompt ---------------------------------------------------------------------------
+    // A command waiting in hx.prompt. The UI shows a modal (title, hint, a text field preset with
+    // default_text) while pending_prompt() is non-null and calls answer_prompt() once: the text on
+    // OK/Enter, nullptr on Cancel/Escape. answer_prompt resumes the command synchronously (it may
+    // prompt again, so re-check pending_prompt() afterwards); errors go to the console.
+    struct PendingPrompt {
+        std::string title, default_text, hint;
+        std::string command;   // name of the waiting command
+    };
+    const PendingPrompt* pending_prompt() const;  // nullptr if none
+    void answer_prompt(const std::string* text);  // no-op without a pending prompt
+
+    // Time limit for script load, commands and console lines (default 10 s; tests lower it).
+    void set_script_time_limit_ms(int ms);
     // Ranges created with hx.highlight(); app passes them to the hex view as a layer.
     const HighlightSet* script_highlights(uint64_t doc_id) const;  // nullptr if none
 

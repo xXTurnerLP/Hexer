@@ -696,6 +696,14 @@ TEST_CASE("paths with override + settings round trip") {
     s.session_autosave_seconds = 10;
     s.goto_default_hex = false;
     s.highlight_modified = false;
+    CHECK(s.undo_merge_ms == 500);
+    CHECK(s.undo_merge_max_bytes == 32);
+    CHECK(s.backup_on_save == true);
+    CHECK(s.backup_max_bytes == (4ull << 30));
+    s.undo_merge_ms = 750;
+    s.undo_merge_max_bytes = 0;
+    s.backup_on_save = false;
+    s.backup_max_bytes = 123ull << 32;  // needs more than 32 bits
     for (int i = 0; i < 25; ++i) s.push_recent("C:/files/f" + std::to_string(i) + ".bin");
     REQUIRE(s.recent_files.size() == 20);
     CHECK(s.recent_files.front() == "C:/files/f24.bin");
@@ -724,6 +732,10 @@ TEST_CASE("paths with override + settings round trip") {
     CHECK(t.session_autosave_seconds == 10);
     CHECK(t.goto_default_hex == false);
     CHECK(t.highlight_modified == false);
+    CHECK(t.undo_merge_ms == 750);
+    CHECK(t.undo_merge_max_bytes == 0);
+    CHECK(t.backup_on_save == false);
+    CHECK(t.backup_max_bytes == (123ull << 32));
     CHECK(t.recent_files == s.recent_files);
     CHECK(t.recent_files.back() == "D:/with spaces/= equals.bin");
 }
@@ -739,6 +751,9 @@ TEST_CASE("settings: hand-edited file, unknown keys preserved, bad values ignore
         "group_size = banana\n"
         "uppercase_hex = no\n"
         "font_size = 1000\n"          // clamped
+        "undo_merge_ms = -5\n"        // clamped to 0 (no time limit)
+        "backup_max_bytes = lots\n"   // malformed: default kept
+        "backup_on_save = off\n"
         "future_option = 42\n"
         "no equals sign here\n"
         "recent3 = /tmp/c.bin\n"
@@ -752,6 +767,9 @@ TEST_CASE("settings: hand-edited file, unknown keys preserved, bad values ignore
     CHECK(s.group_size == def.group_size);
     CHECK(s.uppercase_hex == false);
     CHECK(s.font_size <= 96.0f);
+    CHECK(s.undo_merge_ms == 0);
+    CHECK(s.backup_max_bytes == def.backup_max_bytes);
+    CHECK(s.backup_on_save == false);
     CHECK(s.recent_files == std::vector<std::string>{"/tmp/a.bin", "/tmp/c.bin"});
     REQUIRE(s.save(f));
     std::string back;
@@ -762,6 +780,45 @@ TEST_CASE("settings: hand-edited file, unknown keys preserved, bad values ignore
     REQUIRE(t.load(f));
     CHECK(t.recent_files == s.recent_files);
     CHECK(t.unknown_keys.size() == 2);
+}
+
+TEST_CASE("settings: font fields round trip, hinting is validated") {
+    TempDir tmp;
+    std::string f = path_join(tmp.path, "settings.ini");
+    Settings def;
+    CHECK(def.mono_font.empty());
+    CHECK(def.ui_font.empty());
+    CHECK(def.font_hinting == "normal");
+
+    Settings s;
+    s.mono_font = "C:/Fonts/My Mono = 1.ttf";  // spaces and '=' survive (split at the first '=')
+    s.ui_font = "/usr/share/fonts/ui.ttf";
+    s.font_hinting = "light";
+    REQUIRE(s.save(f));
+    Settings t;
+    REQUIRE(t.load(f));
+    CHECK(t.mono_font == s.mono_font);
+    CHECK(t.ui_font == s.ui_font);
+    CHECK(t.font_hinting == "light");
+
+    for (const char* ok : {"none", "light", "normal", "mono"}) {
+        std::string text = std::string("font_hinting = ") + ok + "\n";
+        REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+        Settings u;
+        REQUIRE(u.load(f));
+        CHECK(u.font_hinting == ok);
+    }
+    std::string text = "font_hinting = SUPER\nmono_font =\n";  // unknown mode: default; empty = auto
+    REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+    Settings u;
+    u.mono_font = "x.ttf";
+    REQUIRE(u.load(f));
+    CHECK(u.font_hinting == "normal");
+    CHECK(u.mono_font.empty());
+    text = "font_hinting = Light\n";  // case-insensitive, stored lower-case
+    REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+    REQUIRE(u.load(f));
+    CHECK(u.font_hinting == "light");
 }
 
 TEST_CASE("settings: a DPI-derived ui_scale from an older version is reset to 1.0 once") {

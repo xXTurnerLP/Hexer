@@ -2,17 +2,15 @@
 --
 -- Commands appear in the command palette (Ctrl+Shift+P) and the Scripts menu. `run(doc)` gets the
 -- active document (or nil). Everything a command edits is ONE undo step (Ctrl+Z reverts it all).
---
--- Commands cannot prompt for input; settings are plain globals you change from the console, e.g.
---   hx_xor_key = 0x5A            -- single-byte key
---   hx_xor_key = "secret"        -- multi-byte key, applied cyclically
--- (Globals survive until the scripts are reloaded; put them in your own user script to keep them.)
+-- hx.prompt(title, default, { hint = ... }) asks the user for a line of text (nil = cancelled).
 
-hx_xor_key = hx_xor_key or 0xFF
+-- Last XOR key entered (the prompt's default next time; survives until the scripts are reloaded).
+hx_xor_key = hx_xor_key or "FF"
 
 -- Byte-by-byte work in Lua runs at a few MB/s and commands run on the UI thread (10 s limit), so
--- these commands cap how much they touch.
-local MAX_XOR = 4 * 1024 * 1024
+-- these commands cap how much they touch (XOR works on 8-byte words, so it can do more).
+local MAX_XOR = 256 * 1024 * 1024
+local MAX_XOR_KEY = 4096
 local MAX_SUM = 16 * 1024 * 1024
 local CHUNK = 64 * 1024
 
@@ -34,29 +32,64 @@ local function selection(doc, max)
     return start, len
 end
 
+-- "FF", "DE AD BE EF", "0x12,0x34" (anything paste accepts) or a quoted text key: "secret".
+-- Returns the key bytes, or nil and why not.
+local function parse_key(text)
+    text = text:match("^%s*(.-)%s*$")
+    local key = text:match('^"(.*)"$') or text:match("^'(.*)'$")
+    if not key then
+        local ok, bytes = pcall(hx.unhex, text)
+        if not ok then return nil, "not hex bytes or a quoted text: " .. text end
+        key = bytes
+    end
+    if #key == 0 then return nil, "the key is empty" end
+    if #key > MAX_XOR_KEY then return nil, string.format("the key is longer than %d bytes", MAX_XOR_KEY) end
+    return key
+end
+
+-- XORs [start, start+len) with `key` repeated from the first byte, 8 bytes per Lua operation.
+local function xor_range(doc, start, len, key)
+    local k = #key
+    local a, b = k, 8
+    while b ~= 0 do a, b = b, a % b end
+    local period = k * 8 // a                         -- the key stream repeats every lcm(k, 8) bytes
+    local stream = key:rep(period // k)
+    local nw = period // 8
+    local words = { string.unpack("<" .. string.rep("i8", nw), stream) }
+    local chunk = period * math.max(1, CHUNK // period)   -- whole periods: each chunk starts at key[1]
+    for off = 0, len - 1, chunk do
+        local data = doc:read(start + off, math.min(chunk, len - off))
+        local n = #data // 8
+        local fmt = "<" .. string.rep("i8", n)
+        local v = { string.unpack(fmt, data) }
+        for i = 1, n do v[i] = v[i] ~ words[(i - 1) % nw + 1] end
+        local tail = {}
+        for i = n * 8 + 1, #data do
+            tail[#tail + 1] = string.char(data:byte(i) ~ stream:byte((i - 1) % period + 1))
+        end
+        doc:write(start + off, string.pack(fmt, table.unpack(v, 1, n)) .. table.concat(tail))
+    end
+end
+
 hx.command {
     name = "Selection: XOR with key",
-    description = "XOR the selected bytes with hx_xor_key (number 0-255 or a string key)",
+    description = "XOR the selected bytes with a key you enter (hex bytes or \"text\", repeated)",
     run = function(doc)
         local start, len = selection(doc, MAX_XOR)
         if not start then return end
-        local key = hx_xor_key
-        if type(key) == "number" then key = string.char(key & 0xFF) end
-        if type(key) ~= "string" or #key == 0 then return hx.error("hx_xor_key must be a number or a non-empty string") end
-
-        local klen = #key
-        local kbytes = { key:byte(1, -1) }
-        for off = 0, len - 1, CHUNK do
-            local data = doc:read(start + off, math.min(CHUNK, len - off))
-            local out = {}
-            for i = 1, #data do
-                -- (off + i - 1) is the position inside the selection -> key index
-                out[i] = string.char(data:byte(i) ~ kbytes[(off + i - 1) % klen + 1])
-            end
-            doc:write(start + off, table.concat(out))
-        end
+        local default = type(hx_xor_key) == "number" and string.format("%02X", hx_xor_key & 0xFF)
+                        or tostring(hx_xor_key)
+        local text = hx.prompt(string.format("XOR %d selected bytes with key", len), default, {
+            hint = 'Hex bytes: FF  or  DE AD BE EF  or  0x12,0x34\nText in quotes: "secret"\n'
+                .. "The key repeats over the selection.",
+        })
+        if not text then return end                  -- cancelled
+        local key, why = parse_key(text)
+        if not key then return hx.error("XOR: " .. why) end
+        hx_xor_key = text
+        doc:transaction(function() xor_range(doc, start, len, key) end, "XOR selection")
         print(string.format("XORed %d bytes at 0x%X with %s", len, start,
-            klen == 1 and string.format("0x%02X", kbytes[1]) or hx.inspect(key)))
+            #key <= 16 and hx.hex(key) or string.format("a %d-byte key", #key)))
     end,
 }
 
