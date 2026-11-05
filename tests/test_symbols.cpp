@@ -444,8 +444,7 @@ TEST_CASE("symbols: the job keeps its table when an edit misses the tables") {
     const size_t alpha = find_bytes(pe, "Alpha");
     const uint8_t B = 'B';
     REQUIRE(d->overwrite(alpha, &B, 1));
-    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
-    CHECK_FALSE(job.current());
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));  // (may already be done: no current() check)
     job.wait();
     CHECK(job.current());
     CHECK(job.builds() == 2);
