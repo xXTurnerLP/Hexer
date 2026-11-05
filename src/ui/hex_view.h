@@ -40,6 +40,11 @@ struct HexViewConfig {
     // Extra scrollbar tick marks (e.g. Find All hits): sorted offsets, drawn at most one per pixel.
     const std::vector<uint64_t>* tick_offsets = nullptr;
     uint32_t tick_color = 0;
+    // Follow pointer (Ctrl+hover / Ctrl+click): the hovered byte starts an unsigned integer of
+    // pointer_width bytes (1, 2, 4, 8); the target offset is value - pointer_base (core/nav.h).
+    int pointer_width = 4;
+    bool pointer_big_endian = false;
+    uint64_t pointer_base = 0;
 };
 
 // Pixel geometry of the last draw() (screen coordinates), for tests and automation.
@@ -60,6 +65,13 @@ struct HexViewEvents {
     uint64_t hover_offset = 0;      // byte under the mouse when has_hover
     int bytes_per_row = 16;         // effective value after auto-fit
     int visible_rows = 0;
+    // Ctrl+click on a byte whose pointer decodes inside the file (target <= size). The caret does
+    // not move; the app jumps to follow_target and records follow_from in its NavHistory.
+    bool follow_requested = false;
+    uint64_t follow_target = 0;
+    uint64_t follow_from = 0;       // the clicked byte (start of the pointer)
+    bool nav_back = false;          // mouse X1 (back) pressed while the view is hovered
+    bool nav_forward = false;       // mouse X2 (forward) pressed while the view is hovered
 };
 
 // One instance per open tab (keeps drag/scrollbar interaction state).
@@ -74,7 +86,10 @@ struct HexViewEvents {
 // insert mode (in overwrite mode it only moves left), mouse click/drag selects (bytes a..b
 // inclusive; a click on the second hex digit puts the caret on the low nibble; a click below the
 // last row or past the last byte puts the caret at EOF), Shift+click extends from the selection's
-// fixed end, double-click selects the highlight (field) under the mouse, wheel scrolls
+// fixed end, double-click selects the highlight (field) under the mouse, Ctrl+hover underlines the
+// pointer (cfg.pointer_*) starting at the hovered byte with a tooltip of its target and Ctrl+click
+// on a byte reports ev.follow_requested instead of moving the caret (nothing for a pointer that is
+// unreadable or points beyond EOF), mouse X1/X2 set ev.nav_back / nav_forward, wheel scrolls
 // 3 rows (Ctrl+wheel is left to the app for zoom), dragging the custom scrollbar maps linearly to
 // the 64-bit row range.
 class HexView {

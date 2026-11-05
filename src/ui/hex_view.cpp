@@ -10,10 +10,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 
 #include "imgui.h"
 #include "imgui_internal.h"  // ImGuiWindow::InnerRect (exact visible area of the child window)
 
+#include "core/nav.h"
 #include "core/util.h"
 #include "ui/theme.h"
 
@@ -37,6 +39,7 @@ namespace {
 constexpr int kMaxBytesPerRow = 256;
 constexpr int kMaxAutoBytesPerRow = 128;
 constexpr int kWheelRows = 3;
+constexpr int kMouseBack = 3, kMouseForward = 4;  // X1 / X2 (GLFW_MOUSE_BUTTON_4 / _5)
 
 // ---- layout ------------------------------------------------------------------------------------
 
@@ -332,6 +335,8 @@ struct TextRun {
     }
 };
 
+constexpr uint32_t kLinkColor = IM_COL32(0x6c, 0xa4, 0xff, 0xff);  // follow-pointer underline
+
 uint32_t with_alpha(uint32_t c, uint32_t a) { return (c & 0x00FFFFFFu) | (a << 24); }
 
 // Highlight colors arrive opaque; the view tints them. Explicitly translucent colors are kept.
@@ -365,6 +370,24 @@ void fill_range(ImDrawList* dl, const Layout& L, uint64_t top, uint64_t draw_row
         }
         if (text && L.ascii)
             dl->AddRectFilled(ImVec2(L.text_byte_x(a), y0), ImVec2(L.text_byte_x(b), y1), color, rounding, flags);
+    }
+}
+
+// Underlines [begin, end) in the visible rows, hex and text column (the follow-pointer link).
+void underline_range(ImDrawList* dl, const Layout& L, uint64_t top, uint64_t draw_rows, uint64_t begin,
+                     uint64_t end, uint32_t color) {
+    if (end <= begin || draw_rows == 0) return;
+    const uint64_t bpr = uint64_t(L.bpr);
+    uint64_t first = std::max(begin / bpr, top);
+    uint64_t last = std::min((end - 1) / bpr, top + draw_rows - 1);
+    for (uint64_t row = first; row <= last; ++row) {
+        uint64_t rs = row * bpr;
+        int a = int(std::max(begin, rs) - rs);
+        int b = int(std::min(end, rs + bpr) - rs);  // exclusive
+        float y = std::floor(L.row_y(row, top) + L.text_dy + L.font_px) + 1.0f;
+        const float t = std::max(1.0f, std::floor(L.font_px / 12.0f));
+        dl->AddRectFilled(ImVec2(L.hex_byte_x(a), y), ImVec2(L.hex_byte_x(b - 1) + 2.0f * L.adv, y + t), color);
+        if (L.ascii) dl->AddRectFilled(ImVec2(L.text_byte_x(a), y), ImVec2(L.text_byte_x(b), y + t), color);
     }
 }
 
@@ -567,9 +590,23 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         v.low_nibble = false;
     };
 
+    if (ImGui::IsWindowHovered()) {
+        if (ImGui::IsMouseClicked(kMouseBack)) ev.nav_back = true;
+        if (ImGui::IsMouseClicked(kMouseForward)) ev.nav_forward = true;
+    }
+
     if (data_hovered) {
         Hit h = hit_test(L, mouse, v.top_row, size);
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (io.KeyCtrl && !io.KeyShift && h.on_byte && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // Follow pointer: the app jumps (and records history); the caret stays put.
+            dragging_select_ = false;
+            uint64_t t = 0;
+            if (decode_pointer(doc, h.off, cfg.pointer_width, cfg.pointer_big_endian, cfg.pointer_base, t)) {
+                ev.follow_requested = true;
+                ev.follow_target = t;
+                ev.follow_from = h.off;
+            }
+        } else if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             dragging_select_ = false;
             if (const Highlight* hl = highlight_at(layers, h.off)) {
                 uint64_t b = std::min(hl->offset, size);
@@ -920,8 +957,11 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                           bm.color ? bm.color : C.bookmark, 1.5f);
     }
 
-    // Hover: subtle box around the byte under the mouse in both columns.
+    // Hover: subtle box around the byte under the mouse in both columns. With Ctrl held the
+    // pointer starting there is underlined like a link (red when it cannot be followed).
     Hit hover;
+    bool link = false, link_ok = false;
+    uint64_t link_target = 0;
     if (data_hovered && !dragging_scrollbar_) {
         hover = hit_test(L, mouse, top, size);
         if (hover.on_byte) {
@@ -934,6 +974,15 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             dl->AddRect(ImVec2(hx0 - 2.0f, y0), ImVec2(hx0 + 2.0f * L.adv + 2.0f, y1), C.hover, 2.0f);
             if (L.ascii)
                 dl->AddRect(ImVec2(L.text_byte_x(col), y0), ImVec2(L.text_byte_x(col) + L.adv, y1), C.hover, 2.0f);
+            if (io.KeyCtrl && !io.KeyShift && !dragging_select_) {
+                link = true;
+                link_ok = decode_pointer(doc, hover.off, cfg.pointer_width, cfg.pointer_big_endian,
+                                         cfg.pointer_base, link_target);
+                const uint64_t w = uint64_t(std::clamp(cfg.pointer_width, 1, 8));
+                const uint64_t end = w > size - hover.off ? size : hover.off + w;
+                underline_range(dl, L, top, draw_rows, hover.off, end, link_ok ? kLinkColor : C.unreadable_text);
+                if (link_ok) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            }
         }
     }
     dl->PopClipRect();
@@ -983,8 +1032,24 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         dl->AddRectFilled(ImVec2(t0.x + 1.0f, cy - 1.0f), ImVec2(t1.x, cy + 1.0f), C.cursor);
     }
 
-    // Tooltip: offset, innermost highlight label, little-endian quick values.
-    if (tooltip_hover && ev.has_hover && !dragging_select_ && !dragging_scrollbar_ && !ImGui::IsAnyMouseDown()) {
+    // Tooltip: the link target while Ctrl is held (no delay), else offset, innermost highlight
+    // label, little-endian quick values.
+    if (link && !ImGui::IsAnyMouseDown()) {
+        ImGui::PushFont(ui_font, ui_font_size);
+        ImGui::BeginTooltip();
+        if (link_ok)
+            ImGui::Text(cfg.uppercase ? "\xE2\x86\x92 0x%llX  (Ctrl+click to follow)"
+                                      : "\xE2\x86\x92 0x%llx  (Ctrl+click to follow)",
+                        (unsigned long long)link_target);
+        else
+            ImGui::TextUnformatted("\xE2\x86\x92 beyond EOF");  // U+2192
+        std::string kind = "u" + std::to_string(std::clamp(cfg.pointer_width, 1, 8) * 8) +
+                           (cfg.pointer_big_endian ? " big-endian" : " little-endian");
+        if (cfg.pointer_base) kind += ", base 0x" + fmt_hex(cfg.pointer_base, 1, cfg.uppercase);
+        ImGui::TextDisabled("%s", kind.c_str());
+        ImGui::EndTooltip();
+        ImGui::PopFont();
+    } else if (tooltip_hover && ev.has_hover && !dragging_select_ && !dragging_scrollbar_ && !ImGui::IsAnyMouseDown()) {
         uint8_t q[4] = {0, 0, 0, 0};
         size_t n = doc.read(ev.hover_offset, q, 4);
         ImGui::PushFont(ui_font, ui_font_size);

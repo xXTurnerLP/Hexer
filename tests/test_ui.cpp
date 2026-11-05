@@ -558,3 +558,126 @@ TEST_CASE("ui: Delete, Backspace and Tab") {
     ui.key(ImGuiKey_Tab);
     CHECK(!ui.v().ascii_focus);
 }
+
+// =============================================================================================
+// follow pointer (Ctrl+click) and mouse back/forward buttons
+// =============================================================================================
+
+namespace {
+
+// Presses button `b` (with modifiers `m`) at `p` and returns the view's events of the press frame.
+HexViewEvents press_events(Ui& ui, ImVec2 p, int m, int b = 0) {
+    ui.mods(m, true);
+    ui.move(p);
+    ui.button(true, b);
+    HexViewEvents ev = ui.ev;
+    ui.button(false, b);
+    ui.mods(m, false);
+    ui.settle();
+    return ev;
+}
+
+void put(Ui& ui, uint64_t off, const Bytes& b) { REQUIRE(ui.doc->overwrite(off, b.data(), b.size())); }
+
+}  // namespace
+
+TEST_CASE("ui: ctrl+click follows a little-endian pointer without moving the caret") {
+    Ui ui(iota_bytes(100));
+    put(ui, 8, {0x20, 0x00, 0x00, 0x00});
+    ui.click(ui.hex(3));
+    REQUIRE(ui.v().cursor == 3);
+
+    HexViewEvents ev = press_events(ui, ui.hex(8), ImGuiMod_Ctrl);
+    CHECK(ev.follow_requested);
+    CHECK(ev.follow_target == 0x20);
+    CHECK(ev.follow_from == 8);
+    CHECK(ui.v().cursor == 3);
+    CHECK(ui.v().anchor == 3);
+    CHECK(!ui.v().has_selection());
+
+    // the text column works too
+    ev = press_events(ui, ui.txt(8), ImGuiMod_Ctrl);
+    CHECK(ev.follow_requested);
+    CHECK(ev.follow_target == 0x20);
+    CHECK(ui.v().cursor == 3);
+}
+
+TEST_CASE("ui: ctrl+click honours pointer width, endianness and base") {
+    Ui ui(iota_bytes(100));
+    put(ui, 12, {0x00, 0x00, 0x00, 0x30});
+    put(ui, 20, {0x34, 0x12});
+
+    ui.cfg.pointer_big_endian = true;
+    HexViewEvents ev = press_events(ui, ui.hex(12), ImGuiMod_Ctrl);
+    CHECK(ev.follow_requested);
+    CHECK(ev.follow_target == 0x30);
+
+    ui.cfg.pointer_big_endian = false;
+    ui.cfg.pointer_width = 2;
+    ui.cfg.pointer_base = 0x1200;
+    ev = press_events(ui, ui.hex(20), ImGuiMod_Ctrl);
+    CHECK(ev.follow_requested);
+    CHECK(ev.follow_target == 0x34);
+    CHECK(ev.follow_from == 20);
+
+    ui.cfg.pointer_base = 0;
+    ui.cfg.pointer_width = 1;
+    ev = press_events(ui, ui.hex(40), ImGuiMod_Ctrl);  // iota: byte 40 == 40
+    CHECK(ev.follow_requested);
+    CHECK(ev.follow_target == 40);
+
+    ui.cfg.pointer_width = 8;
+    put(ui, 50, {0x05, 0, 0, 0, 0, 0, 0, 0});
+    ev = press_events(ui, ui.hex(50), ImGuiMod_Ctrl);
+    CHECK(ev.follow_requested);
+    CHECK(ev.follow_target == 5);
+}
+
+TEST_CASE("ui: ctrl+click on a pointer beyond EOF or cut off by EOF does nothing") {
+    Ui ui(iota_bytes(100));
+    put(ui, 8, {0x20, 0x00, 0x00, 0x00});
+    ui.click(ui.hex(3));
+
+    ui.cfg.pointer_big_endian = true;  // 0x20000000 > size
+    HexViewEvents ev = press_events(ui, ui.hex(8), ImGuiMod_Ctrl);
+    CHECK(!ev.follow_requested);
+    CHECK(ui.v().cursor == 3);
+
+    ui.cfg.pointer_big_endian = false;
+    ev = press_events(ui, ui.hex(98), ImGuiMod_Ctrl);  // only 2 bytes left
+    CHECK(!ev.follow_requested);
+    CHECK(ui.v().cursor == 3);
+
+    ui.cfg.pointer_base = 0x21;  // 0x20 - 0x21 underflows
+    ev = press_events(ui, ui.hex(8), ImGuiMod_Ctrl);
+    CHECK(!ev.follow_requested);
+}
+
+TEST_CASE("ui: plain and shift clicks are unaffected by follow pointer") {
+    Ui ui(iota_bytes(100));
+    put(ui, 8, {0x20, 0x00, 0x00, 0x00});
+    HexViewEvents ev = press_events(ui, ui.hex(8), 0);
+    CHECK(!ev.follow_requested);
+    CHECK(ui.v().cursor == 8);
+    CHECK(!ui.v().has_selection());
+
+    ev = press_events(ui, ui.hex(12), ImGuiMod_Shift);
+    CHECK(!ev.follow_requested);
+    CHECK(ui.sel() == Range{8, 13});
+}
+
+TEST_CASE("ui: mouse X1/X2 report back/forward while hovered") {
+    Ui ui(iota_bytes(100));
+    HexViewEvents ev = press_events(ui, ui.hex(4), 0, 3);
+    CHECK(ev.nav_back);
+    CHECK(!ev.nav_forward);
+    ev = press_events(ui, ui.hex(4), 0, 4);
+    CHECK(ev.nav_forward);
+    CHECK(!ev.nav_back);
+    CHECK(ui.v().cursor == 0);  // neither moves the caret by itself
+    CHECK(!ui.ev.nav_back);     // one frame only
+    CHECK(!ui.ev.nav_forward);
+
+    ev = press_events(ui, ImVec2(ui.w + 50.0f, ui.h + 50.0f), 0, 3);  // outside the view
+    CHECK(!ev.nav_back);
+}
