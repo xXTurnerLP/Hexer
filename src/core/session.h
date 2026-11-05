@@ -5,8 +5,11 @@
 // file, so a session over a 2 TB image stays tiny.
 //
 // Layout of <session_dir>:
-//   session.ini         ordered tab list + active tab (key=value lines, written atomically)
-//   doc-<n>.hxs         one binary file per document (magic "HXS1", little-endian, versioned)
+//   session.ini         ordered tab list + active tab (key=value lines, written atomically), each
+//                       doc's id at save time ("docid=", after its "doc=" line) and the session
+//                       extras ("x.<key>=<value>", %XX-escaped); older builds ignore those lines
+//   doc-<n>.hxs         one binary file per document (magic "HXS1", little-endian, versioned;
+//                       v3 adds the doc's extras, see PersistedDoc::extras)
 //   lock                held (OS file lock) by the instance that owns this directory
 //   instance-<k>/       same layout, used by further Hexer instances running at the same time;
 //                       the next instance that owns the main directory adopts their documents
@@ -17,6 +20,8 @@
 // Documents whose file cannot be restored right now (file on an unplugged drive / offline share /
 // locked, session file unreadable or written by another Hexer version) stay in the index and on
 // disk for a later session (see kept()); only files failing the integrity check are dropped.
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,10 +46,25 @@ public:
         // Human-readable problems, e.g. "data.bin changed on disk since last session; edits were
         // restored on top of the new contents" or "missing.bin no longer exists (skipped)".
         std::vector<std::string> warnings;
+        // Parallel to docs: the Document::id() each doc had when the session was saved, so
+        // session extras that reference docs by id can be mapped to the restored ones. 0 = unknown
+        // (index written by an older build, or doc adopted from another instance's directory).
+        std::vector<uint64_t> saved_ids;
     };
     Restored load();
 
-    void clear();  // delete all session files (of this instance's directory)
+    void clear();  // delete all session files (of this instance's directory); also clears extras
+
+    // ---- session-level UI state: opaque, binary-safe key/value pairs ---------------------------
+    // For state spanning documents (per-doc state goes to Document::set_extra). Written into the
+    // index by every save(); load() replaces them with those of this instance's directory (never
+    // merged from adopted instances). Keys the app uses:
+    //   "compare.<n>" = "<docidA>|<docidB>|<shift>"  a Compare tab: Document::id()s at save time
+    //                   (map with Restored::saved_ids), shift = signed byte offset of B (decimal)
+    //   "active"      = the active tab when it is not a plain doc tab, e.g. "compare.<n>"
+    void set_extra(const std::string& key, const std::string& value);  // "" erases
+    std::string extra(const std::string& key) const;                   // "" if unset
+    const std::map<std::string, std::string>& extras() const { return extras_; }
     const std::string& dir() const { return dir_; }
 
     // Session files that load() could not restore but kept for a later session.
@@ -79,6 +99,7 @@ private:
     std::vector<Saved> saved_;
     std::vector<std::string> kept_;
     std::vector<Adopted> adopted_;
+    std::map<std::string, std::string> extras_;
 };
 
 // ---- single instance (Sublime-like): a second process forwards its files and exits ----------

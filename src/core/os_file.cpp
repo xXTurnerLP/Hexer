@@ -692,6 +692,11 @@ bool os_same_file(const std::string& a, const std::string& b) {
 
 std::string os_absolute_path(const std::string& p) {
     if (p.empty()) return p;
+    // Target URLs ("process://1234") are not file system paths.
+    const size_t scheme = p.find("://");
+    if (scheme != std::string::npos && scheme >= 2 &&
+        std::all_of(p.begin(), p.begin() + std::ptrdiff_t(scheme), [](char c) { return std::isalpha(static_cast<unsigned char>(c)) != 0; }))
+        return p;
 #ifdef _WIN32
     // Device / verbatim paths ("\\.\PhysicalDrive0", "\\?\C:\dir") must not be normalised.
     if (p.size() >= 4 && is_sep(p[0]) && is_sep(p[1]) && (p[2] == '.' || p[2] == '?') && is_sep(p[3])) return p;

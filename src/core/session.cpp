@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <new>
 #include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "core/os_file.h"
 
@@ -14,8 +18,11 @@ namespace {
 
 constexpr char kMagic[4] = {'H', 'X', 'S', '1'};
 // 2: bookmarks carry a note; edits_dropped is always written, then the backed-up targets.
-// Version 1 files are still read.
-constexpr uint32_t kVersion = 2;
+// 3: v2 + an extension block (u32 byte length, then u32 count + key/value strings: the doc's
+//    extras). Only written when the doc has extras, so files without them stay readable by v2
+//    builds. A malformed block (length right, contents not) drops the extras, not the doc.
+// Version 1 and 2 files are still read.
+constexpr uint32_t kVersion = 3;
 constexpr const char* kIndexFile = "session.ini";
 
 uint32_t crc32(const uint8_t* p, size_t n) {
@@ -169,7 +176,7 @@ struct Reader {
 std::string serialize(const PersistedDoc& d) {
     Writer w;
     w.bytes(kMagic, 4);
-    w.u32(kVersion);
+    w.u32(d.extras.empty() ? 2 : kVersion);
     w.str(d.path);
     w.str(d.display_name);
     w.u8(d.file_stat.exists);
@@ -196,13 +203,24 @@ std::string serialize(const PersistedDoc& d) {
     w.u8(d.edits_dropped);
     w.u32(uint32_t(d.backup_done.size()));
     for (const std::string& b : d.backup_done) w.str(b);
+    if (!d.extras.empty()) {
+        Writer x;
+        x.u32(uint32_t(d.extras.size()));
+        for (const auto& [k, v] : d.extras) {
+            x.str(k);
+            x.str(v);
+        }
+        w.str(x.b);
+    }
     w.u32(crc32(reinterpret_cast<const uint8_t*>(w.b.data()), w.b.size()));
     return std::move(w.b);
 }
 
 enum class Parse { Ok, Corrupt, Unsupported };
 
-Parse deserialize(const std::string& data, PersistedDoc& d) {
+// *ext_dropped: the extension block was malformed and ignored (the doc itself parsed fine).
+Parse deserialize(const std::string& data, PersistedDoc& d, bool* ext_dropped) {
+    *ext_dropped = false;
     if (data.size() < 12 || std::memcmp(data.data(), kMagic, 4) != 0) return Parse::Corrupt;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(data.data());
     size_t body = data.size() - 4;
@@ -246,6 +264,23 @@ Parse deserialize(const std::string& data, PersistedDoc& d) {
         for (std::string& b : d.backup_done) b = r.str();
     } else if (r.ok && r.pos < body) {
         d.edits_dropped = r.u8() != 0;  // v1: optional trailing flag
+    }
+    if (r.version >= 3) {
+        const uint32_t len = r.count(1);
+        if (r.need(len)) {
+            Reader x{p + r.pos, len};
+            const uint32_t n = x.count(8);
+            for (uint32_t i = 0; i < n && x.ok; ++i) {
+                std::string k = x.str();
+                std::string v = x.str();
+                if (x.ok) d.extras[std::move(k)] = std::move(v);
+            }
+            if (!x.ok || x.pos != len) {
+                d.extras.clear();
+                *ext_dropped = true;
+            }
+            r.pos += len;
+        }
     }
     return r.ok && r.pos == body ? Parse::Ok : Parse::Unsupported;
 }
@@ -300,12 +335,53 @@ bool read_session_file(const std::string& path, std::string& out, std::string* e
 struct Index {
     int active = 0;
     std::vector<std::string> files;
+    std::vector<uint64_t> ids;  // parallel to files: Document::id() at save time, 0 = unknown
+    std::map<std::string, std::string> extras;
 };
+
+// Session extras in the (line-based) index: every byte outside '!'..'~', and '%' / '=', as %XX.
+std::string escape(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string o;
+    for (char ch : s) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c > ' ' && c < 0x7F && c != '%' && c != '=') {
+            o += ch;
+        } else {
+            o += '%';
+            o += hex[c >> 4];
+            o += hex[c & 15];
+        }
+    }
+    return o;
+}
+
+std::string unescape(const std::string& s) {
+    auto nib = [](char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    std::string o;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const int hi = s[i] == '%' && i + 2 < s.size() ? nib(s[i + 1]) : -1;
+        const int lo = hi >= 0 ? nib(s[i + 2]) : -1;
+        if (lo >= 0) {
+            o += char(hi * 16 + lo);
+            i += 2;
+        } else {
+            o += s[i];
+        }
+    }
+    return o;
+}
 
 bool read_index(const std::string& dir, Index& idx) {
     std::string ini;
     if (!os_read_whole(path_join(dir, kIndexFile), ini)) return false;
     size_t pos = 0;
+    bool last_doc = false;  // the previous line added a doc (a "docid" line belongs to it)
     while (pos < ini.size()) {
         size_t eol = ini.find('\n', pos);
         if (eol == std::string::npos) eol = ini.size();
@@ -315,21 +391,37 @@ bool read_index(const std::string& dir, Index& idx) {
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq), val = line.substr(eq + 1);
+        const bool after_doc = last_doc;
+        last_doc = false;
         if (key == "active") {
             idx.active = std::atoi(val.c_str());
         } else if (key == "doc") {
             // Only plain names inside the session dir.
-            if (!val.empty() && val.find_first_of("/\\") == std::string::npos && val != "." && val != "..")
+            if (!val.empty() && val.find_first_of("/\\") == std::string::npos && val != "." && val != "..") {
                 idx.files.push_back(val);
+                idx.ids.push_back(0);
+                last_doc = true;
+            }
+        } else if (key == "docid") {
+            if (after_doc) idx.ids.back() = std::strtoull(val.c_str(), nullptr, 10);
+        } else if (key.size() > 2 && key.compare(0, 2, "x.") == 0) {
+            idx.extras[unescape(key.substr(2))] = unescape(val);
         }
     }
     return true;
 }
 
-bool write_index(const std::string& dir, int active, const std::vector<std::string>& files, std::string* err) {
+// `ids` (parallel to the first ids.size() files, 0 = none) and `extras` are optional; older
+// builds ignore their lines.
+bool write_index(const std::string& dir, int active, const std::vector<std::string>& files, std::string* err,
+                 const std::vector<uint64_t>& ids = {}, const std::map<std::string, std::string>& extras = {}) {
     std::string ini = "version=1\n";
     ini += "active=" + std::to_string(active) + "\n";
-    for (const std::string& f : files) ini += "doc=" + f + "\n";
+    for (size_t i = 0; i < files.size(); ++i) {
+        ini += "doc=" + files[i] + "\n";
+        if (i < ids.size() && ids[i]) ini += "docid=" + std::to_string(ids[i]) + "\n";
+    }
+    for (const auto& [k, v] : extras) ini += "x." + escape(k) + "=" + escape(v) + "\n";
     return os_write_whole_atomic(path_join(dir, kIndexFile), ini.data(), ini.size(), err);
 }
 
@@ -386,7 +478,7 @@ bool Session::save(const std::vector<Document*>& docs, int active_index, std::st
     for (const Saved& s : saved_) names_in_use.insert(s.file);
 
     for (Document* doc : docs) {
-        if (!doc) continue;
+        if (!doc || !doc->persistable()) continue;  // process memory: pids are ephemeral, never kept
         auto it = std::find_if(saved_.begin(), saved_.end(), [&](const Saved& s) { return s.doc_id == doc->id(); });
         Saved entry;
         if (it != saved_.end())
@@ -431,11 +523,15 @@ bool Session::save(const std::vector<Document*>& docs, int active_index, std::st
     }
 
     std::vector<std::string> files;
-    for (const Saved& s : next) files.push_back(s.file);
+    std::vector<uint64_t> ids;
+    for (const Saved& s : next) {
+        files.push_back(s.file);
+        ids.push_back(s.doc_id);
+    }
     files.insert(files.end(), kept_.begin(), kept_.end());  // never lose what we could not restore
     int active = std::clamp(active_index, 0, std::max(0, int(next.size()) - 1));
     std::string e;
-    if (!write_index(dir, active, files, &e)) {
+    if (!write_index(dir, active, files, &e, ids, extras_)) {
         ok = false;
         if (first_err.empty()) first_err = "Cannot write session index: " + e;
     } else {
@@ -471,6 +567,7 @@ void Session::finish_adoption() {
 int Session::load_dir(const std::string& dir, Restored& out, Adopted* adopt) {
     Index idx;
     if (!read_index(dir, idx)) return -1;
+    if (!adopt) extras_ = std::move(idx.extras);  // other instances' UI state is not merged
     int restored_active = -1;
     for (size_t i = 0; i < idx.files.size(); ++i) {
         const std::string& file = idx.files[i];
@@ -489,7 +586,8 @@ int Session::load_dir(const std::string& dir, Restored& out, Adopted* adopt) {
                 continue;
             }
             PersistedDoc pd;
-            Parse parsed = deserialize(data, pd);
+            bool ext_dropped = false;
+            Parse parsed = deserialize(data, pd, &ext_dropped);
             data.clear();
             data.shrink_to_fit();
             if (parsed == Parse::Corrupt) {
@@ -512,6 +610,8 @@ int Session::load_dir(const std::string& dir, Restored& out, Adopted* adopt) {
                 out.warnings.push_back(name + " changed on disk since last session; edits were restored on top "
                                               "of the new contents");
             if (!note.empty()) out.warnings.push_back(note);
+            if (ext_dropped)
+                out.warnings.push_back(name + ": its saved view state (split, parser, tail) was unreadable and was reset");
             if (pd.edits_dropped)
                 out.warnings.push_back(name + ": unsaved changes that referenced a previous version of the file "
                                               "were too large to keep; the last saved version was opened");
@@ -519,6 +619,7 @@ int Session::load_dir(const std::string& dir, Restored& out, Adopted* adopt) {
             if (recovered && !(changed && pd.dirty))
                 out.warnings.push_back(name + " no longer exists; its edits were restored as an untitled document");
             if (int(i) == idx.active) restored_active = int(out.docs.size());
+            out.saved_ids.push_back(adopt ? 0 : idx.ids[i]);  // other processes' ids may collide
             Saved s;
             s.doc_id = doc->id();
             s.state_id = doc->state_id();
@@ -526,8 +627,9 @@ int Session::load_dir(const std::string& dir, Restored& out, Adopted* adopt) {
             s.disk = doc->disk_stat();
             s.written = !adopt;
             // Rewrite docs whose state was adjusted on restore so the warning is not repeated next time.
-            s.view_hash = (changed || recovered || !note.empty() || pd.edits_dropped || adopt) ? std::string()
-                                                                                             : doc_key(*doc);
+            s.view_hash = (changed || recovered || !note.empty() || pd.edits_dropped || ext_dropped || adopt)
+                              ? std::string()
+                              : doc_key(*doc);
             saved_.push_back(s);
             out.docs.push_back(std::move(doc));
         } catch (const std::bad_alloc&) {
@@ -542,6 +644,7 @@ Session::Restored Session::load() {
     saved_.clear();
     kept_.clear();
     adopted_.clear();
+    extras_.clear();
     if (!acquire()) {
         out.warnings.push_back("Too many Hexer instances are running; the session of this window is not saved");
         return out;
@@ -571,6 +674,19 @@ void Session::clear() {
     os_remove(path_join(slot_dir_, kIndexFile));
     saved_.clear();
     kept_.clear();
+    extras_.clear();
+}
+
+void Session::set_extra(const std::string& key, const std::string& value) {
+    if (value.empty())
+        extras_.erase(key);
+    else
+        extras_[key] = value;
+}
+
+std::string Session::extra(const std::string& key) const {
+    auto it = extras_.find(key);
+    return it == extras_.end() ? std::string() : it->second;
 }
 
 void Session::discard_kept() {

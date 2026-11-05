@@ -73,7 +73,9 @@ void os_reveal_in_file_manager(const std::string& path);  // opens the folder (E
 bool os_read_whole(const std::string& path, std::string& out, std::string* err = nullptr);
 bool os_write_whole_atomic(const std::string& path, const void* data, size_t len, std::string* err = nullptr);
 bool os_same_file(const std::string& a, const std::string& b);  // both exist and are the same file
-std::string os_absolute_path(const std::string& p);            // absolute + lexically normalised
+// Absolute + lexically normalised. Device paths ("\\.\PhysicalDrive0") and target URLs
+// ("process://1234") are returned unchanged.
+std::string os_absolute_path(const std::string& p);
 // If `p` is a symbolic link (possibly chained), the path of the file it finally points to;
 // otherwise `p` unchanged. Saves replace that file instead of the link itself.
 std::string os_resolve_symlinks(const std::string& p);
