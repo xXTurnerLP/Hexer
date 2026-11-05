@@ -1105,6 +1105,8 @@ TEST_CASE("document: >4 GiB sparse file") {
         DWORD got = 0;
         DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &got, nullptr);
         CloseHandle(h);
+#else
+        write_file(p, {});  // ReadWrite opens an existing file only
 #endif
         auto f = OsFile::open(p, OsFile::Mode::ReadWrite);
         REQUIRE(f);
@@ -1367,6 +1369,8 @@ void make_sparse(const std::string& p, uint64_t size) {
     DWORD got = 0;
     DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &got, nullptr);
     CloseHandle(h);
+#else
+    write_file(p, {});  // ReadWrite opens an existing file only
 #endif
     auto f = OsFile::open(p, OsFile::Mode::ReadWrite);
     REQUIRE(f);
