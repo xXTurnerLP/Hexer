@@ -55,7 +55,7 @@ Bytes ipv4(uint8_t proto, const Bytes& body, uint16_t frag = 0, const Bytes& opt
     b.push_back(64);
     b.push_back(proto);
     be16(b, 0);
-    b.insert(b.end(), {10, 0, 0, 1, 10, 0, 0, 2});
+    b = cat(b, {10, 0, 0, 1, 10, 0, 0, 2});  // (vector::insert(il) trips a GCC 13 -Warray-bounds false positive)
     return cat(cat(b, opts), body);
 }
 Bytes udp(uint16_t sp, uint16_t dp, const Bytes& payload) {
