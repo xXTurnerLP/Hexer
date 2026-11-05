@@ -177,6 +177,17 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   as `??` and flagged with a red "I/O error" badge in the status bar; searches stop there and say
   where, instead of matching the zeros that stand in for it.
 
+## Download
+
+Tagged versions (`v*`) have ready-to-run packages on the GitHub Releases page; every CI run
+also keeps them as build artifacts for 7 days.
+
+- **Windows:** `hexer-windows-x64.zip`. Unzip it anywhere and run `hexer\hexer.exe`; it needs no
+  installer and no Visual C++ runtime. Keep the `scripts` folder next to the exe.
+- **Linux:** `hexer-x86_64.AppImage` (`chmod +x` it, then run it), or `hexer-linux-x86_64.tar.gz`
+  (run `hexer-linux-x86_64/hexer`, with `scripts/` next to it). Built on Ubuntu 22.04, so glibc
+  2.35 or newer. File dialogs go through xdg-desktop-portal (GNOME, KDE and most desktops have it).
+
 ## Building
 
 Meson downloads all dependencies (ImGui, GLFW, Lua, FreeType, nativefiledialog-extended, Zydis,
