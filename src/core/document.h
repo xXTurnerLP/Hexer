@@ -145,6 +145,23 @@ struct SaveInfo {
     std::string note;             // human-readable reason when skipped
 };
 
+// Result of Document::refresh_appended() (live tail of a growing file).
+enum class GrowResult {
+    Unchanged,  // nothing new on disk (also: untitled, device, save in progress)
+    Grown,      // bytes were appended; the document now ends with them
+    NotAppend,  // shrunk, rewritten (same size, or the bytes before the old end differ), replaced,
+                // deleted: use the regular changed-on-disk / reload flow
+    Error,      // the file could not be re-read right now (try again later)
+};
+
+// Per-tab live-tail state, owned by the app (not persisted). Pure data; see refresh_appended().
+struct TailState {
+    bool enabled = false;
+    bool follow = true;      // keep the caret / view at the end while it grows
+    double last_poll = 0;    // app clock (seconds) of the last refresh_appended() call
+    uint64_t added = 0;      // bytes appended since tail mode was enabled (status bar)
+};
+
 class Document {
 public:
     // Opens a file for streaming access. Fails only if the file cannot be opened for reading.
@@ -274,6 +291,17 @@ public:
     // Re-open from disk, discarding all edits and undo history. Keeps view state (clamped).
     bool reload(std::string* err);
 
+    // ---- live tail (files that grow by appending, e.g. logs) ----------------------------------
+    // Cheap enough to poll on the UI thread (~2x/s): one stat; only after a size change also a
+    // fresh 4 KiB read of the bytes just before the old end, compared with what this document saw
+    // there (recorded by the first poll of each file version - call it once when tail mode is
+    // switched on - and after every growth; else read through the source cache). On growth the file version is extended and the new range [old size, new size) is
+    // appended to the END of the current piece list and of every undo/redo entry, so edits and
+    // history are kept and undo/redo never drop the tail. Not an undo step; dirty() is unchanged
+    // (the tail is file content); generation() bumps; disk_stat() becomes the grown file's stat,
+    // so changed_on_disk() is false afterwards. *added = bytes appended (0 unless Grown).
+    GrowResult refresh_appended(uint64_t* added = nullptr, std::string* err = nullptr);
+
     // ---- session support (used by core/session.cpp) ------------------------------------------
     const PieceTable& table() const { return table_; }
     const AddBuffer& add_buffer() const { return add_; }
@@ -365,6 +393,16 @@ private:
     uint64_t generation_ = 0;
     uint64_t state_id_ = 0;
     uint64_t saved_state_id_ = 0;
+
+    // refresh_appended(): the last bytes [end - bytes.size(), end) of file version `src` (with
+    // stat size/mtime) as this document last saw them. UI thread only.
+    struct TailRef {
+        std::weak_ptr<FileSource> src;
+        uint64_t end = 0, size = 0;
+        int64_t mtime_ns = 0;
+        std::vector<uint8_t> bytes;
+    };
+    TailRef tail_ref_;
 };
 
 }  // namespace hx

@@ -18,13 +18,17 @@ public:
     static std::shared_ptr<FileSource> open(const std::string& path, std::string* err = nullptr);
     ~FileSource();
 
-    uint64_t size() const;               // size captured at open time (frozen for the piece table)
+    uint64_t size() const;               // size captured at open time (or by the last extend())
     const std::string& path() const;
     const FileStat& stat_at_open() const;
 
     // Thread-safe cached read. Returns bytes copied; short only at EOF or on I/O error.
     size_t read(uint64_t offset, uint8_t* dst, size_t len) const;
     void invalidate();                   // drop all cached blocks (after an in-place write)
+    // Live tail: the file grew by appending; make [size(), new_size) readable. Only growth (false
+    // if new_size < size()). Drops the cached, possibly short block at the old end. Thread-safe with
+    // readers; Snapshots keep their old size (their pieces only reference the old range).
+    bool extend(uint64_t new_size);
     bool io_error() const;               // sticky: true once any read failed
 
     // Release / re-acquire the OS handle (Document's save fallback on filesystems that cannot

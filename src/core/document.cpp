@@ -27,6 +27,7 @@ constexpr size_t kPreserveBlock = 1u << 20;          // in-place save: copy old 
 constexpr uint64_t kMaxPreserve = 512ull << 20;      // above this, history is trimmed instead
 constexpr uint64_t kMaxMaterialize = 16ull << 20;    // persist(): inline bytes of old file versions
 constexpr uint64_t kFillMaxUnit = 64ull << 20;       // fill(): largest pattern chunk
+constexpr size_t kTailCheck = 4096;                  // refresh_appended(): bytes re-read before the old end
 
 bool fail(std::string* err, const std::string& msg) {
     if (err) *err = msg;
@@ -1222,6 +1223,112 @@ bool Document::reload(std::string* err) {
     view_generation++;
     clamp_view();
     return true;
+}
+
+GrowResult Document::refresh_appended(uint64_t* added, std::string* err) {
+    if (added) *added = 0;
+    std::string path;
+    FileStat known;
+    std::shared_ptr<FileSource> src;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (busy_ || path_.empty() || !sources_.back()) return GrowResult::Unchanged;
+        path = path_;
+        known = disk_stat_;
+        src = sources_.back();
+    }
+    if (known.is_device || src->stat_at_open().is_device) return GrowResult::Unchanged;
+    const uint64_t old_size = src->size();
+    const size_t n = size_t(std::min<uint64_t>(kTailCheck, old_size));
+    // tail_ref_ holds the bytes before the end of this exact version as we last saw them (only
+    // the UI thread calls this, so no lock). Without it the source is read (its cache holds what
+    // the view showed); recording it once per version makes later rewrites detectable.
+    const bool ref_ok = tail_ref_.src.lock() == src && tail_ref_.end == old_size &&
+                        tail_ref_.size == known.size && tail_ref_.mtime_ns == known.mtime_ns &&
+                        tail_ref_.bytes.size() == n;
+    auto set_ref = [&](uint64_t end, const FileStat& st, std::vector<uint8_t>&& bytes) {
+        tail_ref_.src = src;
+        tail_ref_.end = end;
+        tail_ref_.size = st.size;
+        tail_ref_.mtime_ns = st.mtime_ns;
+        tail_ref_.bytes = std::move(bytes);
+    };
+
+    const FileStat now = os_stat(path);
+    const bool other = os_identity_differs(now, known);
+    // disk_stat_ can already be larger than this version (an in-place save re-stats the file after
+    // writing; bytes appended meanwhile are in that stat but not in the source): that is growth.
+    if (now.exists && !other && now.size == known.size && now.mtime_ns == known.mtime_ns && now.size <= old_size) {
+        if (!ref_ok) {
+            std::vector<uint8_t> ours(n);
+            if (src->read(old_size - n, ours.data(), n) == n) set_ref(old_size, known, std::move(ours));
+        }
+        return GrowResult::Unchanged;
+    }
+    if (!now.exists || now.is_dir || other || now.size <= old_size) return GrowResult::NotAppend;
+
+    // Appended, or rewritten and longer? Compare the bytes before the old end as the file has them
+    // now (fresh handle, no cache) with ours.
+    std::string e;
+    auto f = OsFile::open(path, OsFile::Mode::Read, &e);
+    if (!f) {
+        if (err) *err = "Cannot re-open " + path + ": " + e;
+        return GrowResult::Error;
+    }
+    if (n) {
+        std::vector<uint8_t> fresh(n), ours;
+        const int64_t got = f->read_at(old_size - n, fresh.data(), n);
+        if (got < 0) {
+            if (err) *err = "Cannot read " + path;
+            return GrowResult::Error;
+        }
+        if (size_t(got) != n) return GrowResult::NotAppend;  // shrank meanwhile
+        if (ref_ok) {
+            ours = tail_ref_.bytes;
+        } else {
+            ours.resize(n);
+            if (src->read(old_size - n, ours.data(), n) != n) {
+                if (err) *err = "Cannot read " + path;
+                return GrowResult::Error;
+            }
+        }
+        if (fresh != ours) return GrowResult::NotAppend;
+    }
+    const uint64_t new_size = now.size;
+    const size_t m = size_t(std::min<uint64_t>(kTailCheck, new_size));
+    std::vector<uint8_t> ref(m);
+    const int64_t got = f->read_at(new_size - m, ref.data(), m);
+    if (got < 0 || size_t(got) != m) ref.clear();  // shrank meanwhile: re-read lazily next poll
+    f.reset();
+
+    std::lock_guard<std::mutex> lk(mu_);
+    if (busy_ || sources_.back() != src) return GrowResult::Unchanged;  // raced with a save: next poll
+    apply_pending();
+    if (!src->extend(new_size)) {
+        if (err) *err = "Cannot extend " + path;
+        return GrowResult::Error;
+    }
+    const uint32_t cur = current_source();
+    const Piece tail{Piece::Original, cur, old_size, new_size - old_size};
+    table_.insert(table_.size(), tail);  // merges with a contiguous last piece
+    auto append = [&](std::vector<Piece>& ps) {
+        if (!ps.empty()) {
+            Piece& b = ps.back();
+            if (b.src == Piece::Original && b.chunk == cur && b.start + b.len == old_size) {
+                b.len += tail.len;
+                return;
+            }
+        }
+        ps.push_back(tail);
+    };
+    for (auto* stack : {&undo_, &redo_})
+        for (UndoEntry& u : *stack) append(u.pieces);
+    disk_stat_ = now;
+    set_ref(new_size, now, std::move(ref));
+    generation_++;
+    persist_gen_++;
+    if (added) *added = tail.len;
+    return GrowResult::Grown;
 }
 
 // ---------------------------------------------------------------------------------------------

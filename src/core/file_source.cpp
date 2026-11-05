@@ -23,7 +23,7 @@ constexpr auto kBadRetry = std::chrono::seconds(10);
 struct FileSource::Impl {
     std::string path;
     FileStat stat;
-    uint64_t size = 0;
+    std::atomic<uint64_t> size{0};              // grows only (extend())
     std::atomic<bool> io_error{false};
 
     mutable std::mutex mu;                      // guards everything below
@@ -78,7 +78,7 @@ struct FileSource::Impl {
             return nullptr;
         }
         uint64_t off = index * kBlockSize;
-        size_t want = size_t(std::min<uint64_t>(kBlockSize, size - off));
+        size_t want = size_t(std::min<uint64_t>(kBlockSize, size.load() - off));
         auto b = std::make_shared<Block>(want);
         int64_t got = f->read_at(off, b->data(), want);  // I/O outside the lock
         if (got < 0 || size_t(got) < want) {
@@ -119,15 +119,16 @@ std::shared_ptr<FileSource> FileSource::open(const std::string& path, std::strin
 
 FileSource::~FileSource() = default;
 
-uint64_t FileSource::size() const { return impl_->size; }
+uint64_t FileSource::size() const { return impl_->size.load(); }
 const std::string& FileSource::path() const { return impl_->path; }
 const FileStat& FileSource::stat_at_open() const { return impl_->stat; }
 bool FileSource::io_error() const { return impl_->io_error.load(); }
 
 size_t FileSource::read(uint64_t offset, uint8_t* dst, size_t len) const {
     Impl& im = *impl_;
-    if (offset >= im.size || len == 0) return 0;
-    len = size_t(std::min<uint64_t>(len, im.size - offset));
+    const uint64_t size = im.size.load();
+    if (offset >= size || len == 0) return 0;
+    len = size_t(std::min<uint64_t>(len, size - offset));
 
     if (len >= kBypassThreshold && !im.any_bad(offset / kBlockSize, (offset + len - 1) / kBlockSize)) {
         auto f = im.handle();
@@ -153,6 +154,26 @@ size_t FileSource::read(uint64_t offset, uint8_t* dst, size_t len) const {
         done += n;
     }
     return done;
+}
+
+bool FileSource::extend(uint64_t new_size) {
+    Impl& im = *impl_;
+    std::lock_guard<std::mutex> lk(im.mu);
+    const uint64_t old = im.size.load();
+    if (new_size < old) return false;
+    if (new_size == old) return true;
+    // The block holding the old EOF may be cached short: drop it (and a remembered failure of it).
+    // Fills in flight sized their block by the old size: the epoch bump keeps them out of the cache.
+    const uint64_t last = old / kBlockSize;
+    auto it = im.map.find(last);
+    if (it != im.map.end()) {
+        im.lru.erase(it->second);
+        im.map.erase(it);
+    }
+    im.bad.erase(last);
+    im.epoch++;
+    im.size = new_size;
+    return true;
 }
 
 void FileSource::invalidate() {
