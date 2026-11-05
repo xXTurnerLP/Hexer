@@ -1944,7 +1944,7 @@ TEST_CASE("document: in-place save keeps the original as .backup, once") {
     std::string p = t.file("ip.bin"), bak = p + ".backup";
     Bytes orig = random_bytes(300000, 61);
     write_file(p, orig);
-    write_file(bak, str_bytes("older backup"));  // replaced
+    write_file(bak + ".tmp", str_bytes("leftover of an interrupted copy"));  // replaced
     auto d = Document::open_file(p);
     REQUIRE(d);
     CHECK_FALSE(d->last_save_info().backup_created);
@@ -1983,14 +1983,27 @@ TEST_CASE("document: in-place save keeps the original as .backup, once") {
     }
     CHECK(doc_bytes(*d) == orig);
 
-    // A new Document object (reopened file) backs up again on its first save.
+    // Reopening the file and saving again never replaces the original's backup.
     d.reset();
     auto d2 = Document::open_file(p);
     REQUIRE(d2->overwrite(5, v, 1));
-    Bytes before = read_file(p);
     REQUIRE(d2->save(nullptr, &err));
-    CHECK(d2->last_save_info().backup_created);
-    CHECK(read_file(bak) == before);
+    CHECK_FALSE(d2->last_save_info().backup_created);
+    CHECK(read_file(bak) == orig);
+    // Same for a rewrite save from a fresh document.
+    auto d3 = Document::open_file(p);
+    REQUIRE(d3->insert(0, v, 2));
+    REQUIRE(d3->save(nullptr, &err));
+    CHECK_FALSE(d3->last_save_info().backup_created);
+    CHECK(read_file(bak) == orig);
+    // Deleting the .backup by hand starts over: the next first save keeps the then-current file.
+    REQUIRE(os_remove(bak));
+    Bytes now = read_file(p);
+    auto d4 = Document::open_file(p);
+    REQUIRE(d4->overwrite(7, v, 1));
+    REQUIRE(d4->save(nullptr, &err));
+    CHECK(d4->last_save_info().backup_created);
+    CHECK(read_file(bak) == now);
 }
 
 TEST_CASE("document: rewrite save keeps the original file as .backup and history still reads it") {
@@ -2066,13 +2079,14 @@ TEST_CASE("document: a hot-exit restored document does not replace its .backup a
     REQUIRE(d2.save(nullptr, &err));
     CHECK_FALSE(d2.last_save_info().backup_created);
     CHECK(read_file(bak) == orig);  // still the original
-    // A document opened fresh (no shared history) starts over.
+    // A document opened fresh keeps the existing original backup as well.
     auto d3 = Document::open_file(p);
     REQUIRE(d3);
     const uint8_t z = 0;
     REQUIRE(d3->overwrite(0, &z, 1));
     REQUIRE(d3->save(nullptr, &err));
-    CHECK(d3->last_save_info().backup_created);
+    CHECK_FALSE(d3->last_save_info().backup_created);
+    CHECK(read_file(bak) == orig);
 }
 
 TEST_CASE("document: save_as backs up an existing different target; new files get none") {

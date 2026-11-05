@@ -247,9 +247,10 @@ public:
     // If the file was replaced (other inode), the rewrite path streams from the still-open old
     // version. Devices (block devices, raw Windows disks) only accept in-place saves.
     //
-    // Backup on first save: the first time this Document (also across hot-exit restarts) writes
-    // over an existing file (per target path: save_as onto another existing file backs that one
-    // up too), the previous on-disk contents are kept as "<target>.backup" (replacing an older one):
+    // Backup of the original: when a save writes over an existing file that has no
+    // "<target>.backup" yet (per target path: save_as onto another existing file backs that one
+    // up too), the on-disk contents are kept as "<target>.backup". An existing .backup is NEVER
+    // replaced - it holds the original from before Hexer first saved the file:
     //   * rewrite: the current file gets the second name .backup (hard link), then the new one is
     //     renamed over the target as usual (atomic; no copy; our open handle keeps reading the old
     //     version, so history still works). Without hard links the current file is renamed to

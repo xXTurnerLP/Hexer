@@ -25,9 +25,9 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   with progress and Cancel (until the last step, when the dialog shows "Finishing..."). If another
   program changed the file since you opened it, saving asks first: Save As, **Overwrite anyway**,
   Reload or Cancel.
-- **Backup on the first save.** The first time Hexer writes over an existing file (per open tab,
-  also across hot-exit restarts), the previous contents are kept as `<file>.backup` next to it (an
-  older `.backup` is replaced). A save that rewrites the file just gives the original that second
+- **Backup of the original.** The first time Hexer writes over an existing file, the original
+  contents are kept as `<file>.backup` next to it. An existing `.backup` is never replaced, so it
+  always holds the file as it was before Hexer first saved it (delete it by hand to start over). A save that rewrites the file just gives the original that second
   name (a hard link, or a rename where links are unsupported), so this costs nothing; an in-place save copies the
   file first (fast OS copy, counted in the progress, cancellable), and skips files above the size
   limit (4 GiB by default; a notification says so). The status bar shows "Saved ... (backup:

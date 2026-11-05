@@ -27,7 +27,8 @@ struct Settings {
     // undo_merge_max_bytes bytes, starts a new undo step (0 = no limit). See Document::set_undo_merge.
     int undo_merge_ms = 500;
     int undo_merge_max_bytes = 32;
-    // First save over an existing file keeps the previous contents as "<file>.backup". In-place
+    // The first save over an existing file keeps the original as "<file>.backup" (never replaced
+    // once it exists). In-place
     // saves of files larger than backup_max_bytes skip that copy (0 = no limit).
     bool backup_on_save = true;
     uint64_t backup_max_bytes = 4ull << 30;

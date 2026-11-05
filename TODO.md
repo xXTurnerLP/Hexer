@@ -18,7 +18,7 @@
 - [x] Copy as (hex, C array, Python bytes, Base64, escaped); lenient paste parsing
 - [x] Bookmarks with names and notes (Ctrl+B, F2 / Shift+F2), persisted; Bookmarks panel (this file /
       all open files, preview bytes), Bookmarks menu, Ctrl+Shift+B quick jump, scrollbar ticks
-- [x] Backup on the first save (`<file>.backup`; hard link / rename for rewrites, fast copy for in-place, size limit)
+- [x] Backup of the original on the first save (`<file>.backup`, never overwritten; hard link / rename for rewrites, fast copy for in-place, size limit)
 - [x] Settings window (Edit > Settings..., Ctrl+,): view, undo grouping, backups, session, fonts
 - [x] Typing undo grouping limits (pause / bytes per step)
 - [x] One selection convention: caret drawn inside the selection, Inspector/status at the first

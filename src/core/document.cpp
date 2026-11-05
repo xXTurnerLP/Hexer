@@ -824,6 +824,12 @@ SaveInfo Document::last_save_info() const {
 bool Document::need_backup_locked(const std::string& real, const FileStat& st, bool copy) {
     if (!g_backup_enabled.load() || !st.exists || st.is_dir) return false;
     if (std::find(backup_done_.begin(), backup_done_.end(), real) != backup_done_.end()) return false;
+    // The .backup holds the ORIGINAL file (from before Hexer first saved it). Once it exists it is
+    // never replaced - backing up an already modified version would defeat its purpose.
+    if (os_stat(backup_path_for(real)).exists) {
+        backup_done_locked(real);
+        return false;
+    }
     const uint64_t limit = g_backup_max_bytes.load();
     std::string why;
     if (st.is_device)
