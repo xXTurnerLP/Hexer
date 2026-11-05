@@ -1,0 +1,43 @@
+#pragma once
+// User settings + per-OS directories. Settings are a plain "key = value" text file so they are
+// easy to hand-edit; unknown keys are preserved-ignored, missing keys keep defaults.
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace hx {
+
+struct Settings {
+    int bytes_per_row = 16;            // 0 = auto-fit to window width (multiple of 8)
+    int group_size = 8;                // extra gap every N bytes (0 = none)
+    bool uppercase_hex = true;
+    bool show_ascii = true;
+    bool insert_mode = false;          // default typing mode for new tabs
+    bool big_endian_inspector = false;
+    float font_size = 16.0f;           // monospace font pixel size (Ctrl +/- / Ctrl+wheel)
+    float ui_scale = 1.0f;
+    bool restore_session = true;       // hot exit
+    int session_autosave_seconds = 3;  // crash-safety interval while dirty
+    bool goto_default_hex = true;
+    bool highlight_modified = true;    // tint bytes that differ from disk
+    std::vector<std::string> recent_files;  // most recent first, max 20
+    // Keys this version does not know (e.g. written by a newer Hexer); written back unchanged by save().
+    std::vector<std::pair<std::string, std::string>> unknown_keys;
+
+    bool load(const std::string& path);
+    bool save(const std::string& path) const;
+    void push_recent(const std::string& path);
+};
+
+namespace paths {
+void set_config_dir_override(const std::string& dir);  // --config-dir (tests, portable mode)
+std::string config_dir();       // %APPDATA%\Hexer  |  $XDG_CONFIG_HOME/hexer (~/.config/hexer)
+std::string session_dir();       // <config>/session
+std::string user_scripts_dir();  // <config>/scripts  (created on first run)
+std::string bundled_scripts_dir();  // <exe dir>/scripts, else HEXER_SOURCE_SCRIPTS_DIR (dev builds)
+std::string settings_file();     // <config>/settings.ini
+std::string imgui_ini_file();    // <config>/layout.ini
+void ensure_dirs();              // create config/session/scripts dirs
+}  // namespace paths
+
+}  // namespace hx

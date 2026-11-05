@@ -1,0 +1,5 @@
+/build*/
+/subprojects/*/
+!/subprojects/packagefiles/
+/subprojects/packagecache/
+*.ppm

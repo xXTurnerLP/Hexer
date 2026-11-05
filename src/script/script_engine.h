@@ -1,0 +1,200 @@
+#pragma once
+// Lua 5.5 scripting: plugins, protocol/format parsers (deserializers) that build a structure tree +
+// hex highlighting, field editing (serializers), commands, and an interactive console.
+//
+// =================================== Lua API (contract) ======================================
+// Every *.lua file in the bundled scripts dir, then in the user scripts dir, is executed in one
+// shared Lua state. Any change to any of those files triggers a full reload (fresh state).
+// Subfolders are scanned too (sorted by relative path), except <dir>/lib/: files there are
+// modules for require("name") (package.path includes <dir>/lib/?.lua) and are not run directly.
+// os.exit and io.read are disabled (no killing the editor, no stdin).
+// Global table `hexer` (also aliased as `hx`):
+//
+//   hx.version                          "0.1.0"
+//   hx.parser{ name=, extensions={"png",..}, detect=function(doc) -> bool, parse=function(p, doc) }
+//   hx.command{ name=, description=, run=function(doc) }   -- shown in palette + Scripts menu
+//   hx.run(name)                        -- run a registered command (as the palette does)
+//   print(...) / hx.log(...) / hx.warn(...) / hx.error(...)  -- to the console; tables pretty-printed
+//   hx.inspect(v) -> string            -- pretty-printer used by print
+//   hx.clear_console()
+//   hx.doc() -> active Doc or nil
+//   hx.new_doc(name, bytes) -> Doc     -- open bytes (e.g. a serialized packet) in a new tab
+//   hx.highlight(doc, off, len, color, label?)  /  hx.clear_highlights(doc)
+//   hx.color(c) -> packed int          -- c: "red"|"#ff8800"|0xff8800 (named: red, green, blue,
+//                                         yellow, orange, purple, cyan, pink, gray, teal)
+//   hx.hex(str) -> "DE AD BE EF"   hx.unhex("de ad be ef") -> str (lenient, like paste)
+//   hx.crc32(str, prev?) -> int       -- zlib/PNG/ZIP CRC-32; pass `prev` to continue over chunks
+//   string.pack / string.unpack       -- standard Lua; the recommended way to serialize
+//
+// Doc (userdata; every call raises "document closed" if its tab was closed):
+//   doc:size()  doc:name()  doc:path()  doc:id()
+//   doc:read(off, len) -> string         (clamped to EOF; at most 64 MiB per call)
+//   doc:u8(off) doc:i8(off) doc:u16le/u16be/i16le/i16be/u32le/u32be/i32le/i32be/
+//       u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)  -> number (nil past EOF)
+//       (also u24le/u24be/i24le/i24be)
+//   doc:write(off, bytes)   doc:insert(off, bytes)   doc:erase(off, len)   doc:replace(off, len, bytes)
+//   doc:transaction(fn, label?)          -- all edits inside fn become ONE undo step
+//   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:goto(off)
+//       (`goto` is a Lua keyword: write doc:jump(off), the same function, or doc["goto"](doc, off))
+//   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")
+//   All script edits are undoable and respect read-only mode (error "document is read-only").
+//
+// Parser context `p` (argument of parse; reads relative to the document, cursor starts at 0):
+//   p:tell()  p:seek(off)  p:skip(n)  p:size()  p:remaining()  p:eof()
+//   p:endian("le"|"be")                 -- default endianness for u16/u32/... without suffix
+//   Typed readers: read at tell(), advance, emit a field, return the value:
+//     p:u8/i8/u16/i16/u24/i24/u32/i32/u64/i64/f32/f64(name, opts?)  (+ "le"/"be" suffixed variants,
+//                                                                 e.g. p:u32be("length"))
+//     p:read(fmt, name, opts?)          -- any string.unpack format, e.g. p:read(">I3", "len24")
+//     p:bytes(name, n, opts?) -> string|nil  (returns the bytes when n <= 64 KiB, else nil)
+//     p:str(name, n, opts?) -> string       p:cstr(name, opts?) -> string (NUL-terminated, max 64 KiB)
+//     p:uleb(name, opts?) / p:sleb(name, opts?)  -- LEB128 varints
+//   Structure:
+//     p:struct(name, fn, opts?) -> fn's return value   (size = bytes consumed by fn)
+//     p:array(name, count, fn(i), opts?)            (children labelled name[i], i from 0)
+//                                                   -> table of fn's first return values
+//     p:field(name, off, size, value_text, opts?)    (manual field, does not move the cursor)
+//     p:label(text)                                 (display text of the innermost open struct)
+//     p:note(text)                                  (comment on the last emitted field)
+//   Non-emitting:  p:peek(fmt) -> values (string.unpack at tell()),  p:peekbytes(n) -> string
+//   opts = { color=, comment=, enum={[1]="HELLO", ...}, fmt="hex"|"dec"|"bin"|"char" }
+//          (enum may also be written name->value: {HELLO=1}; a struct's color is inherited by its
+//           fields that have no color of their own)
+//   Numeric fields (typed readers / p:read) are EDITABLE in the Structure panel: the new value is
+//   encoded with the field's own pack format and written back (enum names accepted).
+//   Limits: 200,000 fields; a parse is aborted after ~2 s (instruction-count hook) - the partial
+//   tree is kept and the error (with script file:line) is shown in the console.
+//
+// Console REPL: input is first tried as `return <input>` (results printed), then as a statement.
+// Predefined each time: `doc` (active Doc or nil), `cur` (cursor), `sel` = {start=, len=}.
+// A command's edits to the active document form ONE undo step ("Script: <name>"). Script load,
+// commands and console lines are stopped after 10 s, detect() after 1 s (same hook as parse).
+// ===========================================================================================
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "core/document.h"
+#include "core/highlight.h"
+
+struct lua_State;
+
+namespace hx {
+
+struct ConsoleLine {
+    enum Kind : uint8_t { Info, Warn, Error, Input, Result };
+    Kind kind = Info;
+    std::string text;
+};
+
+struct Field {
+    std::string name;      // "length", "chunk[3]"
+    std::string type;      // "u32be", "bytes", "str", "struct", "array", "custom", ">I3" ...
+    std::string value;     // display text ("13 (0xD)", "IHDR", "89 50 4E 47 ...", enum name)
+    std::string comment;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    uint32_t color = 0;    // packed rgba (core/highlight.h); always set (auto palette if omitted)
+    int parent = -1;
+    int depth = 0;
+    std::vector<int> children;
+    std::string pack;      // string.pack format used to (re)encode; "" = not editable
+    bool editable() const { return !pack.empty(); }
+    // Enum names (sorted by value) when the field was read with opts.enum; null otherwise.
+    // Shared by all fields that used the same enum table. Handy for a combo box in the UI.
+    struct EnumItem {
+        int64_t value = 0;
+        std::string name;
+    };
+    std::shared_ptr<const std::vector<EnumItem>> enums;
+};
+
+struct ParseResult {
+    std::string parser;              // parser name that produced this ("" = none)
+    std::vector<Field> fields;       // flat, parents before children; roots have parent == -1
+    HighlightSet highlights;         // leaf fields (no children) as colored ranges, finalized
+    std::string error;               // "" on success
+    bool truncated = false;          // hit the field limit
+    double ms = 0.0;
+    uint64_t doc_generation = 0;     // Document::generation() it was computed for
+};
+
+struct ParserInfo {
+    std::string name;
+    std::string file;                // script file path
+    std::vector<std::string> extensions;
+};
+
+struct ScriptCommand {
+    std::string name;
+    std::string description;
+    std::string file;
+};
+
+// Implemented by the application so scripts can reach documents and the UI.
+class ScriptHost {
+public:
+    virtual ~ScriptHost() = default;
+    virtual Document* active_document() = 0;
+    virtual Document* find_document(uint64_t id) = 0;  // nullptr if closed
+    virtual Document* open_bytes(const std::string& name, const uint8_t* data, size_t len) = 0;
+    virtual void reveal(Document& doc, uint64_t offset, uint64_t len) = 0;  // select + scroll into view
+};
+
+class ScriptEngine {
+public:
+    explicit ScriptEngine(ScriptHost* host);
+    ~ScriptEngine();
+    ScriptEngine(const ScriptEngine&) = delete;
+    ScriptEngine& operator=(const ScriptEngine&) = delete;
+
+    // Directories scanned in order (later ones override parsers/commands with the same name).
+    void set_script_dirs(std::vector<std::string> dirs);
+    void reload();                 // fresh lua_State, run every script; errors go to the console
+    bool poll_hot_reload();        // cheap mtime check (call ~once per second); true if reloaded
+    uint64_t reload_count() const { return reload_count_; }
+
+    // ---- console --------------------------------------------------------------------------
+    void exec(const std::string& code);  // REPL line (echoed as Input)
+    void log(ConsoleLine::Kind kind, const std::string& text);
+    const std::deque<ConsoleLine>& console() const { return console_; }
+    void clear_console();
+    uint64_t console_generation() const { return console_gen_; }  // bumps on every new line
+
+    // ---- parsers ---------------------------------------------------------------------------
+    const std::vector<ParserInfo>& parsers() const { return parsers_; }
+    // First parser whose detect(doc) returns true, else first whose extensions match the path, else "".
+    std::string detect_parser(Document& doc);
+    ParseResult parse(Document& doc, const std::string& parser_name);
+    // Serializer: encode `text` with the field's pack format (or enum name) and overwrite the
+    // field's bytes in `doc` (one undo step).
+    bool edit_field(Document& doc, const Field& field, const std::string& text, std::string* err);
+
+    // ---- commands & highlights ---------------------------------------------------------------
+    const std::vector<ScriptCommand>& commands() const { return commands_; }
+    void run_command(const std::string& name);
+    // Ranges created with hx.highlight(); app passes them to the hex view as a layer.
+    const HighlightSet* script_highlights(uint64_t doc_id) const;  // nullptr if none
+
+    ScriptHost* host() const { return host_; }
+    struct Impl;  // private Lua glue (script/lua_api.cpp)
+
+private:
+    void add_lib_paths();
+
+    ScriptHost* host_;
+    std::unique_ptr<Impl> impl_;
+    std::vector<std::string> dirs_;
+    std::vector<ParserInfo> parsers_;
+    std::vector<ScriptCommand> commands_;
+    std::deque<ConsoleLine> console_;   // capped at 5000 lines
+    uint64_t console_gen_ = 0;
+    uint64_t reload_count_ = 0;
+    std::unordered_map<uint64_t, HighlightSet> highlights_;
+    friend struct Impl;
+};
+
+}  // namespace hx
