@@ -214,6 +214,11 @@ uint32_t FileSource::pid() const { return impl_->pid; }
 bool FileSource::sparse() const { return impl_->sparse; }
 bool FileSource::io_error() const { return impl_->io_error.load(); }
 
+uint64_t FileSource::epoch() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->epoch;
+}
+
 bool FileSource::alive() const {
     auto be = impl_->handle();
     return be && be->alive();

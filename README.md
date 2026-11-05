@@ -17,7 +17,12 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   by name, pid or path) and opens one's address space as a document: offset = virtual address,
   unmapped pages show as `??`, the status bar says `process 1234 · 47-bit address space`, and the
   **Regions** panel (opens by itself) lists the memory map (base, size, protection, type, module);
-  click a region to select it. File > Open Disk... opens a physical disk or volume
+  click a region to select it. Its **Modules** tab lists the loaded modules (base, size, path;
+  also the 32-bit ones of a WOW64 process), and Search > Go to Module... jumps to one by name. The
+  Disassembly panel labels module exports (`KERNEL32.dll!CreateFileW:`) from each module's PE
+  headers in memory, and the follow-pointer width defaults to the process's pointer size (8, or 4
+  for a 32-bit process) until you pick one. Lua: `hx.open_process(pid)`, `doc:modules()`.
+  File > Open Disk... opens a physical disk or volume
   (`\\.\PhysicalDrive0`, `/dev/sda`). Both open **read-only** unless you tick Writable (or turn
   Edit > Read-only off later); they keep their size, so they stay in overwrite mode and a save
   writes just the changed bytes in place (no backup). `F5` / File > Refresh Memory re-reads a
@@ -60,6 +65,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   Little or big endian. Double-click a value to edit it.
 - **Structure panel.** Lua parsers decode the file into a tree. Each field is highlighted in the
   hex view in its own color. Double-click a value to edit it, and it is re-encoded in place.
+  Parsers run in the background and re-run after edits, so even a slow one never freezes the
+  editor (the old tree stays shown until the new one is ready; a long parse can be cancelled).
   Bundled parsers: PNG, ZIP (including ZIP64) and an example TLV protocol ("HXP").
 - **Parse at an offset.** The Structure panel's **Parse at** field (or **Cursor**, Scripts > Parse
   at Cursor) runs a parser from any offset, e.g. a PNG embedded in a firmware dump; fields are
@@ -130,6 +137,16 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   a live filter, and **Parse with**: pick a parser (e.g. your protocol's) and each packet you
   click, or step through with `Up` / `Down`, is parsed in the Structure panel (optionally just
   its payload). `python tools/make_pcap.py demo.pcapng` writes a demo capture.
+  The filter is a small expression language: `ip.src == 10.0.0.1`, `ip.addr == 2001:db8::/32`,
+  `tcp.port == 80 and not udp`, `frame.len > 1000 or (arp || icmp)`, `eth.type == 0x86dd`,
+  `"text"` (fields: `ip.src/dst/addr`, `tcp.port/srcport/dstport`, `udp.port/srcport/dstport`,
+  `frame.len`, `eth.type`, `proto`; hover the box for the list); a mistake is marked in red
+  where it is and the previous filter stays. **Follow TCP Stream** (right-click a TCP packet, or
+  the toolbar) reassembles the connection by sequence number (out-of-order, retransmitted and
+  overlapping segments, sequence wraparound) into a new read-only tab, client -> server then
+  server -> client or interleaved in arrival order, with a bookmark per segment ("#12 C>S")
+  to find the packet again (up to 256 MiB per stream). **Open Packet / Payload as Tab** does the
+  same for a single packet.
 - **Live tail** (View > Live Tail) for growing files such as logs and captures: appended data
   shows up within half a second and the view follows it while the caret is at the end
   (`Ctrl+End`). Edits and undo keep working; a file that is rewritten instead of appended to

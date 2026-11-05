@@ -65,6 +65,37 @@ struct PointerType {
 
 bool valid_pointer_width(int width);  // 1, 2, 3, 4 or 8
 
+// The follow-pointer width default of process documents. The width setting is global
+// (Settings::pointer_width); while a process document is active its pointer size (8, or 4 for a
+// WOW64 / 32-bit process) is put in its place, and the replaced width comes back when another
+// kind of document becomes active - until the user picks a width (Inspector row, Follow Pointer
+// Settings): from then on the user's choice holds everywhere for the rest of the session.
+// settings.ini always keeps the user's width (persisted()).
+struct AutoPointerWidth {
+    bool picked = false;  // the user chose a width this session
+    int saved = 0;        // the width an automatic one replaced (0 = no automatic width in effect)
+
+    // The active document changed; `process_bytes` = its pointer size (4 / 8), 0 for anything but
+    // a process document (or an unknown size). Updates `width` (the setting) in place.
+    void activate(int process_bytes, int& width) {
+        if (picked) return;
+        if (process_bytes == 4 || process_bytes == 8) {
+            if (!saved) saved = width;
+            width = process_bytes;
+        } else if (saved) {
+            width = saved;
+            saved = 0;
+        }
+    }
+    // The user picked a width explicitly (it stays).
+    void pick() {
+        picked = true;
+        saved = 0;
+    }
+    // The width to write to settings.ini: the replaced one while an automatic width is in effect.
+    int persisted(int width) const { return saved ? saved : width; }
+};
+
 // Reads the pointer of `type` at `at` and turns it into a file offset (see PointerType). Returns
 // false for an invalid width, bytes past EOF or unreadable (I/O error), a negative absolute value,
 // value < base, a relative target before 0 or past 2^64, or target > doc.size() (target == size,

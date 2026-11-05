@@ -15,6 +15,7 @@
 #include <initializer_list>
 #include <memory>
 
+#include "core/devices.h"
 #include "core/disasm.h"
 #include "core/exe_map.h"
 #include "core/hash.h"
@@ -263,6 +264,34 @@ int doc_pid(lua_State* L) {
     return 1;
 }
 
+// doc:modules() -> list of {name=, base=, size=, path=} (process documents; {} otherwise), or nil, err.
+int doc_modules(lua_State* L) {
+    const Document* d = check_doc(L, 1);
+    std::vector<ModuleInfo> mods;
+    if (d->target() == SourceKind::Process) {
+        std::string err;
+        if (!process_modules(d->process_id(), mods, &err)) {
+            lua_pushnil(L);
+            lua_pushstring(L, err.c_str());
+            return 2;
+        }
+    }
+    lua_createtable(L, int(std::min<size_t>(mods.size(), INT32_MAX)), 0);
+    for (size_t i = 0; i < mods.size(); ++i) {
+        lua_createtable(L, 0, 4);
+        lua_pushstring(L, mods[i].name.c_str());
+        lua_setfield(L, -2, "name");
+        lua_pushinteger(L, lua_Integer(mods[i].base));
+        lua_setfield(L, -2, "base");
+        lua_pushinteger(L, lua_Integer(mods[i].size));
+        lua_setfield(L, -2, "size");
+        lua_pushstring(L, mods[i].path.c_str());
+        lua_setfield(L, -2, "path");
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    return 1;
+}
+
 int doc_read(lua_State* L) {
     Document* d = check_doc(L, 1);
     uint64_t off = check_u64(L, 2);
@@ -424,8 +453,8 @@ int doc_hash(lua_State* L) {
 }
 
 // ---- disassembly (hx.disasm / doc:disasm) ------------------------------------------------------
-// Results are first copied into a Lua-owned array of plain structs, so no C++ object is alive
-// while the result tables are built (see the error-handling rule in lua_internal.h).
+// Results are first copied into a Lua-owned array of plain structs, then into the result tables
+// (a memory error while building them unwinds cleanly: see lua_internal.h).
 
 constexpr size_t kMaxDisasm = 10000;  // instructions per call
 
@@ -529,7 +558,7 @@ int doc_disasm(lua_State* L) {
 
 // ---- doc:symbols ---------------------------------------------------------------------------------
 // The table is serialized into a malloc'ed blob owned by a userdata with __gc (a Lua error while
-// the result tables are built frees it), so no C++ object is alive while Lua may raise.
+// the result tables are built frees it); the SymbolTable itself is gone by then.
 
 struct SymRec {
     uint64_t address, offset;
@@ -564,7 +593,10 @@ int doc_symbols(lua_State* L) {
     bool oom = false;
     {
         const AddressMap map = detect_address_map(*d);
-        const SymbolTable t = build_symbols(*d->snapshot(), map);
+        ScriptHost* host = impl_of(L).eng.host();
+        std::shared_ptr<const SymbolTable> cached = host ? host->cached_symbols(*d) : nullptr;
+        if (!cached) cached = std::make_shared<const SymbolTable>(build_symbols(*d->snapshot(), map));
+        const SymbolTable& t = *cached;
         const size_t n = t.symbols.size() + t.forwarders.size();
         size_t pool = 0;
         for (const auto* v : {&t.symbols, &t.forwarders})
@@ -730,16 +762,7 @@ int doc_bookmarks(lua_State* L) {
     return 1;
 }
 
-// C++ work of a lua_CFunction that raises Lua errors goes into a separate non-inlined helper, so
-// the function's own frame holds no object with a destructor anywhere (MSVC's longjmp unwinding of
-// a Lua error through such a frame can run destructors of objects that were never constructed).
-#if defined(_MSC_VER)
-#define HX_NOINLINE __declspec(noinline)
-#else
-#define HX_NOINLINE __attribute__((noinline))
-#endif
-
-HX_NOINLINE bool add_bookmark_plain(Document& d, uint64_t off, uint64_t len, const char* name, size_t name_len, uint32_t color,
+bool add_bookmark_plain(Document& d, uint64_t off, uint64_t len, const char* name, size_t name_len, uint32_t color,
                         const char* note, size_t note_len) {
     Bookmark b;
     b.offset = off;
@@ -809,6 +832,7 @@ const luaL_Reg kDocMethods[] = {
     {"goto", doc_goto},       {"jump", doc_goto},          {"find", doc_find},
     {"hash", doc_hash},       {"target", doc_target},      {"pid", doc_pid},
     {"disasm", doc_disasm},   {"symbols", doc_symbols},
+    {"modules", doc_modules},
     {"view_range", doc_view_range},                        {"bookmarks", doc_bookmarks},
     {"add_bookmark", doc_add_bookmark},                    {"remove_bookmark", doc_remove_bookmark},
     {nullptr, nullptr},
@@ -974,6 +998,9 @@ int emit(lua_State* L, ParseCtx* c, const char* name, const char* type, uint64_t
     c->explicit_color.push_back(o.has_color ? 1 : 0);
     if (parent >= 0) F[parent].children.push_back(idx);
     c->last = idx;
+    const Impl& im = impl_of(L);
+    if (im.progress_fields) im.progress_fields->store(F.size(), std::memory_order_relaxed);
+    if (im.progress_offset) im.progress_offset->store(off + size, std::memory_order_relaxed);
     return idx;
 }
 
@@ -1024,7 +1051,6 @@ std::shared_ptr<const std::vector<Field::FlagItem>> get_flags(lua_State* L, Pars
             name = lua_tostring(L, -2);
         }
         if (!name || bit < 0 || bit > 63) {
-            list.reset();  // luaL_error longjmps past this frame: free the list first
             luaL_error(L, "opts.flags: use {[bit] = \"NAME\"} with bit numbers 0..63");
         }
         list->push_back({int(bit), name});
@@ -1762,6 +1788,29 @@ int l_new_doc(lua_State* L) {
     return 1;
 }
 
+// hx.open_process(pid, {writable=false}?) -> doc | nil, err
+int l_open_process(lua_State* L) {
+    const lua_Integer pid = luaL_checkinteger(L, 1);
+    luaL_argcheck(L, pid > 0 && pid <= lua_Integer(UINT32_MAX), 1, "not a process id");
+    bool writable = false;
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "writable");
+        writable = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+    }
+    ScriptHost* host = impl_of(L).eng.host();
+    std::string err = "no host";
+    Document* d = host ? host->open_process(uint32_t(pid), writable, &err) : nullptr;
+    if (!d) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.c_str());
+        return 2;
+    }
+    push_doc(L, d->id());
+    return 1;
+}
+
 int l_highlight(lua_State* L) {
     Document* d = check_doc(L, 1);
     uint64_t off = check_u64(L, 2);
@@ -1821,17 +1870,20 @@ int l_unhex(lua_State* L) {
 }
 
 // Standard CRC-32 (zlib / PNG / ZIP); `prev` continues an earlier result for chunked input.
-int l_crc32(lua_State* L) {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
+struct Crc32Table {
+    uint32_t v[256];
+    Crc32Table() {
         for (uint32_t i = 0; i < 256; ++i) {
             uint32_t c = i;
             for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            table[i] = c;
+            v[i] = c;
         }
-        init = true;
     }
+};
+
+int l_crc32(lua_State* L) {
+    static const Crc32Table tbl;  // thread-safe init: background parses run in states of their own
+    const uint32_t* table = tbl.v;
     size_t n;
     const auto* s = reinterpret_cast<const uint8_t*>(luaL_checklstring(L, 1, &n));
     uint32_t crc = ~uint32_t(luaL_optinteger(L, 2, 0));
@@ -1882,7 +1934,7 @@ int l_disasm(lua_State* L) {
 }
 
 // ---- XOR search (hx.xor_scan / hx.xor_guess_key) -----------------------------------------------
-// The scans run in HX_NOINLINE helpers that fill Lua-owned arrays of plain structs.
+// The scans run in helpers that fill Lua-owned arrays of plain structs.
 
 constexpr uint64_t kMaxXorScan = 256ull << 20;   // hx.xor_scan range cap (it blocks)
 constexpr uint64_t kMaxKeyGuess = 16ull << 20;   // hx.xor_guess_key range cap
@@ -1940,9 +1992,9 @@ const char* xor_transform_lua(XorTransform t) {
 
 // Scans [start, start+len) of `d` on a worker (stopped at `until`); at most `max` hits into `arr`.
 // Returns the hit count; *timed_out when the time limit stopped it.
-HX_NOINLINE size_t xor_scan_into(const Document& d, uint64_t start, uint64_t len, const char* pt, size_t pn,
-                                 const XorScanOptions& o, size_t max, std::chrono::steady_clock::time_point until,
-                                 LuaXorHit* arr, bool* timed_out) {
+size_t xor_scan_into(const Document& d, uint64_t start, uint64_t len, const char* pt, size_t pn,
+                     const XorScanOptions& o, size_t max, std::chrono::steady_clock::time_point until,
+                     LuaXorHit* arr, bool* timed_out) {
     const std::vector<uint8_t> plain(pt, pt + pn);
     std::shared_ptr<const Snapshot> snap = d.snapshot();
     XorScanResult res;
@@ -1968,8 +2020,8 @@ HX_NOINLINE size_t xor_scan_into(const Document& d, uint64_t start, uint64_t len
 }
 
 // key_guess over [off, off+len) of `d` into `arr` (kXorMaxKeyLen entries); returns the count.
-HX_NOINLINE size_t key_guess_into(const Document& d, uint64_t off, uint64_t len, uint8_t plain, uint32_t max_len,
-                                  LuaKeyCand* arr) {
+size_t key_guess_into(const Document& d, uint64_t off, uint64_t len, uint8_t plain, uint32_t max_len,
+                      LuaKeyCand* arr) {
     std::vector<uint8_t> buf(static_cast<size_t>(len));
     const size_t got = len ? d.read(off, buf.data(), buf.size()) : 0;
     const std::vector<KeyCandidate> c = key_guess(buf.data(), got, off, plain, max_len);
@@ -2159,6 +2211,7 @@ const luaL_Reg kHexerFuncs[] = {
     {"warn", l_warn},         {"error", l_error},       {"inspect", l_inspect},
     {"clear_console", l_clear_console},                 {"doc", l_doc},
     {"new_doc", l_new_doc},   {"highlight", l_highlight},
+    {"open_process", l_open_process},
     {"clear_highlights", l_clear_highlights},           {"color", l_color},
     {"hex", l_hex},           {"unhex", l_unhex},       {"crc32", l_crc32},
     {"hash", l_hash},         {"hash_algorithms", l_hash_algorithms},
@@ -2468,7 +2521,8 @@ int lua_msg_handler(lua_State* L) {
 void lua_time_hook(lua_State* L, lua_Debug* ar) {
     Impl& im = impl_of(L);
     if (!im.deadline_on) return;
-    if (!im.timed_out && std::chrono::steady_clock::now() < im.deadline) {
+    const bool cancelled = im.cancel && im.cancel->load(std::memory_order_relaxed);  // ParseJob::cancel
+    if (!cancelled && !im.timed_out && std::chrono::steady_clock::now() < im.deadline) {
         if (lua_gethookcount(L) != kHookCount) lua_sethook(L, lua_time_hook, LUA_MASKCOUNT, kHookCount);
         return;
     }
@@ -2479,7 +2533,8 @@ void lua_time_hook(lua_State* L, lua_Debug* ar) {
     if (im.L && im.L != L && lua_gethookcount(im.L) != 1) lua_sethook(im.L, lua_time_hook, LUA_MASKCOUNT, 1);
     if (im.cmd_thread && im.cmd_thread != L && lua_gethookcount(im.cmd_thread) != 1)
         lua_sethook(im.cmd_thread, lua_time_hook, LUA_MASKCOUNT, 1);
-    if (lua_getinfo(L, "Sl", ar) && ar->currentline > 0)
+    if (cancelled) lua_pushliteral(L, "parse cancelled");
+    else if (lua_getinfo(L, "Sl", ar) && ar->currentline > 0)
         lua_pushfstring(L, "%s:%d: script time limit exceeded (%d ms)", ar->short_src, ar->currentline, im.limit_ms);
     else
         lua_pushfstring(L, "script time limit exceeded (%d ms)", im.limit_ms);
@@ -2535,7 +2590,8 @@ void run_parse(Impl& im, Document& doc, int parser_ref, ParseResult& out, uint64
     while (!ctx->open.empty()) close_open(ctx.get());
     if (!ok) {
         out.error = error_head(err);
-        im.log_error_once("Parser '" + out.parser + "': " + err);
+        if (im.quiet_parse_errors) im.last_parse_error = err;  // a ParseJob reports it later
+        else im.log_error_once("Parser '" + out.parser + "': " + err);
     }
 
     // Colors (explicit > inherited from a colored struct > palette by leaf order) and highlights.

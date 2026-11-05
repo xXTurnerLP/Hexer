@@ -647,6 +647,7 @@ private:
     }
 
     void ethertype(uint16_t et, size_t off) {
+        pi_.eth_type = et;
         switch (et) {
         case 0x0800: return ipv4(off);
         case 0x86DD: return ipv6(off);
@@ -687,6 +688,9 @@ private:
         if (ihl < 20 || !has(off, ihl)) return bad("bad IPv4 header length", off, n_);
         pi_.src = fmt_ipv4(p_ + off + 12);
         pi_.dst = fmt_ipv4(p_ + off + 16);
+        pi_.ip_version = 4;
+        std::memcpy(pi_.ip_src, p_ + off + 12, 4);
+        std::memcpy(pi_.ip_dst, p_ + off + 16, 4);
         const size_t total = be16(off + 2);
         size_t end = off + total;
         bool bogus_len = false;
@@ -718,6 +722,9 @@ private:
         if (u8(off) >> 4 != 6) return bad("IPv6 version field is not 6", off, n_);
         pi_.src = fmt_ipv6(p_ + off + 8);
         pi_.dst = fmt_ipv6(p_ + off + 24);
+        pi_.ip_version = 6;
+        std::memcpy(pi_.ip_src, p_ + off + 8, 16);
+        std::memcpy(pi_.ip_dst, p_ + off + 24, 16);
         const size_t plen = be16(off + 4);
         const size_t end = plen ? off + 40 + plen : n_;  // 0: jumbogram / offload
         uint8_t nh = u8(off + 6);
@@ -797,7 +804,14 @@ private:
         const uint16_t win = be16(off + 14);
         pi_.src = ep(pi_.src, sp, v6);
         pi_.dst = ep(pi_.dst, dp, v6);
+        pi_.has_ports = true;
+        pi_.src_port = sp;
+        pi_.dst_port = dp;
         if (doff < 20 || doff > end - off) return bad("bad TCP header length", off + 20, end);
+        pi_.tcp_header = true;
+        pi_.tcp_seq = seq;
+        pi_.tcp_ack = ack;
+        pi_.tcp_flags = uint8_t(flags);
         static const char* kNames[] = {"FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"};
         std::string f;
         for (int i = 0; i < 8; ++i)
@@ -813,6 +827,9 @@ private:
         if (!has(off, 8) || end - off < 8) return bad("short UDP header", off, end);
         pi_.src = ep(pi_.src, be16(off), v6);
         pi_.dst = ep(pi_.dst, be16(off + 2), v6);
+        pi_.has_ports = true;
+        pi_.src_port = be16(off);
+        pi_.dst_port = be16(off + 2);
         const size_t ulen = be16(off + 4);
         if (ulen < 8) return bad("bad UDP length", off + 8, end);
         if (ulen > end - off) {

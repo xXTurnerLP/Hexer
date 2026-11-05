@@ -12,10 +12,13 @@ struct App;
 struct Tab;
 class Document;
 
-// Debounced re-parse of the tab's document (~120 ms after generation / parser / script reload
-// changed). Called every frame for the active tab, before the hex view is drawn, so the parser
-// highlight layer is current. Keeps the last result per document. A parse that took longer than
-// ~50 ms (or hit the field limit) is not re-run on content edits; it shows as stale until F5.
+// Debounced re-parse of the tab's document (~150 ms after generation / parser / script reload
+// changed; at once after F5, a field edit or Parse at). Called every frame for the active tab,
+// before the hex view is drawn, so the parser highlight layer is current. The parse runs on a
+// worker (script/parse_job.h): a fast one is adopted in the frame that starts it, a slow one
+// leaves the previous tree shown (greyed, "Parsing... N fields [Cancel]") until it finishes. A
+// job whose inputs changed meanwhile is cancelled and its result dropped. Keeps the last result
+// per document.
 void update_structure(App& app, Tab& tab);
 // Parse at offset: the Structure panel parses [base, base + length) of the tab's document (base 0
 // and length UINT64_MAX = the whole file; UINT64_MAX = to EOF) and re-parses now. A non-zero base

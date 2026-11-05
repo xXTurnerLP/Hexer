@@ -1,7 +1,6 @@
 #include "ui/panel_disasm.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cfloat>
 #include <charconv>
 #include <cmath>
@@ -195,6 +194,18 @@ void DisasmPanel::ensure_symbols(DocState& st, const Document& doc) {
         st.sym_job.start(doc.snapshot(), st.map);
     }
     st.syms = st.sym_job.result();
+}
+
+std::shared_ptr<const SymbolTable> DisasmPanel::current_symbols(const Document& doc) const {
+    auto it = docs_.find(doc.id());
+    if (it == docs_.end()) return nullptr;
+    const DocState& st = *it->second;
+    // Auto (= detect_address_map) and up to date with the document's bytes; never process memory.
+    if (st.choice != DisasmMapChoice::Auto || !st.map_valid || st.map_choice != DisasmMapChoice::Auto ||
+        st.map_gen != doc.generation() || st.map_size != doc.size() || st.sym_mapv != st.map_version ||
+        st.map.kind == AddressMap::Process || st.map.in_memory || !st.sym_job.current())
+        return nullptr;
+    return st.sym_job.result();
 }
 
 const SymbolTable* DisasmPanel::symbols(const Document& doc, bool wait) {
@@ -789,24 +800,14 @@ void DisasmPanel::draw_symbol_list(DocState& st, const Document& doc, const Disa
     }
     ImGui::SetNextItemWidth(-FLT_MIN);
     const bool edited = ImGui::InputTextWithHint("##symfilter", "filter (part of the name, any case)", &sym_filter_);
-    // Matches: recomputed when the filter or the table changes (a linear pass, also for 1M symbols).
+    // Matches: recomputed when the filter or the table changes (one scan over the table's lowercase
+    // labels, precomputed by the SymbolJob worker: a few ms also for 1M symbols).
     if (edited || sym_matched_ != st.syms || sym_matched_filter_ != sym_filter_) {
         sym_matched_ = st.syms;
         sym_matched_filter_ = sym_filter_;
-        sym_matches_.clear();
         sym_sel_ = 0;
-        std::string f = sym_filter_;
-        for (char& c : f) c = char(std::tolower(static_cast<unsigned char>(c)));
-        if (t) {
-            for (size_t i = 0; i < t->symbols.size(); ++i) {
-                if (!f.empty()) {
-                    std::string l = t->symbols[i].label();
-                    for (char& c : l) c = char(std::tolower(static_cast<unsigned char>(c)));
-                    if (l.find(f) == std::string::npos) continue;
-                }
-                sym_matches_.push_back(uint32_t(i));
-            }
-        }
+        if (t) t->match(sym_filter_, sym_matches_);
+        else sym_matches_.clear();
     }
     const int n = int(sym_matches_.size());
     bool go = false;

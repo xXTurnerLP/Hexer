@@ -35,7 +35,19 @@ test_panels = executable('test_panels', 'test_panels.cpp', test_main,
 test('panels', test_panels, timeout : 300)
 
 # Feature suites (one exe each so features can be built/tested independently).
-foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail', 'procmem', 'history', 'xorscan', 'session', 'symbols']
+foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail', 'history', 'xorscan', 'session', 'symbols']
+  exe = executable('test_' + t, 'test_' + t + '.cpp', test_main,
+    dependencies : [core_dep, doctest_dep], cpp_args : conf_args)
+  test(t, exe, timeout : 300)
+endforeach
+
+# Process memory / devices / modules + in-memory PE symbols; Lua hx.open_process (script_dep).
+test_procmem = executable('test_procmem', 'test_procmem.cpp', test_main,
+  dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
+test('procmem', test_procmem, timeout : 300)
+
+# Packet filter expressions (core/pcap_filter) and TCP stream reassembly (core/pcap_stream).
+foreach t : ['pcapfilter', 'tcpstream']
   exe = executable('test_' + t, 'test_' + t + '.cpp', test_main,
     dependencies : [core_dep, doctest_dep], cpp_args : conf_args)
   test(t, exe, timeout : 300)
@@ -48,6 +60,11 @@ test('cstruct', test_cstruct, timeout : 300)
 test_cexport = executable('test_cexport', 'test_cexport.cpp', test_main,
   dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
 test('cexport', test_cexport, timeout : 300)
+
+# Background parses (script/parse_job.h): worker thread, own Lua state, cancel, stale results, holes.
+test_parsejob = executable('test_parsejob', 'test_parsejob.cpp', test_main,
+  dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
+test('parsejob', test_parsejob, timeout : 300)
 
 # Disassembly (Zydis) + PE / ELF address maps + hx.disasm / doc:disasm + the headless Disassembly panel.
 test_disasm = executable('test_disasm', 'test_disasm.cpp', test_main,

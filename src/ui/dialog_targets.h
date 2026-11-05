@@ -7,9 +7,13 @@
 //     (also accepts a typed device path), "Writable" with a warning; Open calls
 //     cb.open_device(path, writable). A callback returning false keeps the window open and shows
 //     its *err (e.g. "Access is denied (try running Hexer as administrator)").
-//   * RegionsPanel: table base | size | prot | type | module of the active process document,
-//     filter, Refresh (re-reads the region map and the document's cached bytes); a click calls
-//     cb.jump(base, size). The region holding the caret is highlighted.
+//   * RegionsPanel: two tabs for the active process document. "Regions": table base | size |
+//     prot | type | module, filter, Refresh (re-reads the region map and the document's cached
+//     bytes); a click calls cb.jump(base, size). "Modules": the loaded modules (core/devices.h
+//     process_modules) as base | size | name | path, filter, Refresh; a click calls
+//     cb.jump(base, size). The region / module holding the caret is highlighted.
+//     "Go to Module" (open_module_list + draw_module_list): a filterable popup of the modules;
+//     Enter / click jumps to the module's base (cb.jump(base, size)).
 // Self-contained: no App dependency. The app owns one TargetsDialog and one RegionsPanel, calls
 // TargetsDialog::draw() every frame (it draws nothing while both windows are closed) and draws the
 // RegionsPanel inside its own window (the caller owns Begin/End, like the other panels).
@@ -86,9 +90,19 @@ struct RegionsPanel {
     void draw(Document* doc, const RegionsPanelCallbacks& cb);
     void forget(uint64_t doc_id);  // drop the cached list of a closed document
     void request_refresh() { refresh_requested_ = true; }
+    void show_modules_tab() { select_modules_ = true; }  // the next draw() selects the Modules tab
+
+    // "Go to Module": open_module_list() opens the popup (re-listing the modules) with the next
+    // draw_module_list(), which the host calls every frame outside any panel window (it draws
+    // nothing while the popup is closed, and closes it when `doc` is not a process document).
+    void open_module_list() { open_modules_ = true; }
+    bool module_list_open() const { return modules_open_; }
+    void draw_module_list(Document* doc, const RegionsPanelCallbacks& cb);
 
     // Case-insensitive filter over name / type / prot and the hex base ("7ff", "0x7ff"). For tests.
     static bool region_matches(const MemRegion& r, const std::string& filter);
+    // The same over a module's name / path and hex base.
+    static bool module_matches(const ModuleInfo& m, const std::string& filter);
 
 private:
     struct DocState {
@@ -96,9 +110,23 @@ private:
         std::string error;
         std::string filter;
         bool listed = false;
+        std::vector<ModuleInfo> modules;
+        std::string mod_error;
+        std::string mod_filter;
+        bool mod_listed = false;
     };
+    DocState& state(const Document& doc);
+    void list_modules(const Document& doc, DocState& st);
+    void draw_regions(Document& doc, DocState& st, const RegionsPanelCallbacks& cb);
+    void draw_modules(Document& doc, DocState& st, const RegionsPanelCallbacks& cb);
+
     std::map<uint64_t, std::unique_ptr<DocState>> docs_;
     bool refresh_requested_ = false;
+    bool select_modules_ = false;
+    // Go to Module popup
+    bool open_modules_ = false, modules_open_ = false, modules_focus_ = false, modules_scroll_ = false;
+    std::string pick_filter_;
+    int pick_sel_ = 0;
 };
 
 }  // namespace hx

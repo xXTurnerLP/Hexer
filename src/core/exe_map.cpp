@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "core/devices.h"
 #include "core/document.h"
 #include "core/util.h"
 
@@ -82,6 +83,26 @@ AddressMap identity_map(const Document& doc, AddressMap::Kind kind, uint64_t bas
     if (kind == AddressMap::Manual) m.format = "manual base " + hex_addr(base);
     else if (kind == AddressMap::Process) m.format = "process memory";
     else m.format = "no address map";
+    return m;
+}
+
+// Process documents: identity, the process's pointer width and its modules as `names`.
+AddressMap process_map(const Document& doc) {
+    AddressMap m = identity_map(doc, AddressMap::Process, 0);
+    const uint32_t pid = doc.process_id();
+    m.bits = process_bits(pid);
+    std::vector<ModuleInfo> mods;
+    process_modules(pid, mods);
+    for (const ModuleInfo& mod : mods) {
+        if (!mod.size || add_overflows(mod.base, mod.size)) continue;
+        MappedRegion r;
+        r.offset = r.address = mod.base;
+        r.file_size = r.mem_size = mod.size;
+        r.name = mod.name;
+        m.names.push_back(std::move(r));
+    }
+    if (m.bits) m.format += ", " + std::to_string(m.bits) + "-bit";
+    m.format += ", " + std::to_string(m.names.size()) + " modules";
     return m;
 }
 
@@ -242,6 +263,94 @@ bool detect_pe(const Document& doc, AddressMap& out, std::string* err) {
     return true;
 }
 
+// ---- PE image in memory --------------------------------------------------------------------------
+
+bool detect_pe_image(const Snapshot& snap, uint64_t base, AddressMap& out, std::string* err) {
+    const uint64_t size = snap.size();
+    auto rd = [&](uint64_t rva, uint8_t* dst, size_t n) {
+        return !add_overflows(base, rva) && base + rva <= size && size - (base + rva) >= n &&
+               snap.read_valid(base + rva, dst, n) == n;
+    };
+    const std::string where = "no PE image at " + hex_addr(base);
+    uint8_t dos[64];
+    if (!rd(0, dos, sizeof dos) || dos[0] != 'M' || dos[1] != 'Z') return fail(err, where);
+    const uint64_t pe = get_le(dos + 0x3C, 4);
+    uint8_t coff[24];
+    if (pe < 4 || pe > (uint64_t(1) << 20) || !rd(pe, coff, sizeof coff) || std::memcmp(coff, "PE\0\0", 4) != 0)
+        return fail(err, where + " (no PE signature)");
+    const uint16_t machine = uint16_t(get_le(coff + 4, 2));
+    const uint64_t nsect = get_le(coff + 6, 2);
+    const uint64_t opt_size = get_le(coff + 20, 2);
+    if (nsect > AddressMap::kMaxSections) return fail(err, "PE image: too many sections (" + std::to_string(nsect) + ")");
+    uint8_t oh[64];
+    if (opt_size < 64 || !rd(pe + 24, oh, sizeof oh)) return fail(err, "PE image: truncated optional header");
+    const uint16_t magic = uint16_t(get_le(oh, 2));
+    if (magic != 0x10B && magic != 0x20B) return fail(err, "PE image: unknown optional header magic");
+    const bool plus = magic == 0x20B;
+    const uint64_t entry_rva = get_le(oh + 16, 4);
+    const uint64_t sect_align = get_le(oh + 32, 4);
+    const uint64_t image_size = get_le(oh + 56, 4);
+    const uint64_t size_headers = get_le(oh + 60, 4);
+    if (!image_size || add_overflows(base, image_size) || base + image_size > size)
+        return fail(err, "PE image: SizeOfImage out of range");
+    const uint64_t table = pe + 24 + opt_size;
+    if (table + nsect * 40 > image_size) return fail(err, "PE image: section table outside the image");
+
+    AddressMap m;
+    m.kind = AddressMap::Pe;
+    m.in_memory = true;
+    m.base = base;
+    m.file_size = size;
+    m.bits = plus ? 64 : 32;
+    m.format = std::string(plus ? "PE32+ " : "PE32 ") + pe_machine_name(machine) + " image in memory";
+    uint64_t first_rva = image_size;
+    for (uint64_t i = 0; i < nsect; ++i) {
+        uint8_t s[40];
+        if (!rd(table + i * 40, s, sizeof s)) return fail(err, "PE image: unreadable section table");
+        MappedRegion r;
+        size_t nlen = 0;
+        while (nlen < 8 && s[nlen]) ++nlen;
+        r.name.assign(reinterpret_cast<const char*>(s), nlen);
+        for (char& c : r.name)
+            if (uint8_t(c) < 0x20 || uint8_t(c) >= 0x7F) c = '?';
+        if (r.name.empty()) r.name = "section" + std::to_string(i);
+        const uint64_t vsize = get_le(s + 8, 4);
+        const uint64_t rva = get_le(s + 12, 4);
+        const uint64_t raw_size = get_le(s + 16, 4);
+        const uint64_t chars = get_le(s + 36, 4);
+        uint64_t ext = vsize ? vsize : raw_size;
+        if (sect_align > 1) ext = (ext + sect_align - 1) / sect_align * sect_align;  // < 2^33
+        if (rva >= image_size) return fail(err, "PE image: section " + r.name + " outside SizeOfImage");
+        ext = std::min(ext, image_size - rva);
+        if (!ext) continue;
+        r.offset = r.address = base + rva;
+        r.file_size = r.mem_size = ext;
+        r.exec = (chars & 0x20000000u) || (chars & 0x20u);
+        first_rva = std::min(first_rva, rva);
+        m.regions.push_back(std::move(r));
+    }
+    const uint64_t hdr = std::min(size_headers ? size_headers : first_rva, first_rva);
+    if (hdr) {
+        MappedRegion h;
+        h.offset = h.address = base;
+        h.file_size = h.mem_size = hdr;
+        h.name = "(headers)";
+        m.regions.insert(m.regions.begin(), std::move(h));
+    }
+    if (!check_overlaps(m.regions, err)) {
+        if (err) *err = "PE image: " + *err;
+        return false;
+    }
+    std::stable_sort(m.regions.begin(), m.regions.end(),
+                     [](const MappedRegion& a, const MappedRegion& b) { return a.offset < b.offset; });
+    if (entry_rva && entry_rva < image_size) {
+        m.has_entry = true;
+        m.entry = base + entry_rva;
+    }
+    out = std::move(m);
+    return true;
+}
+
 // ---- ELF -----------------------------------------------------------------------------------------
 
 bool detect_elf(const Document& doc, AddressMap& out, std::string* err) {
@@ -358,7 +467,7 @@ bool detect_elf(const Document& doc, AddressMap& out, std::string* err) {
 
 AddressMap detect_address_map(const Document& doc, std::string* err) {
     if (err) err->clear();
-    if (doc.target() == SourceKind::Process) return identity_map(doc, AddressMap::Process, 0);
+    if (doc.target() == SourceKind::Process) return process_map(doc);
     AddressMap m;
     std::string e;
     if (detect_pe(doc, m, &e)) return m;

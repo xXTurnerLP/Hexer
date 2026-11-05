@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <climits>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -173,6 +174,7 @@ void pick_follow_type(App& app, InspType type) {
     int w = 0;
     bool sgn = false;
     if (!insp_int_type(type, w, sgn)) return;
+    app.auto_ptr.pick();  // an explicit choice: process documents no longer change the width
     Settings& s = app.settings;
     if (s.pointer_width == w && s.pointer_signed == sgn) return;
     s.pointer_width = w;
@@ -495,6 +497,7 @@ bool draw_pointer_settings(App& app, bool in_menu) {
     auto set_width = [&](int w) {
         changed |= s.pointer_width != w;
         s.pointer_width = w;
+        app.auto_ptr.pick();  // an explicit choice: process documents no longer change the width
     };
     const char* signed_tip = "Sign-extend the value: a negative absolute pointer cannot be followed, a negative "
                              "relative one points backwards";
@@ -553,33 +556,14 @@ bool draw_pointer_settings(App& app, bool in_menu) {
 
 namespace {
 
-// A parse slower than this (detect + parse, on the UI thread) is not re-run on every edit.
-constexpr double kAutoParseBudgetMs = 50.0;
+// Parses run on a worker (script/parse_job.h). The frame that starts one waits this long for it,
+// so a fast parser's tree shows up at once, as when it ran on the UI thread.
+constexpr int kInstantParseMs = 8;
+constexpr double kParseDebounceS = 0.15;  // re-parse this long after the last edit
+constexpr double kParsingShowS = 0.1;     // "parsing..." (greyed tree) only after this long
 
-void run_parse(App& app, Tab& t) {
-    StructureState& st = t.st;
-    Document& d = *t.doc;
-    const double t0 = now_s();
-    const std::string requested = d.view().parser;
-    const std::string name = requested.empty() ? app.engine->detect_parser(d) : requested;
-    const size_t old_count = st.result.fields.size();
-    if (name.empty()) {
-        st.result = ParseResult{};
-        st.has_result = false;
-    } else {
-        st.result = (st.base || st.length != UINT64_MAX) ? app.engine->parse(d, name, st.base, st.length)
-                                                         : app.engine->parse(d, name);
-        st.has_result = true;
-    }
-    st.parsed_base = st.base;
-    st.parsed_length = st.length;
-    st.used_parser = name;
-    st.last_parse_ms = (now_s() - t0) * 1000.0;
-    st.slow = st.has_result && (st.last_parse_ms > kAutoParseBudgetMs || st.result.truncated);
-    st.gen = d.generation();
-    st.reload = app.engine->reload_count();
-    st.requested = requested;
-    st.due = 0.0;
+// A new result is in `st.result` (`old_count` = fields of the previous one): reset the tree view.
+void parse_result_changed(App& app, StructureState& st, const Document& d, size_t old_count) {
     const auto& fields = st.result.fields;
     if (fields.size() != old_count || st.open.size() != fields.size()) {
         st.open.assign(fields.size(), 0);  // new shape: expand the roots only
@@ -592,6 +576,56 @@ void run_parse(App& app, Tab& t) {
     st.clicked_field = -1;
     if (app.st_edit.ctx == d.id()) app.st_edit.end();  // field indices may have changed
 }
+
+// Takes the finished job's result (it was started for the current inputs).
+void adopt_parse(App& app, Tab& t) {
+    StructureState& st = t.st;
+    std::unique_ptr<ParseJob> job = std::move(st.job);
+    const size_t old_count = st.result.fields.size();
+    st.result = job->take(*app.engine, *t.doc);
+    st.has_result = true;
+    st.used_parser = job->parser();
+    st.parsed_base = job->base();
+    st.parsed_length = job->length();
+    st.gen = job->generation();
+    st.reload = st.job_reload;
+    st.requested = st.job_requested;
+    st.last_parse_ms = (now_s() - st.job_t0) * 1000.0;
+    st.due = 0.0;
+    parse_result_changed(app, st, *t.doc, old_count);
+}
+
+// Detects the parser (cheap detect() calls, UI thread) and starts the job; no parser: no tree.
+void start_parse(App& app, Tab& t) {
+    StructureState& st = t.st;
+    Document& d = *t.doc;
+    const double t0 = now_s();
+    const std::string requested = d.view().parser;
+    const std::string name = requested.empty() ? app.engine->detect_parser(d) : requested;
+    st.due = 0.0;
+    if (name.empty()) {
+        const size_t old_count = st.result.fields.size();
+        st.result = ParseResult{};
+        st.has_result = false;
+        st.used_parser.clear();
+        st.parsed_base = st.base;
+        st.parsed_length = st.length;
+        st.gen = d.generation();
+        st.reload = app.engine->reload_count();
+        st.requested = requested;
+        st.last_parse_ms = (now_s() - t0) * 1000.0;
+        parse_result_changed(app, st, d, old_count);
+        return;
+    }
+    st.job = std::make_unique<ParseJob>(*app.engine, d, name, st.base, st.length);
+    st.job_reload = app.engine->reload_count();
+    st.job_requested = requested;
+    st.job_t0 = t0;
+    if (st.job->wait(kInstantParseMs)) adopt_parse(app, t);
+}
+
+// A parse has been running for a while: the shown tree is the previous one.
+bool parse_running(const StructureState& st) { return st.job && now_s() - st.job_t0 >= kParsingShowS; }
 
 // Flattened list of visible rows (DFS honoring the expanded flags). Only rebuilt on change, so a
 // 200k-field tree costs nothing per frame; drawing is virtualised with ImGuiListClipper.
@@ -635,8 +669,8 @@ void open_ancestors(StructureState& st, int fi) {
 void draw_parser_combo(App& app, Tab& t, Document& d) {
     StructureState& st = t.st;
     std::string& forced = d.view().parser;
-    std::string preview = forced.empty() ? "Auto (" + (st.used_parser.empty() ? std::string("none") : st.used_parser) + ")"
-                                         : forced;
+    const std::string& shown = st.job ? st.job->parser() : st.used_parser;  // detected, maybe still parsing
+    std::string preview = forced.empty() ? "Auto (" + (shown.empty() ? std::string("none") : shown) + ")" : forced;
     std::string choose;
     bool chosen = false;
     ImGui::SetNextItemWidth(220.0f * app.ui_scale);
@@ -712,13 +746,26 @@ uint64_t parsed_len(const StructureState& st, const Document& d) {
     return std::min(st.parsed_length, room);
 }
 
+// "Parsing... 1234 fields [Cancel]" while a background parse has been running for a while.
+void draw_parse_progress(StructureState& st) {
+    ImGui::TextColored(kWarnColor, "Parsing... %llu fields", ull(st.job->fields()));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(st.job->cancelled());
+    if (ImGui::SmallButton("Cancel")) st.job->cancel();
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Stop the parser and show the tree it has built so far");
+}
+
 void draw_parse_info(App& app, StructureState& st, const Document& d) {
     if (!st.has_result) {
-        if (st.gen == UINT64_MAX)
+        if (parse_running(st)) {
+            draw_parse_progress(st);
+        } else if (st.gen == UINT64_MAX || st.job) {
             ImGui::TextDisabled("Parsing...");
-        else
+        } else {
             ImGui::TextDisabled("No parser matched this document.");
-        ImGui::TextDisabled("Pick one above, or add a script (Scripts > Open Scripts Folder).");
+            ImGui::TextDisabled("Pick one above, or add a script (Scripts > Open Scripts Folder).");
+        }
         return;
     }
     const ParseResult& r = st.result;
@@ -730,11 +777,9 @@ void draw_parse_info(App& app, StructureState& st, const Document& d) {
                             fmt_offset(st.parsed_base).c_str(), r.fields.size(), r.ms);
     else
         ImGui::TextDisabled("%zu fields  \xC2\xB7  %.1f ms", r.fields.size(), r.ms);
-    if (st.slow && st.gen != d.generation()) {
+    if (parse_running(st)) {  // the tree below is the previous result (greyed)
         ImGui::SameLine();
-        ImGui::TextColored(kWarnColor, "(stale: press F5 to re-parse)");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("This parser took %.0f ms, so it is not re-run automatically after edits.", st.last_parse_ms);
+        draw_parse_progress(st);
     }
     if (r.truncated) {
         ImGui::SameLine();
@@ -869,7 +914,7 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     if (app.st_edit.active(fi, d.id())) {
         int res = inline_edit_input(app.st_edit, false);
         if (res > 0 && commit_field_edit(app, d, f)) {
-            st.gen = UINT64_MAX;  // one explicit edit: re-parse even if auto-parse is off (slow parser)
+            st.gen = UINT64_MAX;  // one explicit edit: re-parse (in the background) without the debounce
             st.pending_gen = UINT64_MAX - 1;
         }
         if (res < 0) app.st_edit.end();
@@ -959,30 +1004,39 @@ void draw_field_table(App& app, Tab& t, Document& d) {
 void update_structure(App& app, Tab& t) {
     StructureState& st = t.st;
     Document& d = *t.doc;
+    std::erase_if(st.retired, [](const std::unique_ptr<ParseJob>& j) { return j->done(); });
     const uint64_t gen = d.generation();
     const uint64_t rel = app.engine->reload_count();
     const std::string& want = d.view().parser;
+    if (st.job) {
+        const ParseJob& j = *st.job;
+        const bool current = j.generation() == gen && st.job_reload == rel && st.job_requested == want &&
+                             j.base() == st.base && j.length() == st.length;
+        if (current && j.done()) {
+            adopt_parse(app, t);
+        } else if (!current) {  // its result would be stale: stop it, parse again once edits pause
+            st.job->cancel();
+            st.retired.push_back(std::move(st.job));
+        }
+    }
+    if (st.job || !st.retired.empty()) app.wants_poll = true;  // poll for the result / the worker's end
     if (gen == st.gen && rel == st.reload && want == st.requested && st.base == st.parsed_base &&
         st.length == st.parsed_length) {
         st.due = 0.0;
         return;
     }
-    // Only the content changed and the last parse was slow: don't freeze the UI after every
-    // keystroke. The panel shows the result as stale; F5 / Reparse (st.gen = UINT64_MAX) runs it.
-    if (st.slow && st.gen != UINT64_MAX && rel == st.reload && want == st.requested) {
-        st.due = 0.0;
-        return;
-    }
+    if (st.job) return;  // already parsing the current state
     const double now = now_s();
     if (gen != st.pending_gen || rel != st.pending_reload || want != st.pending_parser) {
         st.pending_gen = gen;
         st.pending_reload = rel;
         st.pending_parser = want;
-        const bool first = st.gen == UINT64_MAX && !st.has_result && st.reload == UINT64_MAX;
-        st.due = now + (first ? 0.0 : 0.12);  // debounce while typing
+        // Debounce while typing; the first parse and explicit requests (F5, a field edit, Parse
+        // at: st.gen = UINT64_MAX) start at once.
+        st.due = now + (st.gen == UINT64_MAX ? 0.0 : kParseDebounceS);
     }
     app.wants_poll = true;
-    if (now >= st.due) run_parse(app, t);
+    if (now >= st.due) start_parse(app, t);
 }
 
 void set_parse_base(App& app, Tab& t, uint64_t base, uint64_t length) {
@@ -1068,7 +1122,12 @@ void draw_structure_panel(App& app) {
     draw_parser_combo(app, *t, *d);
     draw_parse_base(app, *t, *d);
     draw_parse_info(app, t->st, *d);
-    if (t->st.has_result && !t->st.result.fields.empty()) draw_field_table(app, *t, *d);
+    if (t->st.has_result && !t->st.result.fields.empty()) {
+        const bool grey = parse_running(t->st);
+        if (grey) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+        draw_field_table(app, *t, *d);
+        if (grey) ImGui::PopStyleVar();
+    }
     ImGui::End();
 }
 
@@ -1604,6 +1663,14 @@ void draw_packets_panel(App& app) {
         app.show_structure = true;
     };
     cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    // Followed TCP streams / single packets: a new read-only tab; its bookmarks are its initial
+    // state (not an undo step), like the bytes of create_from_bytes.
+    cb.open_tab = [&app](const std::string& name, const std::vector<uint8_t>& bytes, const std::vector<Bookmark>& marks) {
+        if (Document* d = app.open_bytes(name, bytes.data(), bytes.size())) {
+            d->view().bookmarks = marks;
+            d->set_read_only(true);
+        }
+    };
     pp.draw(t ? t->doc.get() : nullptr, names, cb);
     if (pp.wants_frames()) app.wants_poll = true;
     ImGui::End();
@@ -1662,8 +1729,6 @@ void draw_xor_panel(App& app) {
 }
 
 void draw_regions_panel(App& app) {
-    dock_like(kWinConsole);
-    if (!begin_panel(kWinRegions, &app.show_regions)) return;
     Tab* t = active_tab(app);
     RegionsPanel& rp = app.regions_panel;
     rp.mono = app.fonts.mono;
@@ -1674,8 +1739,15 @@ void draw_regions_panel(App& app) {
         if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, base, size, false);
     };
     cb.notify = [&app](const std::string& m) { set_status(app, m); };
-    rp.draw(t && !t->doc->busy() ? t->doc.get() : nullptr, cb);
-    ImGui::End();
+    Document* doc = t && !t->doc->busy() ? t->doc.get() : nullptr;
+    dock_like(kWinConsole);
+    if (begin_panel(kWinRegions, &app.show_regions)) {
+        rp.draw(doc, cb);
+        ImGui::End();
+    }
+    // "Go to Module" popup: outside the panel window, and after it (a closed BeginPopupModal
+    // clears the next-window data, e.g. the panel's SetNextWindowFocus).
+    rp.draw_module_list(doc, cb);
 }
 
 // =============================================================================================

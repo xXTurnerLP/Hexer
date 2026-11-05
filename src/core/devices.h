@@ -50,4 +50,21 @@ uint64_t process_address_limit(uint32_t pid);
 // Pointer width of `pid` (32 / 64; 0 unknown).
 int process_bits(uint32_t pid);
 
+struct ModuleInfo {
+    std::string name;   // "KERNEL32.DLL", "libc.so.6", "hexer.exe"
+    std::string path;   // full path of the image file
+    uint64_t base = 0;  // load address (Windows: the image base; Linux: the lowest mapping)
+    uint64_t size = 0;  // Windows: SizeOfImage; Linux: lowest mapping .. end of the highest one
+    uint64_t end() const { return base + size; }
+};
+// Loaded modules (executable + shared libraries) of `pid`, ascending by base, one per base.
+// Windows: Toolhelp32 with TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, so a WOW64 (32-bit) process
+// lists its 32-bit modules as well as the 64-bit ntdll / wow64 ones (those lie above its 4 GiB
+// address space, outside its document). Linux: the file-backed mappings of
+// /proc/PID/maps grouped by path, keeping files with an executable mapping (shared libraries and
+// the executable, not mmapped data files). False + *err when the process cannot be queried.
+bool process_modules(uint32_t pid, std::vector<ModuleInfo>& out, std::string* err = nullptr);
+// The module containing `address` in a list from process_modules, or nullptr.
+const ModuleInfo* module_at(const std::vector<ModuleInfo>& mods, uint64_t address);
+
 }  // namespace hx

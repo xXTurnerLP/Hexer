@@ -10,7 +10,15 @@
 //     to p_vaddr ("LOAD0" ...); section headers (SHF_ALLOC, not NOBITS) only provide names
 //     (".text"), looked up by offset or address. The entry point is e_entry.
 //   * Manual: VA = offset + base. None: VA = offset. Process documents: VA = offset (identity;
-//     their offsets already are virtual addresses).
+//     their offsets already are virtual addresses); `names` lists the loaded modules (one entry
+//     per module: offset = address = base, sizes = the module size, name "KERNEL32.DLL"; from
+//     process_modules, core/devices.h), so section_at_* name the module and build_symbols reads
+//     each module's in-memory PE headers; `bits` is the process's pointer width.
+//   * PE image in memory (detect_pe_image, for a module of a process document): the headers are
+//     read at the load address and every section is mapped by RVA - offset == address == load
+//     address + VirtualAddress, PointerToRawData / SizeOfRawData are ignored (a loaded image is
+//     laid out by RVA); kind Pe with in_memory = true and base = the load address (not the
+//     header's ImageBase).
 //
 // Detection reads only the headers through Document::read (bounded: at most kMaxSections /
 // kMaxSegments table entries, each read checked against the document size). A malformed header
@@ -24,6 +32,7 @@
 namespace hx {
 
 class Document;
+class Snapshot;
 
 struct MappedRegion {
     uint64_t offset = 0;     // file offset of the first byte
@@ -48,6 +57,7 @@ struct AddressMap {
     uint64_t entry = 0;           // virtual address of the entry point
     int bits = 0;                 // 64 / 32 from the header (0 = unknown): the natural disasm mode
     std::string format;           // "PE32+ x86-64", "ELF64 x86-64", "manual base 0x400000", ...
+    bool in_memory = false;       // Pe: an image mapped in memory (detect_pe_image), offset == VA
 
     // Virtual address of file offset `off`. Pe / Elf: false outside every region. None / Manual /
     // Process: always (off + base), false only past file_size or on overflow.
@@ -72,7 +82,13 @@ struct AddressMap {
 // is not that format or the header is malformed ("not a PE file", "section 3 overlaps ...").
 bool detect_pe(const Document& doc, AddressMap& out, std::string* err = nullptr);
 bool detect_elf(const Document& doc, AddressMap& out, std::string* err = nullptr);
-// Process documents -> identity (Process); else PE, then ELF; else None. Never fails. When a
+// The PE image the loader mapped at `base` in `snap` (a process document's bytes: offset = virtual
+// address). Bounded like detect_pe (headers and the section table only, read with read_valid so an
+// unreadable page fails); false + *err when there is no valid PE header at `base`, SizeOfImage
+// runs past the snapshot or the sections overlap / lie outside SizeOfImage.
+bool detect_pe_image(const Snapshot& snap, uint64_t base, AddressMap& out, std::string* err = nullptr);
+// Process documents -> identity (Process, with the module list: one quick OS query); else PE, then
+// ELF; else None. Never fails. When a
 // header looked like PE / ELF but was rejected, *err says why (the map is None then).
 AddressMap detect_address_map(const Document& doc, std::string* err = nullptr);
 AddressMap manual_address_map(const Document& doc, uint64_t base);

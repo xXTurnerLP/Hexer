@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -17,14 +19,21 @@
 
 #include "core/devices.h"
 #include "core/document.h"
+#include "core/exe_map.h"
 #include "core/file_source.h"
+#include "core/nav.h"
 #include "core/os_file.h"
 #include "core/procmem.h"
 #include "core/session.h"
+#include "core/symbols.h"
+#include "script/script_engine.h"
+#include "symbol_fixture.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #else
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -515,4 +524,433 @@ TEST_CASE("procmem: open_device refuses a regular file") {
     CHECK(err.find("not a disk") != std::string::npos);
     std::error_code ec;
     std::filesystem::remove(f, ec);
+}
+
+// ---- modules, in-memory PE symbols, follow-pointer width, Lua ---------------------------------------
+
+namespace {
+
+std::string lower_str(std::string s) {
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// The first symbol of that name / module (any case) and kind.
+const Symbol* find_symbol(const SymbolTable& t, const std::string& name, const std::string& module,
+                          Symbol::Kind kind) {
+    for (const Symbol& s : t.symbols)
+        if (s.name == name && s.kind == kind && lower_str(s.module) == lower_str(module)) return &s;
+    return nullptr;
+}
+
+// symfix::make_pe() as the loader lays it out at `base` in memory (by RVA): headers at +0, .text
+// (file 0x200) at +0x1000, .rdata (file 0x400) at +0x2000; the IAT holds resolved addresses.
+// `oft` false clears the import descriptor's OriginalFirstThunk.
+std::unique_ptr<Document> loaded_pe_doc(uint64_t base, bool oft = true) {
+    const symfix::Bytes file = symfix::make_pe();
+    symfix::Bytes mem(size_t(base + 0x3000), 0xCC);
+    std::memcpy(mem.data() + base, file.data(), 0x200);
+    std::memcpy(mem.data() + base + 0x1000, file.data() + 0x200, 0x200);
+    std::memset(mem.data() + base + 0x1200, 0, 0xE00);
+    std::memcpy(mem.data() + base + 0x2000, file.data() + 0x400, 0x400);
+    std::memset(mem.data() + base + 0x2400, 0, 0xC00);
+    symfix::put(mem, size_t(base + 0x2300), 0x7FF012345678ull, 8);  // resolved GetProcAddress
+    symfix::put(mem, size_t(base + 0x2308), 0x7FF012340010ull, 8);  // resolved #16
+    if (!oft) symfix::put(mem, size_t(base + 0x2200), 0, 4);
+    return Document::create_from_bytes("image.bin", mem.data(), mem.size());
+}
+
+struct ProcHost : ScriptHost {
+    std::vector<std::unique_ptr<Document>> docs;
+    Document* active_document() override { return docs.empty() ? nullptr : docs.back().get(); }
+    Document* find_document(uint64_t id) override {
+        for (auto& d : docs)
+            if (d->id() == id) return d.get();
+        return nullptr;
+    }
+    Document* open_bytes(const std::string& name, const uint8_t* data, size_t len) override {
+        docs.push_back(Document::create_from_bytes(name, data, len));
+        return docs.back().get();
+    }
+    void reveal(Document&, uint64_t, uint64_t) override {}
+    Document* open_process(uint32_t pid, bool writable, std::string* err) override {
+        for (auto& d : docs)
+            if (d->target() == SourceKind::Process && d->process_id() == pid && (!writable || !d->read_only()))
+                return d.get();
+        auto d = Document::open_process(pid, writable, err);
+        if (!d) return nullptr;
+        docs.push_back(std::move(d));
+        return docs.back().get();
+    }
+};
+
+}  // namespace
+
+TEST_CASE("procmem: the module list holds this executable and the system libraries at their bases") {
+    std::vector<ModuleInfo> mods;
+    std::string err;
+    REQUIRE_MESSAGE(process_modules(self_pid(), mods, &err), err);
+    REQUIRE(mods.size() >= 2);
+    for (size_t i = 1; i < mods.size(); ++i) CHECK(mods[i - 1].base < mods[i].base);  // ascending, each once
+    for (const ModuleInfo& m : mods) {
+        CHECK_FALSE(m.name.empty());
+        CHECK(m.size > 0);
+        CHECK(m.path.size() >= m.name.size());
+    }
+    const uint64_t code = addr_of(reinterpret_cast<const void*>(&self_pid));  // in this executable
+    const ModuleInfo* exe = module_at(mods, code);
+    REQUIRE(exe);
+    CHECK(module_at(mods, exe->base) == exe);
+    CHECK(module_at(mods, exe->end()) != exe);
+    CHECK(module_at(mods, 0) == nullptr);
+#ifdef _WIN32
+    CHECK(exe->base == addr_of(GetModuleHandleW(nullptr)));
+    wchar_t self[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH);
+    CHECK(lower_str(exe->path) == lower_str(wide_to_utf8(std::wstring(self, n))));
+    for (const wchar_t* dll : {L"kernel32.dll", L"ntdll.dll"}) {
+        HMODULE h = GetModuleHandleW(dll);
+        REQUIRE(h);
+        const ModuleInfo* m = module_at(mods, addr_of(h));
+        REQUIRE(m);
+        CHECK(m->base == addr_of(h));
+        CHECK(lower_str(m->name) == lower_str(wide_to_utf8(dll)));
+        MODULEINFO mi{};
+        REQUIRE(GetModuleInformation(GetCurrentProcess(), h, &mi, sizeof mi));
+        CHECK(m->size == mi.SizeOfImage);
+    }
+#else
+    Dl_info di{};
+    REQUIRE(dladdr(reinterpret_cast<void*>(&self_pid), &di));
+    CHECK(exe->base == addr_of(di.dli_fbase));
+    char self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self);
+    REQUIRE(n > 0);
+    CHECK(exe->path == std::string(self, size_t(n)));
+    void* fopen_fn = dlsym(RTLD_DEFAULT, "fopen");
+    REQUIRE(fopen_fn);
+    Dl_info li{};
+    REQUIRE(dladdr(fopen_fn, &li));
+    const ModuleInfo* libc = module_at(mods, addr_of(fopen_fn));
+    REQUIRE(libc);
+    CHECK(libc->base == addr_of(li.dli_fbase));
+    CHECK(libc->name.find("libc") != std::string::npos);
+#endif
+    CHECK_FALSE(process_modules(0xFFFFFFF0u, mods, &err));  // no such process
+    CHECK(mods.empty());
+    CHECK_FALSE(err.empty());
+}
+
+TEST_CASE("procmem: a process document's address map names its modules and its pointer width") {
+    std::string err;
+    auto doc = Document::open_process(self_pid(), false, &err);
+    REQUIRE_MESSAGE(doc, err);
+    const AddressMap map = detect_address_map(*doc);
+    CHECK(map.kind == AddressMap::Process);
+    CHECK(map.bits == int(sizeof(void*) * 8));
+    REQUIRE_FALSE(map.names.empty());
+    const uint64_t code = addr_of(reinterpret_cast<const void*>(&self_pid));
+    std::vector<ModuleInfo> mods;
+    REQUIRE(process_modules(self_pid(), mods));
+    const ModuleInfo* exe = module_at(mods, code);
+    REQUIRE(exe);
+    CHECK(map.section_at_va(code) == exe->name);
+    CHECK(map.section_at_offset(code) == exe->name);
+    uint64_t va = 0;
+    CHECK(map.offset_to_va(code, va));  // still the identity
+    CHECK(va == code);
+}
+
+TEST_CASE("procmem: detect_pe_image maps a loaded image by RVA and ignores the raw pointers") {
+    const uint64_t base = 0x10000;
+    auto doc = loaded_pe_doc(base);
+    REQUIRE(doc);
+    auto snap = doc->snapshot();
+    AddressMap m;
+    std::string err;
+    REQUIRE_MESSAGE(detect_pe_image(*snap, base, m, &err), err);
+    CHECK(m.kind == AddressMap::Pe);
+    CHECK(m.in_memory);
+    CHECK(m.base == base);  // the load address, not ImageBase 0x140000000
+    CHECK(m.bits == 64);
+    REQUIRE(m.regions.size() == 3);
+    CHECK(m.regions[0].name == "(headers)");
+    CHECK(m.regions[1].name == ".text");
+    CHECK(m.regions[1].offset == base + 0x1000);   // by RVA, not PointerToRawData 0x200
+    CHECK(m.regions[1].address == base + 0x1000);
+    CHECK(m.regions[1].file_size == 0x1000);       // VirtualSize rounded to SectionAlignment
+    CHECK(m.regions[1].exec);
+    CHECK(m.regions[2].offset == base + 0x2000);
+    CHECK(m.has_entry);
+    CHECK(m.entry == base + 0x1000);
+    uint64_t off = 0;
+    CHECK(m.va_to_offset(base + 0x2100, off));
+    CHECK(off == base + 0x2100);
+
+    // Symbols through that map: addresses = load address + RVA, names from the in-memory tables.
+    const SymbolTable t = build_symbols(*snap, m);
+    const Symbol* alpha = find_symbol(t, "Alpha", "test.dll", Symbol::Export);
+    REQUIRE(alpha);
+    CHECK(alpha->address == base + 0x1000);
+    REQUIRE(t.forwarders.size() == 1);
+    CHECK(t.forwarders[0].forward == "NTDLL.RtlFoo");
+    const Symbol* gpa = find_symbol(t, "GetProcAddress", "KERNEL32.dll", Symbol::Import);
+    REQUIRE(gpa);
+    CHECK(gpa->kind == Symbol::Import);
+    CHECK(gpa->address == base + 0x2300);  // the IAT slot (it holds the resolved address)
+    const Symbol* mb = find_symbol(t, "MessageBoxW", "USER32.dll", Symbol::Import);
+    REQUIRE(mb);
+    CHECK(mb->address == base + 0x2340);
+
+    // A descriptor without OriginalFirstThunk: a loaded IAT has no names, nothing is invented.
+    auto no_oft = loaded_pe_doc(base, false);
+    REQUIRE(detect_pe_image(*no_oft->snapshot(), base, m, &err));
+    const SymbolTable t2 = build_symbols(*no_oft->snapshot(), m);
+    CHECK(find_symbol(t2, "GetProcAddress", "KERNEL32.dll", Symbol::Import) == nullptr);
+    CHECK(find_symbol(t2, "Alpha", "test.dll", Symbol::Export) != nullptr);
+    for (const Symbol& s : t2.symbols) CHECK(s.address != base + 0x2300);
+}
+
+TEST_CASE("procmem: detect_pe_image rejects what is not a loaded PE image") {
+    const uint64_t base = 0x10000;
+    AddressMap m;
+    std::string err;
+    {
+        auto doc = loaded_pe_doc(base);
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), base + 0x1000, m, &err));  // no MZ there
+        CHECK(err.find("no PE image") != std::string::npos);
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), UINT64_MAX - 8, m, &err));  // no overflow
+    }
+    auto patched = [&](size_t at, uint64_t v, int n) {
+        const symfix::Bytes file = symfix::make_pe();
+        symfix::Bytes mem(size_t(base + 0x3000), 0);
+        std::memcpy(mem.data() + base, file.data(), 0x200);
+        symfix::put(mem, size_t(base) + at, v, n);
+        return Document::create_from_bytes("bad.bin", mem.data(), mem.size());
+    };
+    const size_t opt = 0x58, sec = opt + 0xF0;
+    {
+        auto doc = patched(opt + 56, 0x4000, 4);  // SizeOfImage past the end of the data
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), base, m, &err));
+        CHECK(err.find("SizeOfImage") != std::string::npos);
+    }
+    {
+        auto doc = patched(sec + 12, 0x3000, 4);  // .text RVA == SizeOfImage
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), base, m, &err));
+        CHECK(err.find("outside SizeOfImage") != std::string::npos);
+    }
+    {
+        auto doc = patched(sec + 40 + 12, 0x1100, 4);  // .rdata starts inside .text
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), base, m, &err));
+        CHECK(err.find("overlap") != std::string::npos);
+    }
+    {
+        auto doc = patched(0x46, 2000, 2);  // absurd section count
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), base, m, &err));
+    }
+    {
+        auto doc = patched(0x40, 0, 4);  // no PE signature
+        CHECK_FALSE(detect_pe_image(*doc->snapshot(), base, m, &err));
+        CHECK(err.find("signature") != std::string::npos);
+    }
+}
+
+#ifdef _WIN32
+TEST_CASE("procmem: symbols of a process come from its modules' in-memory PE images") {
+    std::string err;
+    auto doc = Document::open_process(self_pid(), false, &err);
+    REQUIRE_MESSAGE(doc, err);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    REQUIRE(k32);
+    auto snap = doc->snapshot();
+    AddressMap img;
+    REQUIRE_MESSAGE(detect_pe_image(*snap, addr_of(k32), img, &err), err);
+    CHECK(img.in_memory);
+    CHECK(img.format.find("image in memory") != std::string::npos);
+    const uint64_t create_file = addr_of(reinterpret_cast<const void*>(GetProcAddress(k32, "CreateFileW")));
+    CHECK(img.section_at_va(create_file) == ".text");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const SymbolTable t = build_symbols(*snap, detect_address_map(*doc));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    MESSAGE(t.symbols.size() << " symbols of this process in " << ms << " ms");
+    CHECK_FALSE(t.truncated);
+    const Symbol* cf = find_symbol(t, "CreateFileW", "KERNEL32.dll", Symbol::Export);
+    REQUIRE(cf);
+    CHECK(cf->kind == Symbol::Export);
+    CHECK(cf->label() == cf->module + "!CreateFileW");
+    CHECK(cf->address == create_file);
+    CHECK(t.at(cf->address) != nullptr);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const Symbol* rtl = find_symbol(t, "RtlAllocateHeap", "ntdll.dll", Symbol::Export);
+    REQUIRE(rtl);
+    CHECK(rtl->address == addr_of(reinterpret_cast<const void*>(GetProcAddress(ntdll, "RtlAllocateHeap"))));
+
+    // This executable's imports: one symbol per IAT slot, which holds the resolved function.
+    std::vector<ModuleInfo> mods;
+    REQUIRE(process_modules(self_pid(), mods));
+    const ModuleInfo* exe = module_at(mods, addr_of(GetModuleHandleW(nullptr)));
+    REQUIRE(exe);
+    int checked = 0;
+    for (const Symbol& s : t.symbols) {
+        if (s.kind != Symbol::Import || s.address < exe->base || s.address >= exe->end()) continue;
+        if (lower_str(s.module) != "kernel32.dll" || s.name.empty() || s.name[0] == '#') continue;
+        uint64_t slot = 0;
+        std::memcpy(&slot, reinterpret_cast<const void*>(uintptr_t(s.address)), sizeof slot);
+        CHECK_MESSAGE(slot == addr_of(reinterpret_cast<const void*>(GetProcAddress(k32, s.name.c_str()))), s.name);
+        ++checked;
+    }
+    CHECK(checked > 0);
+    // Its entry point gets a name (it exports nothing).
+    AddressMap exe_img;
+    REQUIRE(detect_pe_image(*snap, exe->base, exe_img, &err));
+    REQUIRE(exe_img.has_entry);
+    const Symbol* entry = t.at(exe_img.entry);
+    REQUIRE(entry);
+    CHECK(entry->name == "entry");
+    CHECK(entry->module == exe->name);
+}
+
+// A 32-bit (WOW64) process from this 64-bit one: its 32-bit modules are listed (each once), its
+// map says 32-bit, and its PE32 images give symbols. Skipped where there is no SysWOW64.
+TEST_CASE("procmem: a WOW64 process lists its 32-bit modules and gives PE32 symbols") {
+    if (sizeof(void*) != 8) return;
+    wchar_t sysdir[MAX_PATH];
+    const UINT len = GetSystemWow64DirectoryW(sysdir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return;
+    std::wstring cmd = L"\"" + std::wstring(sysdir, len) + L"\\PING.EXE\" -n 30 127.0.0.1";
+    if (GetFileAttributesW((std::wstring(sysdir, len) + L"\\PING.EXE").c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    REQUIRE(CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
+    struct Kill {
+        PROCESS_INFORMATION& p;
+        ~Kill() {
+            TerminateProcess(p.hProcess, 0);
+            WaitForSingleObject(p.hProcess, 5000);
+            CloseHandle(p.hThread);
+            CloseHandle(p.hProcess);
+        }
+    } kill{pi};
+    const uint32_t pid = pi.dwProcessId;
+    CHECK(process_bits(pid) == 32);
+    // Its loader runs on its own: wait until the 32-bit kernel32 is there.
+    std::vector<ModuleInfo> mods;
+    const ModuleInfo* k32 = nullptr;
+    for (int i = 0; i < 100 && !k32; ++i) {
+        process_modules(pid, mods);
+        for (const ModuleInfo& m : mods)
+            if (lower_str(m.name) == "kernel32.dll" && m.end() <= (1ull << 32)) k32 = &m;
+        if (!k32) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(k32);
+    for (size_t i = 1; i < mods.size(); ++i) CHECK(mods[i - 1].base < mods[i].base);  // each base once
+    const auto exe_count = std::count_if(mods.begin(), mods.end(),
+                                         [](const ModuleInfo& m) { return lower_str(m.name) == "ping.exe"; });
+    CHECK(exe_count == 1);
+
+    std::string err;
+    auto doc = Document::open_process(pid, false, &err);
+    REQUIRE_MESSAGE(doc, err);
+    CHECK(doc->size() == (1ull << 32));
+    const AddressMap map = detect_address_map(*doc);
+    CHECK(map.bits == 32);
+    AddressMap img;
+    REQUIRE_MESSAGE(detect_pe_image(*doc->snapshot(), k32->base, img, &err), err);
+    CHECK(img.bits == 32);
+    CHECK(img.format.rfind("PE32 ", 0) == 0);
+    const SymbolTable t = build_symbols(*doc->snapshot(), map);
+    const Symbol* cf = find_symbol(t, "CreateFileW", "KERNEL32.dll", Symbol::Export);
+    REQUIRE(cf);
+    CHECK(cf->address > k32->base);
+    CHECK(cf->address < k32->end());
+    CHECK(map.section_at_va(cf->address) == k32->name);
+}
+#endif
+
+TEST_CASE("procmem: process documents default the follow-pointer width until the user picks one") {
+    AutoPointerWidth a;
+    int width = 2;                   // the user's setting
+    a.activate(8, width);            // a 64-bit process document becomes active
+    CHECK(width == 8);
+    CHECK(a.persisted(width) == 2);  // settings.ini keeps the user's width
+    a.activate(4, width);            // a WOW64 one
+    CHECK(width == 4);
+    CHECK(a.persisted(width) == 2);
+    a.activate(0, width);            // back to a file: the user's width again
+    CHECK(width == 2);
+    CHECK(a.persisted(width) == 2);
+    a.activate(0, width);
+    CHECK(width == 2);
+    a.activate(8, width);
+    CHECK(width == 8);
+    width = 4;                       // the user picks 32-bit (Inspector row) while a process is active
+    a.pick();
+    CHECK(a.persisted(width) == 4);
+    a.activate(0, width);            // the choice holds everywhere from now on
+    CHECK(width == 4);
+    a.activate(8, width);
+    CHECK(width == 4);
+
+    AutoPointerWidth b;              // picked before any process document was opened
+    width = 2;
+    b.pick();
+    b.activate(8, width);
+    CHECK(width == 2);
+    AutoPointerWidth c;              // unknown pointer size: nothing changes
+    width = 3;
+    c.activate(0, width);
+    CHECK(width == 3);
+    CHECK(c.persisted(width) == 3);
+}
+
+TEST_CASE("procmem: Lua hx.open_process and doc:modules") {
+    ProcHost host;
+    ScriptEngine eng(&host);
+    eng.set_script_dirs({});
+    eng.reload();
+    const uint64_t code = addr_of(reinterpret_cast<const void*>(&self_pid));
+    std::string src = "local PID, CODE = " + std::to_string(self_pid()) + ", " + std::to_string(code) + "\n";
+    src += R"(
+        local d, err = hx.open_process(PID)
+        assert(d, err)
+        assert(d:target() == "process" and d:pid() == PID)
+        local mods = assert(d:modules())
+        assert(#mods > 0)
+        local exe
+        for i, m in ipairs(mods) do
+            assert(type(m.name) == "string" and m.name ~= "" and type(m.path) == "string")
+            assert(m.size > 0)
+            if i > 1 then assert(mods[i - 1].base <= m.base) end
+            if CODE >= m.base and CODE < m.base + m.size then exe = m end
+        end
+        assert(exe, "the test executable is not in the module list")
+        assert(hx.open_process(PID):id() == d:id())             -- the open document is reused
+        assert(hx.open_process(PID, { writable = false }):id() == d:id())
+        local w = assert(hx.open_process(PID, { writable = true }))  -- the first one is read-only
+        assert(w:id() ~= d:id())
+        assert(hx.open_process(PID, { writable = true }):id() == w:id())
+        local none, e2 = hx.open_process(4294967290)
+        assert(none == nil and type(e2) == "string" and #e2 > 0, tostring(e2))
+        assert(not pcall(hx.open_process, 0))
+        assert(not pcall(hx.open_process, -1))
+        assert(not pcall(hx.open_process, PID, 5))
+        local f = hx.new_doc("plain.bin", "abc")
+        assert(#f:modules() == 0)
+    )";
+#ifdef _WIN32
+    src += R"(
+        local found
+        for _, s in ipairs(d:symbols()) do
+            if s.name == "CreateFileW" and s.kind == "export" and s.module:lower() == "kernel32.dll" then found = s end
+        end
+        assert(found and found.kind == "export" and found.offset == found.address)
+    )";
+#endif
+    std::string err;
+    CHECK(eng.run_source(src, "open_process_test", &err));
+    CHECK(err.empty());
+    if (!err.empty()) MESSAGE(err);
+    CHECK(host.docs.size() == 3);  // read-only + writable process documents + plain.bin
 }

@@ -138,6 +138,16 @@ struct PacketInfo {
     uint8_t ip_proto = 0xFF;  // IP protocol / IPv6 next header of the L4 (0xFF = no IP)
     bool fragment = false;    // IPv4 / IPv6 fragment (L4 decoded only for the first fragment)
     bool malformed = false;   // a header was cut short or had impossible lengths (noted in info)
+    // Decoded header fields (filters, TCP stream reassembly); zero when that layer was not decoded.
+    uint16_t eth_type = 0;    // EtherType of the network layer (after VLAN tags; Ethernet / SLL / SLL2)
+    uint8_t ip_version = 0;   // 4 or 6 once an IP header with addresses was decoded
+    uint8_t ip_src[16] = {};  // IPv4: the first 4 bytes
+    uint8_t ip_dst[16] = {};
+    bool has_ports = false;   // a TCP / UDP header was decoded: src_port / dst_port are valid
+    uint16_t src_port = 0, dst_port = 0;
+    bool tcp_header = false;  // a complete TCP header (valid data offset): tcp_seq / ack / flags valid
+    uint32_t tcp_seq = 0, tcp_ack = 0;
+    uint8_t tcp_flags = 0;    // FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10, ...
 };
 PacketInfo dissect(const uint8_t* data, size_t n, uint16_t linktype);
 

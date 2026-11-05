@@ -1,13 +1,14 @@
 #pragma once
 // Private glue shared by script_engine.cpp (engine orchestration) and lua_api.cpp (the `hexer` API).
 //
-// Error-handling rule for every lua_CFunction in this module: Lua errors are longjmp()s (Lua is
-// built as C), which skip C++ destructors. So a C function must never raise a Lua error (luaL_check*,
-// luaL_error, lua_call of user code, ...) while a local with a non-trivial destructor (std::string,
-// std::vector, ...) is alive. Compute into such objects inside an inner scope / helper, keep the error
-// text in a plain char buffer, and raise only after the scope ends. Safest: do the C++ work in a
-// separate HX_NOINLINE helper (lua_api.cpp) - on MSVC (/EHsc) a Lua error raised BEFORE an inner
-// scope of the same function was seen to crash while unwinding (hx.xor_scan).
+// Error handling: Lua is compiled as C++ (script/lua_onelua.cpp), so a Lua error (luaL_check*,
+// luaL_error, an error in user code called with lua_call, the time-limit hook) is a C++ exception
+// that unwinds through our lua_CFunctions: std::string / std::vector / shared_ptr locals alive there
+// are destroyed normally, a lua_CFunction may raise anywhere. Rules that keep this working:
+//   * include the Lua headers below ("lua.h" ..., C++ linkage), never <lua.hpp> (extern "C");
+//   * no catch (...) on a path called from Lua (it would swallow the error): catch specific types;
+//   * no noexcept function / destructor that calls back into Lua unprotected (std::terminate).
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -15,7 +16,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include <lua.hpp>
+#include "lauxlib.h"
+#include "lua.h"
+#include "lualib.h"
 
 #include "script/script_engine.h"
 
@@ -43,6 +46,23 @@ struct ScriptEngine::Impl {
     int ref_packsize = LUA_NOREF;
 
     std::string loading_file;      // script currently executed by reload() (for ParserInfo::file)
+    // What every script file / run_source chunk ran as at the last reload, keyed like
+    // ParserInfo::file (only those that registered a parser): a ParseJob rebuilds the parser
+    // from it in a Lua state of its own.
+    struct ScriptText {
+        std::string chunk, text;  // chunk name ("@examples/png.lua", "=C struct") + source
+    };
+    std::unordered_map<std::string, ScriptText> sources;
+    void keep_parser_sources();    // drops the sources no registered parser comes from
+
+    // Background parse (script/parse_job.h) in this state: the count hook also stops Lua once
+    // *cancel is set ("parse cancelled"), emit() reports progress, and run_parse leaves a parse
+    // error to the job (last_parse_error, with traceback) instead of logging it.
+    const std::atomic<bool>* cancel = nullptr;
+    std::atomic<uint64_t>* progress_fields = nullptr;   // fields emitted so far
+    std::atomic<uint64_t>* progress_offset = nullptr;   // end offset of the last emitted field
+    bool quiet_parse_errors = false;
+    std::string last_parse_error;
 
     struct Watched {
         std::string path;

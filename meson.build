@@ -29,7 +29,28 @@ endif
 add_project_arguments(proj_args, language : 'cpp')
 
 threads_dep = dependency('threads')
-lua_dep     = dependency('lua', fallback : ['lua', 'lua_dep'])
+# Lua is compiled as C++ (src/script/lua_onelua.cpp #includes its .c files) so a Lua error throws a C++
+# exception instead of longjmp()ing over our lua_CFunctions (their destructors run). The wrap only
+# provides the sources and headers (never a system Lua: that one is C); its own C library is unused.
+# Third-party code: no warnings; /EHs because the luaopen_* functions are extern "C" and may throw.
+lua_src_dep = subproject('lua').get_variable('lua_dep').partial_dependency(includes : true)
+lua_args = cpp.get_argument_syntax() == 'msvc' ? ['/w'] : ['-w']
+lua_sys_deps = [cpp.find_library('m', required : false)]
+if host_machine.system() != 'windows'
+  lua_args += ['-DLUA_USE_POSIX']
+  dl_dep = dependency('dl', required : false)
+  if dl_dep.found()
+    lua_args += ['-DLUA_USE_DLOPEN']
+    lua_sys_deps += dl_dep
+  endif
+endif
+lua_lib = static_library('hexer_lua', 'src/script/lua_onelua.cpp',
+  cpp_args : lua_args,
+  dependencies : lua_src_dep,
+  override_options : ['warning_level=0', 'cpp_eh=s'],
+  implicit_include_directories : false,
+)
+lua_dep     = declare_dependency(link_with : lua_lib, dependencies : [lua_src_dep] + lua_sys_deps)
 glfw_dep    = dependency('glfw3')
 imgui_dep   = dependency('imgui-docking')
 # FreeType (hinted font rasteriser) only reads plain TTF/OTF files here: no optional codecs.

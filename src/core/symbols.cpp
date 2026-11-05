@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -14,6 +15,7 @@ namespace hx {
 namespace {
 
 // Bytes of the snapshot through a small window (names and table entries are mostly adjacent).
+// Records which bytes the build used (SymbolTable::sources).
 class Reader {
 public:
     explicit Reader(const Snapshot& s) : snap_(s), size_(s.size()) {}
@@ -21,15 +23,8 @@ public:
 
     // Exactly n bytes at off; false past the end.
     bool read(uint64_t off, void* dst, size_t n) {
-        if (off > size_ || size_ - off < n) return false;
-        if (n > kWindow) return snap_.read(off, static_cast<uint8_t*>(dst), n) == n;
-        if (off < win_off_ || off - win_off_ + n > win_len_) {
-            win_off_ = off;
-            win_len_ = size_t(std::min<uint64_t>(kWindow, size_ - off));
-            win_len_ = snap_.read(off, win_, win_len_);
-            if (win_len_ < n) return false;
-        }
-        std::memcpy(dst, win_ + (off - win_off_), n);
+        if (!fetch(off, dst, n)) return false;
+        note(off, n);
         return true;
     }
     bool uint(uint64_t off, int n, bool be, uint64_t& v) {
@@ -42,28 +37,80 @@ public:
     // NUL-terminated string at off, at most `max` bytes (cut there), control bytes -> '?'.
     std::string cstr(uint64_t off, size_t max) {
         std::string s;
+        const uint64_t start = off;
+        bool nul_seen = false;
         while (s.size() < max && off < size_) {
             uint8_t chunk[256];
             const size_t n = size_t(std::min<uint64_t>({sizeof chunk, max - s.size(), size_ - off}));
-            if (!read(off, chunk, n)) break;
+            if (!fetch(off, chunk, n)) break;
             const uint8_t* nul = static_cast<const uint8_t*>(std::memchr(chunk, 0, n));
             const size_t take = nul ? size_t(nul - chunk) : n;
             s.append(reinterpret_cast<const char*>(chunk), take);
-            if (nul) break;
+            if (nul) {
+                nul_seen = true;
+                break;
+            }
             off += n;
         }
+        note(start, s.size() + (nul_seen ? 1 : 0));  // the bytes looked at, not the whole chunk
         for (char& c : s)
             if (uint8_t(c) < 0x20 || uint8_t(c) == 0x7F) c = '?';
         return s;
     }
+    // The recorded ranges, sorted and merged.
+    std::vector<std::pair<uint64_t, uint64_t>> take_sources() {
+        compact();
+        return std::move(spans_);
+    }
 
 private:
     static constexpr size_t kWindow = 16 << 10;
+    static constexpr uint64_t kGap = 64;  // ranges closer than this are merged (a superset is safe)
+
+    void note(uint64_t off, uint64_t n) {
+        if (!n) return;
+        if (!spans_.empty() && off >= spans_.back().first && off <= spans_.back().second + kGap) {
+            spans_.back().second = std::max(spans_.back().second, off + n);
+            return;
+        }
+        spans_.emplace_back(off, off + n);
+        if (spans_.size() >= compact_at_) {
+            compact();
+            compact_at_ = std::max<size_t>(4096, spans_.size() * 2);
+        }
+    }
+    void compact() {
+        std::sort(spans_.begin(), spans_.end());
+        size_t k = 0;
+        for (size_t i = 0; i < spans_.size(); ++i) {
+            if (k && spans_[i].first <= spans_[k - 1].second + kGap)
+                spans_[k - 1].second = std::max(spans_[k - 1].second, spans_[i].second);
+            else
+                spans_[k++] = spans_[i];
+        }
+        spans_.resize(k);
+    }
+    // read() without recording.
+    bool fetch(uint64_t off, void* dst, size_t n) {
+        if (off > size_ || size_ - off < n) return false;
+        if (n > kWindow) return snap_.read(off, static_cast<uint8_t*>(dst), n) == n;
+        if (off < win_off_ || off - win_off_ + n > win_len_) {
+            win_off_ = off;
+            win_len_ = size_t(std::min<uint64_t>(kWindow, size_ - off));
+            win_len_ = snap_.read(off, win_, win_len_);
+            if (win_len_ < n) return false;
+        }
+        std::memcpy(dst, win_ + (off - win_off_), n);
+        return true;
+    }
+
     const Snapshot& snap_;
     uint64_t size_;
     uint8_t win_[kWindow];
     uint64_t win_off_ = 0;
     size_t win_len_ = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> spans_;  // [begin, end) read so far
+    size_t compact_at_ = 4096;
 };
 
 // Shared build state: caps, time budget, cancellation.
@@ -129,9 +176,12 @@ struct PeInfo {
     uint64_t dir_rva[16] = {}, dir_size[16] = {};
 };
 
-bool pe_info(Reader& rd, PeInfo& pi) {
+// `hdr`: offset of the DOS header (0 in a file; the load address of an image in process memory).
+bool pe_info(Reader& rd, PeInfo& pi, uint64_t hdr = 0) {
     uint64_t lfanew = 0, sig = 0, opt_size = 0, magic = 0;
-    if (!rd.uint(0x3C, 4, false, lfanew) || !rd.uint(lfanew, 4, false, sig) || sig != 0x4550) return false;
+    if (!rd.uint(hdr + 0x3C, 4, false, lfanew)) return false;
+    lfanew += hdr;
+    if (!rd.uint(lfanew, 4, false, sig) || sig != 0x4550) return false;
     if (!rd.uint(lfanew + 20, 2, false, opt_size) || !rd.uint(lfanew + 24, 2, false, magic)) return false;
     const uint64_t opt = lfanew + 24;
     pi.plus = magic == 0x20B;
@@ -149,15 +199,16 @@ bool pe_info(Reader& rd, PeInfo& pi) {
 }
 
 struct Pe {
-    explicit Pe(Ctx& ctx) : c(ctx) {}
+    Pe(Ctx& ctx, const AddressMap& map) : c(ctx), m(map) {}
     Ctx& c;
+    const AddressMap& m;  // this image's map (c.map, or one module of a process)
     PeInfo pi;
 
     // File offset of `rva` and how many file bytes follow it in the same region.
     bool span(uint64_t rva, uint64_t& off, uint64_t& avail) const {
         if (rva > UINT32_MAX || pi.base + rva < pi.base) return false;
-        if (!c.map.va_to_offset(pi.base + rva, off)) return false;
-        const MappedRegion* r = c.map.region_at_offset(off);
+        if (!m.va_to_offset(pi.base + rva, off)) return false;
+        const MappedRegion* r = m.region_at_offset(off);
         if (!r) return false;
         avail = std::min(r->offset + r->file_size, c.rd.size()) - off;
         return true;
@@ -274,7 +325,7 @@ struct Pe {
                 auto u32 = [&](int at) { return uint64_t(d[at]) | uint64_t(d[at + 1]) << 8 | uint64_t(d[at + 2]) << 16 | uint64_t(d[at + 3]) << 24; };
                 const uint64_t oft = u32(0), name = u32(12), ft = u32(16);
                 if (!name && !ft) break;  // the terminating descriptor
-                if (!ft) continue;
+                if (!ft || (!oft && m.in_memory)) continue;  // a loaded IAT holds addresses, not names
                 const std::string dll = str(name, 256);
                 if (!import_module(dll.empty() ? "?" : dll, oft ? oft : ft, ft, true)) return;
             }
@@ -529,15 +580,138 @@ const Symbol* SymbolTable::nearest(uint64_t va, uint64_t* delta) const {
     return &symbols[*it];
 }
 
+namespace {
+
+void append_lower(std::string& dst, const std::string& s) {
+    for (char c : s) dst += char(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+}
+
+}  // namespace
+
+void SymbolTable::index_labels() {
+    size_t total = 0;
+    for (const Symbol& s : symbols) total += s.module.size() + s.name.size() + 2;
+    lower_.clear();
+    lower_.reserve(total);
+    lower_at_.clear();
+    lower_at_.reserve(symbols.size() + 1);
+    for (const Symbol& s : symbols) {
+        lower_at_.push_back(lower_.size());
+        if (!s.module.empty()) {
+            append_lower(lower_, s.module);
+            lower_ += '!';
+        }
+        append_lower(lower_, s.name);
+        lower_ += '\n';  // never inside a label (control bytes became '?'): no match spans two
+    }
+    lower_at_.push_back(lower_.size());
+}
+
+void SymbolTable::match(std::string_view filter, std::vector<uint32_t>& out) const {
+    out.clear();
+    std::string f;
+    append_lower(f, std::string(filter));
+    if (f.empty()) {
+        out.reserve(symbols.size());
+        for (size_t i = 0; i < symbols.size(); ++i) out.push_back(uint32_t(i));
+        return;
+    }
+    if (f.find('\n') != std::string::npos) return;
+    if (lower_at_.size() != symbols.size() + 1) {  // not indexed: lowercase label by label
+        std::string l;
+        for (size_t i = 0; i < symbols.size(); ++i) {
+            l.clear();
+            append_lower(l, symbols[i].label());
+            if (l.find(f) != std::string::npos) out.push_back(uint32_t(i));
+        }
+        return;
+    }
+    // One scan of the whole text; after a hit, continue at the next label.
+    const std::string_view text(lower_);
+    size_t i = 0;
+    for (size_t pos = text.find(f); pos != std::string_view::npos; pos = text.find(f, lower_at_[i + 1])) {
+        while (lower_at_[i + 1] <= pos) ++i;
+        out.push_back(uint32_t(i));
+    }
+}
+
+bool same_bytes(const Snapshot& a, const Snapshot& b, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+    if (a.size() != b.size()) return false;
+    // Where byte `pos` of a snapshot comes from: piece `i`, `o` bytes into it.
+    struct Cursor {
+        const Snapshot& s;
+        size_t i = 0;
+        uint64_t o = 0;
+        void seek(uint64_t pos) {
+            i = size_t(std::upper_bound(s.starts.begin(), s.starts.end(), pos) - s.starts.begin()) - 1;
+            o = pos - s.starts[i];
+        }
+        const void* origin() const {
+            const Piece& p = s.pieces[i];
+            if (p.src == Piece::Original) return p.chunk < s.sources.size() ? s.sources[p.chunk].get() : nullptr;
+            return p.chunk < s.chunks.size() ? s.chunks[p.chunk].get() : nullptr;
+        }
+        bool same(const Cursor& c) const {
+            const Piece &p = s.pieces[i], &q = c.s.pieces[c.i];
+            return p.src == q.src && origin() == c.origin() && p.start + o == q.start + c.o;
+        }
+        uint64_t left() const { return s.pieces[i].len - o; }
+        void advance(uint64_t n) {
+            o += n;
+            if (o == s.pieces[i].len) {
+                ++i;
+                o = 0;
+            }
+        }
+    };
+    if (a.pieces.size() != a.starts.size() || b.pieces.size() != b.starts.size()) return false;
+    for (const auto& [begin, range_end] : ranges) {
+        const uint64_t end = std::min(range_end, a.size());
+        if (begin >= end) continue;
+        Cursor x{a}, y{b};
+        x.seek(begin);
+        y.seek(begin);
+        for (uint64_t pos = begin; pos < end;) {
+            if (x.i >= a.pieces.size() || y.i >= b.pieces.size() || !x.same(y)) return false;
+            const uint64_t n = std::min({x.left(), y.left(), end - pos});
+            x.advance(n);
+            y.advance(n);
+            pos += n;
+        }
+    }
+    return true;
+}
+
 SymbolTable build_symbols(const Snapshot& snap, const AddressMap& map, const SymbolLimits& lim,
                           const std::atomic<bool>* cancel) {
     SymbolTable out;
-    if (map.kind == AddressMap::Process) return out;
     auto rd = std::make_unique<Reader>(snap);  // the window buffer is too big for a worker's stack
     Ctx c(*rd, map, lim, cancel, out);
-    if (map.kind == AddressMap::Pe) {
-        Pe pe(c);
-        if (pe_info(*rd, pe.pi)) {
+    std::vector<Symbol> entries;  // process modules: "module!entry" unless named otherwise
+    if (map.kind == AddressMap::Process) {
+        // Every loaded module (map.names) through its in-memory PE headers.
+        for (const MappedRegion& mod : map.names) {
+            if (c.stop()) break;
+            AddressMap image;
+            if (!detect_pe_image(snap, mod.address, image)) continue;
+            Pe pe(c, image);
+            if (!pe_info(*rd, pe.pi, mod.address)) continue;
+            pe.pi.base = mod.address;  // the load address, whatever the header's ImageBase says
+            pe.exports();
+            pe.imports();
+            if (image.has_entry) {
+                Symbol s;
+                s.kind = Symbol::Function;
+                s.name = "entry";
+                s.module = mod.name;
+                s.address = image.entry;
+                entries.push_back(std::move(s));
+            }
+        }
+    } else if (map.kind == AddressMap::Pe) {
+        Pe pe(c, map);
+        if (pe_info(*rd, pe.pi, map.in_memory ? map.base : 0)) {
+            if (map.in_memory) pe.pi.base = map.base;
             pe.exports();
             pe.imports();
         }
@@ -552,6 +726,12 @@ SymbolTable build_symbols(const Snapshot& snap, const AddressMap& map, const Sym
     out.finalize();
     // A stripped image still gets its entry point named.
     const bool cancelled = cancel && cancel->load();
+    std::vector<Symbol> unnamed;  // module entry points without a symbol of their own
+    for (Symbol& s : entries)
+        if (!cancelled && !out.at(s.address)) unnamed.push_back(std::move(s));
+    for (Symbol& s : unnamed)
+        if (out.symbols.size() < lim.max_symbols) out.symbols.push_back(std::move(s));
+    if (!unnamed.empty()) out.finalize();
     if ((map.kind == AddressMap::Pe || map.kind == AddressMap::Elf) && map.has_entry && !cancelled &&
         !out.at(map.entry) && out.symbols.size() < lim.max_symbols) {
         Symbol s;
@@ -561,40 +741,128 @@ SymbolTable build_symbols(const Snapshot& snap, const AddressMap& map, const Sym
         out.symbols.push_back(std::move(s));
         out.finalize();
     }
+    out.sources = rd->take_sources();
     return out;
 }
 
 // ---- SymbolJob -----------------------------------------------------------------------------------
 
-SymbolJob::~SymbolJob() { stop(); }
+namespace {
 
-void SymbolJob::stop() {
-    cancel_ = true;
-    if (thread_.joinable()) thread_.join();
-    cancel_ = false;
+bool same_region(const MappedRegion& a, const MappedRegion& b) {
+    return a.offset == b.offset && a.file_size == b.file_size && a.address == b.address && a.mem_size == b.mem_size &&
+           a.name == b.name && a.exec == b.exec;
 }
 
-void SymbolJob::start(std::shared_ptr<const Snapshot> snap, AddressMap map, SymbolLimits lim) {
-    stop();
-    running_ = true;
-    thread_ = std::thread([this, snap = std::move(snap), map = std::move(map), lim] {
-        auto t = std::make_shared<SymbolTable>(build_symbols(*snap, map, lim, &cancel_));
-        if (!cancel_.load()) {
-            std::lock_guard<std::mutex> lk(mu_);
-            result_ = std::move(t);
+bool same_regions(const std::vector<MappedRegion>& a, const std::vector<MappedRegion>& b) {
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(), same_region);
+}
+
+bool same_map(const AddressMap& a, const AddressMap& b) {
+    return a.kind == b.kind && a.base == b.base && a.file_size == b.file_size && a.has_entry == b.has_entry &&
+           a.entry == b.entry && a.bits == b.bits && a.format == b.format && a.in_memory == b.in_memory &&
+           same_regions(a.regions, b.regions) && same_regions(a.names, b.names);
+}
+
+}  // namespace
+
+SymbolJob::~SymbolJob() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        quit_ = true;
+        cancel_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+}
+
+bool SymbolJob::start(std::shared_ptr<const Snapshot> snap, AddressMap map, SymbolLimits lim) {
+    std::vector<uint64_t> epochs;
+    if (snap)
+        for (const auto& src : snap->sources) epochs.push_back(src ? src->epoch() : 0);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const Request& last = result_for_;
+        const bool live = map.kind == AddressMap::Process || map.in_memory;  // bytes change without edits
+        if (!live && !has_pending_ && !busy_ && result_ && !result_->truncated && snap && last.snap &&
+            lim.max_symbols == last.lim.max_symbols && lim.max_ms == last.lim.max_ms && epochs == last.epochs &&
+            same_map(map, last.map) && same_bytes(*last.snap, *snap, result_->sources)) {
+            result_for_.snap.swap(snap);  // the newer snapshot (the old one is released below, unlocked)
+            return false;
         }
-        generation_++;
-        running_ = false;
-    });
+        pending_.snap.swap(snap);  // a request the worker has not picked up yet is replaced
+        pending_.map = std::move(map);
+        pending_.lim = lim;
+        pending_.epochs = std::move(epochs);
+        has_pending_ = true;
+        ++requests_;
+        cancel_ = true;  // the running build (if any) stops and is dropped
+        if (!thread_.joinable()) thread_ = std::thread([this] { worker(); });
+    }
+    cv_.notify_all();
+    return true;
+}
+
+void SymbolJob::worker() {
+    std::unique_lock<std::mutex> lk(mu_);
+    for (;;) {
+        cv_.wait(lk, [this] { return quit_ || has_pending_; });
+        if (quit_) return;
+        Request r = std::move(pending_);
+        pending_ = Request{};
+        has_pending_ = false;
+        busy_ = true;
+        cancel_ = false;
+        const uint64_t id = requests_;
+        lk.unlock();
+        auto t = std::make_shared<SymbolTable>(build_symbols(*r.snap, r.map, r.lim, &cancel_));
+        t->index_labels();
+        std::shared_ptr<const SymbolTable> old_table;
+        Request old_req;
+        lk.lock();
+        busy_ = false;
+        if (!cancel_.load()) {  // cancel_ is only reset here, so false = never cancelled: complete
+            old_table = std::move(result_);
+            old_req = std::move(result_for_);
+            result_ = std::move(t);
+            result_for_ = std::move(r);
+            result_request_ = id;
+        }
+        ++generation_;
+        cv_.notify_all();
+        // Free the replaced / dropped table and snapshots without holding the lock (1M symbols).
+        lk.unlock();
+        t.reset();
+        r = Request{};
+        old_table.reset();
+        old_req = Request{};
+        lk.lock();
+    }
+}
+
+bool SymbolJob::running() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return has_pending_ || busy_;
 }
 
 void SymbolJob::wait() {
-    if (thread_.joinable()) thread_.join();
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [this] { return !has_pending_ && !busy_; });
 }
 
 std::shared_ptr<const SymbolTable> SymbolJob::result() const {
     std::lock_guard<std::mutex> lk(mu_);
     return result_;
+}
+
+bool SymbolJob::current() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return result_ && !has_pending_ && !busy_ && result_request_ == requests_;
+}
+
+uint64_t SymbolJob::builds() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return requests_;
 }
 
 }  // namespace hx

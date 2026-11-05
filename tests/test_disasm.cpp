@@ -1115,3 +1115,66 @@ TEST_CASE("lua: doc:symbols") {
     CHECK(eng.run_source("assert(#hx.doc():symbols() == 0)", "symbols_none", &err));
     CHECK(err.empty());
 }
+
+TEST_CASE("disasm panel: the symbol table survives code patches; current_symbols") {
+    PanelUi ui(symfix::make_pe());
+    const SymbolTable* t0 = ui.panel.symbols(*ui.doc, true);
+    REQUIRE(t0);
+    CHECK(ui.panel.current_symbols(*ui.doc).get() == t0);
+
+    // A code patch the panel has not seen yet: not current until the next look.
+    const uint8_t nop = 0x90;
+    REQUIRE(ui.doc->overwrite(0x230, &nop, 1));
+    CHECK(ui.panel.current_symbols(*ui.doc) == nullptr);
+    ui.frame();
+    CHECK(ui.panel.symbols(*ui.doc, true) == t0);  // kept: the patch missed every table
+    CHECK(ui.panel.current_symbols(*ui.doc).get() == t0);
+
+    // An export name changes: rebuilt (the label row follows).
+    const Bytes pe = symfix::make_pe();
+    size_t alpha = 0;
+    while (alpha + 5 < pe.size() && std::memcmp(pe.data() + alpha, "Alpha", 5) != 0) ++alpha;
+    const uint8_t B = 'B';
+    REQUIRE(ui.doc->overwrite(alpha, &B, 1));
+    const SymbolTable* t1 = ui.panel.symbols(*ui.doc, true);
+    REQUIRE(t1);
+    CHECK(t1 != t0);
+    CHECK(t1->at(0x140001000ull)->name == "Blpha");
+    CHECK(ui.panel.current_symbols(*ui.doc).get() == t1);
+
+    // Another map than doc:symbols would use: never handed out.
+    ui.panel.set_map_choice(*ui.doc, DisasmMapChoice::Manual, 0x1000);
+    ui.panel.symbols(*ui.doc, true);
+    CHECK(ui.panel.current_symbols(*ui.doc) == nullptr);
+}
+
+namespace {
+struct CacheHost : Host {
+    std::shared_ptr<const SymbolTable> table;
+    std::shared_ptr<const SymbolTable> cached_symbols(Document&) override { return table; }
+};
+}  // namespace
+
+TEST_CASE("lua: doc:symbols reuses the host's current table") {
+    CacheHost host;
+    host.doc = doc_of(symfix::make_pe());
+    auto t = std::make_shared<SymbolTable>();
+    Symbol s;
+    s.name = "from_cache";
+    s.address = 0x140001000ull;
+    t->symbols.push_back(s);
+    t->finalize();
+    host.table = t;
+    ScriptEngine eng(&host);
+    eng.set_script_dirs({});
+    eng.reload();
+    std::string err;
+    CHECK(eng.run_source(R"(
+        local s = hx.doc():symbols()
+        assert(#s == 1 and s[1].name == "from_cache" and s[1].offset == 0x200, #s)
+    )", "symbols_cached", &err));
+    CHECK(err.empty());
+    host.table.reset();  // nothing cached: built as before
+    CHECK(eng.run_source("assert(#hx.doc():symbols() == 6)", "symbols_built", &err));
+    CHECK(err.empty());
+}

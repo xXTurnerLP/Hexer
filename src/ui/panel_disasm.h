@@ -20,7 +20,9 @@
 //   * Toolbar: Follow cursor, mode (Auto = the header's 32 / 64, else 64-bit), address map (Auto,
 //     Manual base [hex], None), Entry point, Symbols, options (uppercase, bytes column, AT&T syntax).
 //   * Symbols (core/symbols.h: PE exports / imports, ELF symtab / PLT / GOT), built in the
-//     background per document and rebuilt after edits (the previous table stays meanwhile): a
+//     background per document (SymbolJob: never blocks) and rebuilt after edits that touch the
+//     bytes the tables were read from (a code patch keeps the table; meanwhile the previous one
+//     stays): a
 //     label row ("kernel32.dll!CreateFileW:") above an instruction at a symbol address, branch /
 //     call / memory targets annotated with the symbol ("call qword ptr [rip+0x1234]  ;
 //     KERNEL32.dll!GetProcAddress", "jnz 0x401020  ; main+0x20"; +offset only inside the same
@@ -98,6 +100,12 @@ public:
     // The document's symbol table under its current map (nullptr while the first build runs;
     // `wait` blocks until the running build is done - tests, automation).
     const SymbolTable* symbols(const Document& doc, bool wait = false);
+    // The finished table of `doc` when it is current - built (or kept after an edit that missed
+    // the tables, see SymbolJob) for the document's bytes as they are now under the detected
+    // (Auto) map, i.e. exactly what build_symbols(detect_address_map(doc)) gives - else nullptr
+    // (another map choice, the build still running, an edit the panel has not seen yet, process
+    // memory). doc:symbols reuses it through ScriptHost::cached_symbols. Never blocks.
+    std::shared_ptr<const SymbolTable> current_symbols(const Document& doc) const;
     // Opens the "Go to Symbol" list with the next draw() (palette "Go to Symbol...").
     void open_symbol_list() { open_symbols_ = true; }
     bool symbol_list_open() const { return symbols_open_; }

@@ -241,6 +241,31 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 * Guard against damaged input instead of failing:
   `if len > p:remaining() then p:bytes("data (truncated)", p:remaining()) return end`.
 
+### Parsers run in the background
+
+The Structure panel runs `parse` on a worker thread, so a slow parser never freezes the editor.
+A fast parse shows up at once; a slow one leaves the previous tree on screen (greyed, with
+"Parsing... N fields" and a **Cancel** button, which keeps the tree built so far) until it
+finishes. After an edit the document is re-parsed about 150 ms after you stop typing; a parse
+still running for an older state of the document is cancelled.
+
+Each background parse gets a **Lua state of its own** in which only the script file that
+defined the parser has run (as it was at the last reload; `require` works as usual). The file
+runs again for every parse, so keep its top-level code cheap and free of side effects (its
+`print` output there is dropped). Inside `parse`:
+
+* **Globals set by other script files are not visible.** Share code through a module in `lib/`
+  and `require` it. (A script that needs another script's global already when it loads is parsed
+  on the UI thread instead, as are parsers defined in the console.)
+* `doc` reads see the document **as it was when the parse started**; edits in the meantime start
+  a new parse.
+* The document is **read-only** there: `doc:write` & co. raise `document is read-only`;
+  `hx.highlight`, `doc:select` / `doc:jump`, bookmarks and `hx.new_doc` have no visible effect.
+  Use fields to show things, and commands to change things.
+* `print`, `hx.log`, `hx.warn` output appears in the console when the result arrives.
+
+`detect` still runs on the UI thread in the shared state (keep it to a few reads).
+
 ---
 
 ## Doc API
@@ -266,7 +291,8 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | `doc:bookmarks()` | list of `{offset, length, name, color, note}` (`color` is a packed color, `0` = default) |
 | `doc:add_bookmark(off, len?, name?, color?, note?)` → index | adds a bookmark (`len` default 1, clamped to the end; `color` as `hx.color` takes it); returns its 1-based index. An undo step ("Add bookmark"; inside a command or `doc:transaction` part of that step); works on read-only documents too |
 | `doc:remove_bookmark(i)` | removes bookmark `i` (1-based, as in `doc:bookmarks()`; an error if there is none). Undoable like adding |
-| `doc:symbols()` | Symbols of a PE / ELF executable, sorted by address (forwarded exports last), each `{name, address, offset, kind, module, ordinal?, forward?}`: `kind` is `"export"`, `"import"`, `"function"` or `"object"`; `module` the export / import DLL (`"KERNEL32.dll"`, ELF: `""`); imports are one entry per IAT slot (`address` = the slot, `name` = `"GetProcAddress"` or `"#12"` by ordinal) and on ELF `"puts@got"` (GOT slot) / `"puts@plt"` (PLT stub); `offset` is the file offset (nil when the address is not in the file); a forwarded export has `forward = "NTDLL.RtlAllocateHeap"` and no `address`. Sources: PE export / import / delay-import directories, ELF `.symtab` / `.dynsym` (FUNC / OBJECT) and JUMP_SLOT / GLOB_DAT relocations, plus function `"entry"` at an unnamed entry point; `{}` for other files and process memory. Capped at 1M symbols / ~3 s |
+| `doc:symbols()` | Symbols of a PE / ELF executable, sorted by address (forwarded exports last), each `{name, address, offset, kind, module, ordinal?, forward?}`: `kind` is `"export"`, `"import"`, `"function"` or `"object"`; `module` the export / import DLL (`"KERNEL32.dll"`, ELF: `""`); imports are one entry per IAT slot (`address` = the slot, `name` = `"GetProcAddress"` or `"#12"` by ordinal) and on ELF `"puts@got"` (GOT slot) / `"puts@plt"` (PLT stub); `offset` is the file offset (nil when the address is not in the file); a forwarded export has `forward = "NTDLL.RtlAllocateHeap"` and no `address`. Sources: PE export / import / delay-import directories, ELF `.symtab` / `.dynsym` (FUNC / OBJECT) and JUMP_SLOT / GLOB_DAT relocations, plus function `"entry"` at an unnamed entry point. Process memory (Windows): the exports / imports of every loaded module, read from its PE headers as mapped in memory (`"KERNEL32.dll"` / `"CreateFileW"` at its real address; `offset` = `address`), plus `"entry"` per module; Linux processes: `{}` for now. `{}` for other files. Capped at 1M symbols / ~3 s; instant when the Disassembly panel already holds the document's current table (Auto map) |
+| `doc:modules()` | The loaded modules of a process-memory document, by base: `{name, base, size, path}` (`"KERNEL32.DLL"`, load address, image size, full path; Linux: the file-backed mappings with an executable part, `base` = the lowest one). `{}` for files and devices; `nil, err` when the process cannot be queried |
 
 All edits are undoable. They fail with an error on read-only documents (`document is read-only`)
 and while a save is running.
@@ -286,6 +312,7 @@ and while a save is running.
 | `hx.clear_console()` | |
 | `hx.doc()` | active document or `nil` |
 | `hx.new_doc(name, bytes)` | opens the bytes in a new tab and returns its Doc |
+| `hx.open_process(pid, {writable=false}?)` | opens the memory of process `pid` in a tab (read-only unless `writable`; an open tab of that process is reused unless writable access is asked of a read-only one) and returns its Doc, or `nil, err` (no such process, access denied: run as administrator / with ptrace rights) |
 | `hx.highlight(doc, off, len, color?, label?)` / `hx.clear_highlights(doc)` | extra colored ranges in the hex view |
 | `hx.color(c)` | packed color from a name, `"#rrggbb"` or `0xRRGGBB`. Names: red green blue yellow orange purple cyan pink gray teal white |
 | `hx.hex(s)` → `"DE AD"` / `hx.unhex("de:ad")` → bytes | `unhex` is as lenient as paste: `0x`, commas, `\x`, `b64:` |
@@ -369,6 +396,7 @@ See "Selection: XOR with key" in `scripts/examples/commands.lua`.
 * `for _, h in ipairs(hx.xor_scan(doc, "This program")) do print(("%X  %s"):format(h.offset, h.text)) end`
   finds an XOR- / ADD- / ROL-obfuscated PE stub; `doc:add_bookmark(h.offset, 12, h.text)` marks one.
 * `for _, s in ipairs(doc:symbols()) do if s.kind == "import" then print(("%X  %s!%s"):format(s.address, s.module, s.name)) end end`
+* `local p = hx.open_process(1234); for _, m in ipairs(p:modules()) do print(("%X  %8X  %s"):format(m.base, m.size, m.name)) end`
   prints every IAT slot with its DLL and function.
 * Tables print readably: `{ a = 1, list = { 1, 2, 3 } }`.
 * Prototype a parser in a file and keep it open in your editor: every save hot-reloads it.
@@ -381,3 +409,7 @@ See "Selection: XOR with key" in `scripts/examples/commands.lua`.
 * `for` loop variables are read-only. Copy one to a local before changing it.
 * `global` is a reserved word, so don't use it as a variable name.
 * Integer division is `//`, bit operators are `& | ~ << >>`, and integers are 64-bit.
+* Errors raised by the `hx` / `doc` functions (bad arguments, an unknown hash or disassembly mode,
+  a read past the end in a parser, ...) are ordinary Lua errors: `pcall` catches them and the
+  script carries on. (Hexer compiles Lua as C++, so such an error unwinds cleanly through the
+  editor's own code.)

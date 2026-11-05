@@ -78,14 +78,30 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       panel, read-only unless asked, in-place saves of overwrites, `doc:target()` / `doc:pid()`)
 - [x] Process memory: Search / Strings / XOR search / minimap / Hash skip unreadable holes
       ("X unreadable skipped"); Inspector shows ?? for unreadable bytes
-- [ ] Process memory: default the follow-pointer width to the process's pointer size; module
-      list / jump to a module's base from the palette; Lua `hx.open_process(pid)`
+- [x] Process memory: default the follow-pointer width to the process's pointer size (until the
+      user picks one; settings.ini keeps theirs); module list (Regions panel "Modules" tab, palette
+      "Go to Module..."); module!export labels in the Disassembly from each module's in-memory PE
+      headers (`detect_pe_image`); Lua `hx.open_process(pid, {writable})`, `doc:modules()`
+- [ ] Process memory: symbols of Linux processes (ELF modules: PT_DYNAMIC .dynsym in memory, or
+      the module's file on disk relocated to its base); the Disassembly's module symbols are only
+      re-read on Refresh Memory / edits (a DLL loaded later has no labels until then)
 - [x] Compile and test core/procmem.cpp + core/devices.cpp on Linux (/proc/PID/mem, /sys/block)
 - [ ] Verify by hand: Open Process / Open Disk pickers, writable process save, the Regions click
       (screenshots only so far)
 - [x] pcap/pcapng: Packets panel (index in the background, filter, "Parse with" a parser over each
       packet or its payload, Up / Down steps and re-parses); auto-shown for captures
-- [ ] Packets: open a packet / TCP stream as its own tab, filter expressions (ip.src == ...)
+- [x] Packets: filter expressions (core/pcap_filter: ip.src/dst/addr incl. IPv6 + /prefix, tcp/udp
+      ports, frame.len, eth.type, proto, "text"; and / or / not, parentheses; the error is marked
+      inline and the previous filter stays; a worker above 100k packets)
+- [x] Packets: Follow TCP Stream (core/pcap_stream: reassembly by sequence number with out-of-order,
+      retransmitted / overlapping segments, wraparound, ACKed gaps, connection reuse; a read-only tab,
+      sequential or interleaved, one bookmark per segment, 256 MiB cap; the list gets the conversation
+      filter) and Open Packet / Payload as Tab
+- [ ] Packets: Follow UDP stream; IPv4 / IPv6 fragment reassembly (fragments are skipped by Follow
+      TCP Stream); a "TCP stream # / conversation" column; a stream that starts without a SYN with
+      an out-of-order first segment loses the bytes before it
+- [ ] Packets: Lua access (`doc:packets()`, a filter from scripts); filter on more fields (vlan,
+      tcp.flags, tcp.seq, ip.proto, frame.number)
 - [x] Split view of the same document (View > Split View, Ctrl+\, F6; kept in the session)
 - [ ] Multi-selection
 - [x] C struct → parser: paste C definitions, get a Lua parser (apply at the cursor or save it)
@@ -110,6 +126,12 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       nearest symbol + offset in the tooltip, Go to Symbol list, `doc:symbols()`; map choice / base /
       pinned start per tab in the session; panel options are real Settings members (checked
       against dumpbin on kernel32.dll: 1698 exports / 211 forwarded / 1292 imports, all equal)
+- [x] Symbols without stalls: SymbolJob restarts never block the UI (one worker per job, a request
+      slot), the table is kept when an edit misses the bytes it was read from (SymbolTable::sources,
+      compared piece by piece; size changes always rebuild), Go to Symbol filters a precomputed
+      lowercase label text (1M symbols: ~10 ms per keystroke), doc:symbols reuses the panel's table
+- [ ] Symbols: keep the table across inserts / deletes after its sources (today any size change
+      rebuilds: some checks depend on the file size)
 - [ ] Disassembly: branch arrows; a "Find references to" scan; PDB / DWARF names; i386 PIC PLT
       (jmp [ebx+X]) @plt names; symbols for a Manual base over a PE / ELF image (today: none)
 - [ ] Disassembly: other architectures (ARM / AArch64) only if asked (Zydis is x86 only)
@@ -139,8 +161,13 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Linux packages: AppStream metainfo in the AppImage; an aarch64 build
 - [x] Compile the visual-analysis / compare / capture batch with GCC and Clang (-Wall -Wextra,
       green in CI)
-- [ ] Run parsers on a worker thread over a Snapshot (a parse slower than ~50 ms is currently
-      not re-run after edits; the Structure panel shows it as stale until F5)
+- [x] Run parsers on a worker thread (script/parse_job.h: a Lua state of its own per parse over a
+      read-only clone of the document; cancel, progress, stale results dropped; every parse is
+      re-run after edits, debounced)
+- [ ] Background detect(): detection still runs on the UI thread (1 s limit per parser)
+- [x] Lua compiled as C++ (src/script/lua_onelua.cpp over the wrap's sources): a Lua error is a C++
+      exception, destructors of live locals in our lua_CFunctions run (no more longjmp over C++
+      frames, no HX_NOINLINE workaround); tested in debug / debugoptimized / release on MSVC
 
 ## Known limitations / tech debt
 - Each undo entry stores a full copy of the piece list; thousands of scattered edits combined with

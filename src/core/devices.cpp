@@ -55,7 +55,22 @@ void set_err(std::string* err, const std::string& msg) {
     if (err) *err = msg;
 }
 
+// By base; one entry per base (a WOW64 process's executable is in both Toolhelp module lists).
+void sort_modules(std::vector<ModuleInfo>& v) {
+    std::stable_sort(v.begin(), v.end(), [](const ModuleInfo& a, const ModuleInfo& b) { return a.base < b.base; });
+    v.erase(std::unique(v.begin(), v.end(), [](const ModuleInfo& a, const ModuleInfo& b) { return a.base == b.base; }),
+            v.end());
+}
+
 }  // namespace
+
+const ModuleInfo* module_at(const std::vector<ModuleInfo>& mods, uint64_t address) {
+    auto it = std::upper_bound(mods.begin(), mods.end(), address,
+                               [](uint64_t a, const ModuleInfo& m) { return a < m.base; });
+    if (it == mods.begin()) return nullptr;
+    --it;
+    return address - it->base < it->size ? &*it : nullptr;
+}
 
 #ifdef _WIN32
 // =============================================================================================
@@ -255,6 +270,39 @@ bool process_regions(uint32_t pid, std::vector<MemRegion>& out, std::string* err
     return true;
 }
 
+bool process_modules(uint32_t pid, std::vector<ModuleInfo>& out, std::string* err) {
+    out.clear();
+    if (pid == 0) {  // CreateToolhelp32Snapshot would list this process instead
+        set_err(err, "Cannot list the modules of process 0");
+        return false;
+    }
+    // TH32CS_SNAPMODULE32 adds the 32-bit modules of a WOW64 process. ERROR_BAD_LENGTH: the
+    // module list changed while it was being read (a starting process) - try again.
+    HANDLE snap = INVALID_HANDLE_VALUE;
+    DWORD e = 0;
+    for (int tries = 0; tries < 8 && snap == INVALID_HANDLE_VALUE; ++tries) {
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap == INVALID_HANDLE_VALUE && (e = GetLastError()) != ERROR_BAD_LENGTH) break;
+    }
+    Handle h(snap);
+    if (!h) {
+        set_err(err, "Cannot list the modules of process " + std::to_string(pid) + ": " + win_error(e));
+        return false;
+    }
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof me;
+    for (BOOL ok = Module32FirstW(h.h, &me); ok; ok = Module32NextW(h.h, &me)) {
+        ModuleInfo m;
+        m.name = wide_to_utf8(me.szModule);
+        m.path = wide_to_utf8(me.szExePath);
+        m.base = uint64_t(reinterpret_cast<uintptr_t>(me.modBaseAddr));
+        m.size = me.modBaseSize;
+        out.push_back(std::move(m));
+    }
+    sort_modules(out);
+    return true;
+}
+
 std::vector<DeviceInfo> list_devices() {
     std::vector<DeviceInfo> out;
     const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
@@ -449,6 +497,40 @@ bool process_regions(uint32_t pid, std::vector<MemRegion>& out, std::string* err
         out.push_back(std::move(r));
     }
     std::sort(out.begin(), out.end(), [](const MemRegion& a, const MemRegion& b) { return a.base < b.base; });
+    return true;
+}
+
+bool process_modules(uint32_t pid, std::vector<ModuleInfo>& out, std::string* err) {
+    out.clear();
+    std::vector<MemRegion> regs;
+    if (!process_regions(pid, regs, err, true)) return false;
+    std::vector<std::pair<std::string, size_t>> index;  // path -> index in out (sorted by path)
+    std::vector<bool> exec;
+    for (const MemRegion& r : regs) {
+        if (r.name.empty() || r.name[0] != '/') continue;  // anonymous, [heap], [stack], [vdso]...
+        auto it = std::lower_bound(index.begin(), index.end(), r.name,
+                                   [](const std::pair<std::string, size_t>& a, const std::string& p) { return a.first < p; });
+        if (it == index.end() || it->first != r.name) {
+            it = index.insert(it, std::make_pair(r.name, out.size()));
+            ModuleInfo m;
+            m.name = path_filename(r.name);
+            m.path = r.name;
+            m.base = r.base;
+            m.size = r.size;
+            out.push_back(std::move(m));
+            exec.push_back(false);
+        }
+        ModuleInfo& m = out[it->second];
+        const uint64_t end = std::max(m.end(), r.end());
+        m.base = std::min(m.base, r.base);
+        m.size = end - m.base;
+        if (r.prot.size() >= 3 && r.prot[2] == 'x') exec[it->second] = true;
+    }
+    std::vector<ModuleInfo> keep;
+    for (size_t i = 0; i < out.size(); ++i)
+        if (exec[i]) keep.push_back(std::move(out[i]));
+    out = std::move(keep);
+    sort_modules(out);
     return true;
 }
 

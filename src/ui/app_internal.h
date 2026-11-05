@@ -16,6 +16,7 @@
 #include "core/search.h"
 #include "core/session.h"
 #include "core/settings.h"
+#include "script/parse_job.h"
 #include "script/script_engine.h"
 #include "ui/app.h"
 #include "ui/dialog_cstruct.h"
@@ -87,10 +88,17 @@ struct StructureState {
     uint64_t parsed_base = 0;         // base / length of `result`
     uint64_t parsed_length = UINT64_MAX;
     std::string base_input;           // the panel's "@" field
-    // Wall time of the last detect + parse. A slow (or truncated) parse is not re-run on every
-    // edit; the panel shows it as stale until F5 / Reparse.
+    // Wall time of the last detect + parse (start of its job to its result).
     double last_parse_ms = 0.0;
-    bool slow = false;
+    // The parse runs on a worker (script/parse_job.h); `result` stays shown (greyed after a
+    // moment) until it finishes. job_reload / job_requested: what it was started for (with the
+    // job's own generation / base / length). A job whose inputs changed is cancelled and parked
+    // in `retired` until its worker has stopped (never joined on the UI thread while it runs).
+    std::unique_ptr<ParseJob> job;
+    uint64_t job_reload = UINT64_MAX;
+    std::string job_requested;
+    double job_t0 = 0.0;              // app clock at its start
+    std::vector<std::unique_ptr<ParseJob>> retired;
 };
 
 struct SearchHits {
@@ -372,6 +380,13 @@ struct App final : ScriptHost {
     Document* open_bytes(const std::string& name, const uint8_t* data, size_t len) override;
     void reveal(Document& doc, uint64_t offset, uint64_t len) override;
     bool view_range(Document& doc, uint64_t& first, uint64_t& last) override;
+    std::shared_ptr<const SymbolTable> cached_symbols(Document& doc) override;
+    Document* open_process(uint32_t pid, bool writable, std::string* err) override;
+
+    // Follow-pointer width of process documents (core/nav.h AutoPointerWidth): the process's
+    // pointer size while one is active, until the user picks a width (panels.cpp calls pick()).
+    AutoPointerWidth auto_ptr;
+    uint64_t auto_ptr_doc = UINT64_MAX;  // active doc id auto_ptr was last applied for
 };
 
 // ---- helpers implemented in app.cpp, used by panels.cpp ------------------------------------

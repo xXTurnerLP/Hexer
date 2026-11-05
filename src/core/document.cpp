@@ -492,6 +492,23 @@ std::shared_ptr<const Snapshot> Document::snapshot() const {
     return make_snapshot();
 }
 
+std::unique_ptr<Document> Document::clone_readonly() const {
+    std::unique_ptr<Document> d(new Document());
+    std::lock_guard<std::mutex> lk(mu_);
+    d->id_ = id_;
+    d->path_ = path_;
+    d->display_name_ = display_name_;
+    d->sources_ = sources_;
+    d->table_ = table_;
+    d->add_ = add_;  // the chunk list: chunks are shared, their written bytes never change
+    d->view_ = view_;
+    d->read_only_ = true;
+    d->disk_stat_ = disk_stat_;
+    d->generation_ = generation_;
+    d->state_id_ = d->saved_state_id_ = state_id_;
+    return d;
+}
+
 bool Document::is_base_piece(const Piece& p) const {
     if (p.src != Piece::Add || base_chunks_ == 0) return false;
     if (p.chunk + 1 < base_chunks_) return true;

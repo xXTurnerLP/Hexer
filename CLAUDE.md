@@ -21,7 +21,7 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
 ```
 src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device / process memory),
              procmem (process memory backend, "process://<pid>" URLs), devices (process / disk /
-             memory region lists), piece_table, highlight, document (edits, undo, save, targets,
+             memory region / module lists), piece_table, highlight, document (edits, undo, save, targets,
              extras), session (hot exit + per-doc / session extras), search, inspector, util (goto
              exprs, copy-as, paste parse), settings (+ paths), nav (PointerType, follow pointer +
              jump history), xorscan (XorScanJob, key_guess, undoable apply_transform),
@@ -29,15 +29,22 @@ src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device 
              definitions -> Lua parser source),
              entropy (ByteClass + EntropyJob: sampled per-bucket entropy for the minimap), bitmap
              (bytes -> pixels), diff (DiffJob: compare two Snapshots with a shift), pcap (pcap/pcapng
-             PcapIndexJob + packet dissector); document also has refresh_appended() (live tail);
-             exe_map (AddressMap: PE / ELF / manual file offset <-> VA, entry point, sections);
+             PcapIndexJob + packet dissector), pcap_filter (PacketFilter expressions +
+             PacketFilterJob), pcap_stream (TCP reassembly: follow_tcp_stream, TcpStreamJob),
+             pcap_job.h (PcapWorker<R>: one background run, used by both); document also has
+             refresh_appended() (live tail);
+             exe_map (AddressMap: PE / ELF / manual file offset <-> VA, entry point, sections;
+             detect_pe_image = a PE mapped by RVA in process memory; a Process map's `names` are
+             the modules), nav also has AutoPointerWidth (process docs' pointer-size default);
              symbols (SymbolTable: PE exports / imports, ELF symtab / PLT / GOT names, bounded
              reads; SymbolJob builds it on a worker thread);
              disasm (x86-64 / x86 via Zydis, disasm_range / disasm_sync_back; its own static lib
              hexer_disasm so only its users link Zydis)
 src/script/  script_engine.h (Lua API contract — the header comment is the API spec),
-             script_engine.cpp, lua_api.cpp, cexport (parse tree -> C header, opts.flags names;
-             no Lua, but on Field so it lives here)
+             script_engine.cpp, lua_api.cpp, lua_onelua.cpp (the wrap's Lua sources compiled as ONE
+             C++ TU: Lua errors are C++ exceptions; include "lua.h" etc., never lua.hpp),
+             cexport (parse tree -> C header, opts.flags names; no Lua, but on Field so it lives here), parse_job (ParseJob: one parse on a worker
+             thread in a ScriptEngine of its own over Document::clone_readonly)
 src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
              menus, shortcuts, tabs, Compare tab, live tail, split view, minimap wiring, session
              extras, ScriptHost impl); self-contained feature UIs without App dependency:
@@ -54,15 +61,18 @@ tests/       doctest; one exe per module: test_core, test_util, test_script, tes
              test_diffview (headless Compare view: next / prev, Find Shift, synced scroll),
              test_panels (headless Packets + Bitmap panels: row clicks / keys, decode, image clicks),
              test_nav, test_strings, test_hash, test_cstruct, test_entropy, test_bitmap,
-             test_diff, test_pcap, test_tail (growing files), test_procmem (reads and writes the
-             test process's own memory), test_history, test_xorscan, test_session,
+             test_diff, test_pcap, test_pcapfilter, test_tcpstream (synthetic captures from
+             pcap_fixture.h), test_tail (growing files), test_procmem (reads and writes the
+             test process's own memory; its modules, their in-memory PE symbols, hx.open_process), test_history, test_xorscan, test_session,
              test_symbols (PE / ELF fixtures in symbol_fixture.h, malformed tables, kernel32.dll
              when present), test_disasm (encodings, sync_back, PE / ELF maps incl. malformed
              headers, Lua, headless panel incl. labels / Go to Symbol / session extras),
-             test_cexport (C header export + round trip through cstruct, opts.flags, bit toggles)
+             test_cexport (C header export + round trip through cstruct, opts.flags, bit toggles),
+             test_parsejob (background parses: cancel, stale reads, errors, sync fallback, holes)
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
-             make_pcap.py (demo pcapng with HXP packets for the Packets panel)
+             make_pcap.py (demo pcapng with HXP packets + an HTTP-over-TCP connection for the
+             Packets panel / Follow TCP Stream)
 assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file
 .github/     CI (workflows/ci.yml): release builds + tests on GCC / Clang / MSVC; packages
              (Windows zip, Linux AppImage on ubuntu-22.04 + tar.gz) as 7-day artifacts, smoke-tested
@@ -96,13 +106,17 @@ Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`
 `"Show All Bookmarks"`, `"Jump to Bookmark..."`, `"Strings: Scan File"`, `"Hash Selection"`,
 `"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`, `"Minimap: Byte Classes"`,
 `"Color Bytes by Class"`, `"Toggle Bitmap"`, `"Bitmap: Show at Cursor"`, `"Toggle Packets"`,
+`"Packets: Follow TCP Stream"` / `"... (Interleaved)"`, `"Packets: Open Packet as Tab"`, `"Packets:
+Open Payload as Tab"`, `"Packets: Filter Conversation"` (selected packet, else the one under the
+caret: e.g. `--exec "local d=hx.doc(); d:jump(d:size()-20)"` picks the last packet; they wait
+for the index),
 `"Structure: Parse Selection"`, `"Structure: Copy as C Header"` (clipboard), `"Structure: Export C
 Header..."` (native dialog), `"Toggle Live Tail"`, `"Compare with: <tab name>"`,
 `"Compare: Align at Cursors"`, `"Compare: Find Shift"`, `"Compare with File on Disk"`, `"Compare with
 Backup"`, `"Revert to Backup"` (the last two need `<file>.backup`), `"Show History"`, `"XOR: Scan File"`, `"XOR: Guess Key from
 Selection"`, `"Open Process..."`, `"Open Disk..."`, `"Toggle Regions"`, `"Split Horizontally"`,
 `"Split Vertically"`, `"Split View: Switch Pane"`, `"Undo"`, `"Toggle Disassembly"`, `"Go to Entry
-Point"`, `"Disassemble at Cursor"`, `"Disassembly: Follow Target"`, `"Go to Symbol..."`; any palette
+Point"`, `"Disassemble at Cursor"`, `"Disassembly: Follow Target"`, `"Go to Symbol..."`, `"Go to Module..."` / `"Show Modules"` (process docs); any palette
 label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable; all
 actions of one run execute in the same frame, so e.g. "Compare: Next Difference" right after
 "Compare with: ..." finds no result yet). A process opens from the command line as
@@ -120,6 +134,11 @@ mods)`, `ui.drag(a, b)`, `ui.key(ImGuiKey_X, mods)`, `ui.type("ab")` queue io ev
 and `ui.hex(off)` / `ui.txt(off)` give the screen position of a drawn byte (`HexView::cell_pos`).
 Every change to input handling or hit testing in `ui/hex_view.cpp` gets a case there.
 Use `Document::set_clock_for_tests` for undo-merge timing.
+
+Structure panel parses: `update_structure()` (panels.cpp) starts a `ParseJob` (detect() stays on
+the UI thread) and adopts its result when it is done and still matches the inputs (generation,
+script reload, parser, Parse at range); a mismatching job is cancelled into `StructureState::retired`.
+Don't call `ScriptEngine::parse` from the UI for the panel; it stays the synchronous API (tests).
 
 Follow pointer type: `Settings::pointer_type()` (width / signed / relative / base + the Inspector's
 LE/BE) is the one source; clicking an integer Inspector row sets it, `follow_pointer_as()`
@@ -157,6 +176,8 @@ ranges are displayed with `fmt_range()` (inclusive end).
 - Errors: return `bool` + `std::string* err` (nullable). No exceptions across module boundaries.
 - Lua: API surface is documented in the comment block at the top of `src/script/script_engine.h`;
   keep it, `docs/scripting.md` and `scripts/examples/` in sync when changing the API.
+  Lua is built as C++, so a lua_CFunction may raise (luaL_error / luaL_check*) with C++ locals
+  alive; never `catch (...)` on a path called from Lua (it would swallow the error), no noexcept there.
 - Tests: add doctest cases for any core/util/script behaviour you change. Use temp dirs, never the
   real user config dir (`paths::set_config_dir_override`).
 - Commit messages: imperative, short subject; mention the module (`core:`, `ui:`, `script:`).

@@ -34,6 +34,10 @@
 //   hx.clear_console()
 //   hx.doc() -> active Doc or nil
 //   hx.new_doc(name, bytes) -> Doc     -- open bytes (e.g. a serialized packet) in a new tab
+//   hx.open_process(pid, {writable=false}?) -> Doc | nil, err   -- the memory of process `pid` in a
+//       tab (read-only unless writable; an open tab of that process is reused when it is writable
+//       or writable was not asked for). nil + message when it cannot be opened (no such process,
+//       access denied: needs administrator / ptrace rights)
 //   hx.highlight(doc, off, len, color, label?)  /  hx.clear_highlights(doc)
 //   hx.color(c) -> packed int          -- c: "red"|"#ff8800"|0xff8800 (named: red, green, blue,
 //                                         yellow, orange, purple, cyan, pink, gray, teal)
@@ -67,6 +71,10 @@
 //   doc:size()  doc:name()  doc:path()  doc:id()
 //   doc:target() -> "file" | "device" | "process"   doc:pid() -> process id (process memory) | nil
 //       (process memory: offset = virtual address, unmapped pages read as 0; fixed size)
+//   doc:modules() -> list of { name=, base=, size=, path= } by base: the loaded modules of a process
+//       document ("KERNEL32.DLL", load address, image size, full path; Linux: file-backed mappings
+//       with an executable part, base = lowest mapping); {} for files / devices; nil, err when the
+//       process cannot be queried
 //   doc:read(off, len) -> string         (clamped to EOF; at most 64 MiB per call)
 //   doc:u8(off) doc:i8(off) doc:u16le/u16be/i16le/i16be/u32le/u32be/i32le/i32be/
 //       u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)  -> number (nil past EOF)
@@ -94,8 +102,11 @@
 //         forward  forwarded export: "NTDLL.RtlAllocateHeap" (then no address)
 //       Sources: PE export / import / delay-import directories, ELF .symtab / .dynsym FUNC and
 //       OBJECT symbols, JUMP_SLOT / GLOB_DAT relocations; an entry point without a name of its
-//       own is function "entry". Built synchronously (capped at 1M symbols / ~3 s); {} for other
-//       files and process memory.
+//       own is function "entry". Process memory: every loaded module's exports / imports from
+//       its PE headers as mapped in memory (module = the DLL, e.g. "KERNEL32.dll!CreateFileW";
+//       offset = address) plus "entry" per module (Windows; Linux processes: {}). Built
+//       synchronously (capped at 1M symbols / ~3 s); {} for other files. Reuses the Disassembly
+//       panel's table when it is up to date for the document (Auto map) instead of building.
 //   doc:view_range() -> first, last   -- first and last byte visible in the document's hex view
 //       (inclusive; as of the last drawn frame), nil when it has no drawn view (headless, empty doc)
 //   doc:bookmarks() -> list of { offset=, length=, name=, color= (packed int, 0 = default), note= }
@@ -144,6 +155,15 @@
 //   literals like 'IHDR', and hex/bin bit patterns for signed fields accepted).
 //   Limits: 200,000 fields; a parse is aborted after ~2 s (instruction-count hook) - the partial
 //   tree is kept and the error (with script file:line) is shown in the console.
+//   Background parses: the Structure panel runs parse() on a worker thread (script/parse_job.h),
+//   each time in a Lua state of its own that ran only the script file the parser came from (as of
+//   the last reload; require() works; it runs again for every parse, so keep its top-level code
+//   cheap and free of side effects). So inside parse(): globals set by OTHER script files are
+//   not visible (a script that needs one at load time is parsed on the UI thread instead, as are
+//   parsers defined in the console); doc reads see the document as it was when the parse started;
+//   the doc is read-only there (edits raise "document is read-only"; hx.highlight, doc:select /
+//   doc:jump, bookmarks and hx.new_doc have no visible effect); print / hx.log output reaches the
+//   console when the result arrives. detect() still runs on the UI thread in the shared state.
 //
 // Console REPL: input is first tried as `return <input>` (results printed), then as a statement.
 // Predefined each time: `doc` (active Doc or nil), `cur` (cursor), `sel` = {start=, len=}.
@@ -164,6 +184,9 @@
 struct lua_State;
 
 namespace hx {
+
+class ParseJob;
+struct SymbolTable;
 
 struct ConsoleLine {
     enum Kind : uint8_t { Info, Warn, Error, Input, Result };
@@ -241,6 +264,15 @@ public:
     // First and last (inclusive) byte visible in `doc`'s hex view as last drawn; false if it has
     // none (doc:view_range() returns nil). Default: no view (headless hosts).
     virtual bool view_range(Document& /*doc*/, uint64_t& /*first*/, uint64_t& /*last*/) { return false; }
+    // A finished symbol table the host already holds for `doc` as it is now under its detected
+    // map (the Disassembly panel's), so doc:symbols need not build one; nullptr: none (default).
+    virtual std::shared_ptr<const SymbolTable> cached_symbols(Document& /*doc*/) { return nullptr; }
+    // hx.open_process: the memory of process `pid` as a document (read-only unless `writable`),
+    // e.g. a new tab; nullptr + *err on failure. Default: not supported (headless hosts).
+    virtual Document* open_process(uint32_t /*pid*/, bool /*writable*/, std::string* err) {
+        if (err) *err = "opening processes is not supported here";
+        return nullptr;
+    }
 };
 
 class ScriptEngine {
@@ -319,6 +351,7 @@ private:
     uint64_t reload_count_ = 0;
     std::unordered_map<uint64_t, HighlightSet> highlights_;
     friend struct Impl;
+    friend class ParseJob;  // script/parse_job.h: background parses in an engine of their own
 };
 
 }  // namespace hx

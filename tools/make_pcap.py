@@ -8,6 +8,8 @@ The capture holds Ethernet frames with ARP, ICMP, TCP and IPv4 / IPv6 UDP packet
 the file in Hexer, pick "HXP packet" in the Packets panel's "Parse with" combo, tick "Payload only"
 and click a UDP packet (or step with Up / Down): the Structure panel shows the decoded TLV records.
 One frame carries an 802.1Q VLAN tag and one HXP packet has a bad CRC, to have something to find.
+The capture ends with an HTTP request / response over TCP (port 80) with an out-of-order and a
+retransmitted segment: right-click one of its packets > Follow TCP Stream.
 """
 import struct
 import sys
@@ -129,6 +131,41 @@ def epb(ts_ns, frame):
     return block(6, struct.pack("<IIIII", 0, ts_ns >> 32, ts_ns & 0xFFFFFFFF, len(frame), len(frame)) + frame)
 
 
+def http_conversation():
+    """A TCP connection 10.0.0.1:51234 -> 10.0.0.2:80 for Follow TCP Stream: handshake, an HTTP
+    request, a response in three segments (the last one arrives before the middle one, which is
+    then also retransmitted), FIN both ways."""
+    cp, sp = 51234, 80
+    c, s = 1000, 5000  # initial sequence numbers
+
+    def c2s(flags, seq, ack, data=b"", ident=20):
+        return eth(MAC_B, MAC_A, 0x0800, ipv4(IP_A, IP_B, 6, tcp(cp, sp, flags, seq, ack, data), ident))
+
+    def s2c(flags, seq, ack, data=b"", ident=40):
+        return eth(MAC_A, MAC_B, 0x0800, ipv4(IP_B, IP_A, 6, tcp(sp, cp, flags, seq, ack, data), ident))
+
+    req = b"GET /sensor/7 HTTP/1.1\r\nHost: 10.0.0.2\r\nUser-Agent: hexer-demo\r\n\r\n"
+    body = b'{"device": "sensor-7", "temperature": 23.5, "readings": [235, -41, 240, 999]}\n'
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body)
+    b1, b2 = body[:40], body[40:]
+    c1, s1 = c + 1, s + 1
+    return [
+        c2s(0x02, c, 0, ident=20),                                   # SYN
+        s2c(0x12, s, c1, ident=40),                                  # SYN, ACK
+        c2s(0x10, c1, s1, ident=21),                                 # ACK
+        c2s(0x18, c1, s1, req, 22),                                  # request
+        s2c(0x10, s1, c1 + len(req), ident=41),
+        s2c(0x18, s1, c1 + len(req), head, 42),                      # response headers
+        s2c(0x18, s1 + len(head) + len(b1), c1 + len(req), b2, 43),  # body part 2 (out of order)
+        c2s(0x10, c1 + len(req), s1 + len(head), ident=23),          # dup ACK: part 1 missing
+        s2c(0x18, s1 + len(head), c1 + len(req), b1, 44),            # part 1 (late)
+        s2c(0x18, s1 + len(head), c1 + len(req), b1, 46),            # part 1 again (retransmission)
+        c2s(0x11, c1 + len(req), s1 + len(head) + len(body), ident=24),          # FIN, ACK
+        s2c(0x11, s1 + len(head) + len(body), c1 + len(req) + 1, ident=45),      # FIN, ACK
+        c2s(0x10, c1 + len(req) + 1, s1 + len(head) + len(body) + 1, ident=25),  # ACK
+    ]
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "demo.pcapng"
     t0 = 1767225600 * 1_000_000_000  # 2026-01-01 00:00:00 UTC
@@ -155,6 +192,7 @@ def main():
         eth(MAC_B, MAC_A, 0x0800, ipv4(IP_A, IP_B, 17, udp(40000, port, broken), 7)),
         eth(MAC_B, MAC_A, 0x0800, ipv4(IP_A, IP_B, 17, udp(40000, port, bye), 8)),
     ]
+    frames += http_conversation()
     blob = shb() + idb()
     for i, f in enumerate(frames):
         blob += epb(t0 + i * 125_000_000 + i * 1234, f)

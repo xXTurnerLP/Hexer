@@ -207,6 +207,15 @@ void ScriptEngine::Impl::close_state() {
     depth = 0;
     warn_buf.clear();
     logged_errors.clear();
+    sources.clear();
+}
+
+void ScriptEngine::Impl::keep_parser_sources() {
+    for (auto it = sources.begin(); it != sources.end();) {
+        bool used = false;
+        for (const ParserInfo& p : eng.parsers_) used = used || p.file == it->first;
+        it = used ? std::next(it) : sources.erase(it);
+    }
 }
 
 void ScriptEngine::Impl::log_error_once(const std::string& text) {
@@ -453,6 +462,7 @@ void ScriptEngine::reload() {
             continue;
         }
         impl_->loading_file = f.w.path;
+        impl_->sources[f.w.path] = {chunk, src};
         std::string err;
         if (!impl_->pcall(0, 0, impl_->script_limit_ms, &err)) {
             log(ConsoleLine::Error, err);
@@ -460,6 +470,7 @@ void ScriptEngine::reload() {
         }
         impl_->loading_file.clear();
     }
+    impl_->keep_parser_sources();
     ++reload_count_;
     char buf[200];
     std::snprintf(buf, sizeof buf, "%s %d script%s (%d parser%s, %d command%s)%s%s",
@@ -485,9 +496,11 @@ bool ScriptEngine::run_source(const std::string& lua, const std::string& chunk_n
         return fail(m);
     }
     impl_->loading_file = chunk_name;
+    impl_->sources[chunk_name] = {chunk, lua};
     std::string e;
     bool ok = impl_->pcall(0, 0, impl_->script_limit_ms, &e);
     impl_->loading_file.clear();
+    impl_->keep_parser_sources();
     if (!ok) return fail(e);
     return true;
 }

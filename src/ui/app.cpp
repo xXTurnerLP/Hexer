@@ -25,6 +25,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 #include "nfd.h"
 
+#include "core/devices.h"
 #include "core/highlight.h"
 #include "core/inspector.h"
 #include "core/nav.h"
@@ -1468,6 +1469,13 @@ void refresh_memory(App& a) {
     set_status(a, d->target_alive() ? "Memory refreshed (region map re-read)" : "The process has exited");
 }
 
+// Palette "Go to Module...": the Regions panel's Modules tab and its filterable module popup.
+void go_to_module(App& a) {
+    a.show_regions = a.focus_regions = true;
+    a.regions_panel.show_modules_tab();
+    a.regions_panel.open_module_list();
+}
+
 void toggle_panel(bool& show, bool& focus) {
     show = !show;
     focus = show;
@@ -1679,10 +1687,35 @@ const Action kActions[] = {
     {"Disassemble at Cursor", {0, 0}, disasm_at_cursor, has_doc, true, false},
     {"Go to Entry Point", {0, 0}, disasm_go_to_entry, has_doc, true, false},
     {"Go to Symbol...", {0, 0}, disasm_go_to_symbol, has_doc, true, false},
+    {"Go to Module...", {0, 0}, go_to_module, has_process, true, false},
+    {"Show Modules", {0, 0}, [](App& a) {
+         a.show_regions = a.focus_regions = true;
+         a.regions_panel.show_modules_tab();
+     }, has_process, true, false},
     {"Disassembly: Follow Target", {0, 0}, disasm_follow_target, has_doc, true, false},
     {"Packets: Index Capture", {0, 0}, [](App& a) {
          a.show_packets = a.focus_packets = true;
          a.packets_panel.request_index();
+     }, has_capture, true, false},
+    {"Packets: Follow TCP Stream", {0, 0}, [](App& a) {  // selected packet, else the one at the caret
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_follow_stream(false);
+     }, has_capture, true, false},
+    {"Packets: Follow TCP Stream (Interleaved)", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_follow_stream(true);
+     }, has_capture, true, false},
+    {"Packets: Open Packet as Tab", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_open_packet(false);
+     }, has_capture, true, false},
+    {"Packets: Open Payload as Tab", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_open_packet(true);
+     }, has_capture, true, false},
+    {"Packets: Filter Conversation", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_conversation_filter();
      }, has_capture, true, false},
     // Scripts
     // F5 also re-reads a process document's memory (Refresh Memory).
@@ -1962,6 +1995,7 @@ void draw_navigate_items(App& app) {
     }
     menu_action(app, "Go to Entry Point");
     menu_action(app, "Go to Symbol...");
+    menu_action(app, "Go to Module...");
 }
 
 // File > Compare With: every other open document, or a file to open.
@@ -3507,11 +3541,53 @@ bool App::view_range(Document& doc, uint64_t& first, uint64_t& last) {
     return true;
 }
 
+// doc:symbols(): the Disassembly panel's table when it is current for the document.
+std::shared_ptr<const SymbolTable> App::cached_symbols(Document& doc) { return disasm_panel.current_symbols(doc); }
+
+// hx.open_process: a tab of that process is reused unless writable access is asked of a
+// read-only one; otherwise a new tab, as File > Open Process... opens it.
+Document* App::open_process(uint32_t pid, bool writable, std::string* err) {
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        Document& d = *tabs[i]->doc;
+        if (d.target() == SourceKind::Process && d.process_id() == pid && (!writable || !d.read_only())) {
+            select_request = active = int(i);
+            return &d;
+        }
+    }
+    std::unique_ptr<Document> d = Document::open_process(pid, writable, err);
+    if (!d) return nullptr;
+    return add_tab(*this, std::move(d)).doc.get();
+}
+
 // =============================================================================================
 // Per-frame housekeeping: drops, disk changes, scripts, session, settings, title
 // =============================================================================================
 
 namespace {
+
+// Process documents default the follow-pointer width to the process's pointer size while they
+// are active (core/nav.h AutoPointerWidth); decided again whenever the active document changes.
+void apply_auto_pointer_width(App& app) {
+    Tab* t = active_tab(app);
+    const uint64_t id = t ? t->doc->id() : 0;
+    if (id == app.auto_ptr_doc) return;
+    app.auto_ptr_doc = id;
+    const Document* d = t ? t->doc.get() : nullptr;
+    const int bytes = d && d->target() == SourceKind::Process ? process_bits(d->process_id()) / 8 : 0;
+    const int before = app.settings.pointer_width;
+    app.auto_ptr.activate(bytes, app.settings.pointer_width);
+    if (app.settings.pointer_width == before) return;
+    if (InspType ft = insp_type_of_int(app.settings.pointer_width, app.settings.pointer_signed); ft != InspType::Count)
+        app.insp_sel = int(ft);  // the Inspector marks the follow type's row
+    if (bytes) set_status(app, "Follow pointer width: " + std::to_string(bytes * 8) + "-bit (the process's pointer size)");
+}
+
+// settings.ini keeps the user's pointer width, not a process document's automatic one.
+void save_settings(App& app) {
+    Settings s = app.settings;
+    s.pointer_width = app.auto_ptr.persisted(s.pointer_width);
+    s.save(paths::settings_file());
+}
 
 void process_pending_opens(App& app) {
     if (app.pending_open.empty()) return;
@@ -3755,7 +3831,7 @@ void autosave(App& app) {
     }
     if (app.settings_dirty_at >= 0.0 && n - app.settings_dirty_at > 1.0) {
         app.settings_dirty_at = -1.0;
-        app.settings.save(paths::settings_file());
+        save_settings(app);
     }
 }
 
@@ -3962,6 +4038,7 @@ void frame(App& app) {
     // (the sender already exited, believing them delivered; open tabs go into the session).
     poll_inbox(app);
     process_pending_opens(app);
+    apply_auto_pointer_width(app);
     poll_save(app);
     poll_search(app);
     poll_tail(app);
@@ -4140,7 +4217,7 @@ void shutdown(App& app) {
     else if (app.session && !app.settings.restore_session)
         app.session->clear();  // hot exit disabled: don't resurrect stale edits later
     end_compare(app);
-    app.settings.save(paths::settings_file());
+    save_settings(app);
     app.engine.reset();  // before documents: the Lua state may still reference them
     app.tabs.clear();
     app.closed.clear();

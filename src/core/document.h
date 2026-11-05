@@ -241,6 +241,12 @@ public:
     // unplugged drive, file truncated by another program). Unreadable bytes read as 0.
     bool io_error() const;
     std::shared_ptr<const Snapshot> snapshot() const;
+    // A read-only stand-in of the current state for one worker thread (background parse,
+    // script/parse_job.h): the same bytes (file versions and add-buffer chunks are shared like a
+    // Snapshot's; O(pieces)), path, name, view state (caret, selection, bookmarks, parser),
+    // generation() and the same id(); no undo history. Call on the UI thread. The clone is not
+    // a document of the app: it is only ever read (edits fail as on any read-only document).
+    std::unique_ptr<Document> clone_readonly() const;
     // True if any byte in [offset, offset+len) is not original file content (typed, pasted, filled,
     // inserted; used to tint edited bytes). Original bytes merely shifted by an insert/erase earlier
     // in the file do not count.

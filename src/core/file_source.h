@@ -75,6 +75,9 @@ public:
     uint64_t next_readable(uint64_t offset) const;
     bool sparse() const;                 // holes are expected (process memory)
     void invalidate();                   // drop all cached blocks (after an in-place write)
+    // Bumps whenever invalidate() / refresh() / extend() dropped cached bytes (the content may have
+    // changed under the same source: an in-place save, a forced save, process memory).
+    uint64_t epoch() const;
     // Process: re-read the region map and drop cached bytes (regions change while it runs).
     void refresh();
     bool alive() const;                  // false once a process target has exited

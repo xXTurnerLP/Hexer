@@ -24,6 +24,7 @@
 #include "core/highlight.h"
 #include "ui/panel_bitmap.h"
 #include "ui/panel_packets.h"
+#include "pcap_fixture.h"
 
 using namespace hx;
 
@@ -222,6 +223,276 @@ TEST_CASE("panels: Packets on a document that is not a capture") {
     CHECK(selects == 0);
     gui.body = [&] { panel.draw(nullptr, {}, cb); };  // no document
     gui.frame();
+}
+
+namespace {
+
+// Draws frames until the index of `doc` is shown (row 0 drawn).
+void wait_index(Gui& gui, PacketsPanel& panel) {
+    float x = 0, y = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!panel.row_pos(0, x, y)) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        gui.frame();
+    }
+}
+// Draws frames until `done()` (workers: filter / stream jobs).
+void wait_for(Gui& gui, const std::function<bool()>& done) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!done()) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        gui.frame();
+    }
+}
+void type(Gui& gui, const char* s) {
+    ImGui::GetIO().AddInputCharactersUTF8(s);
+    gui.frame();
+    gui.frame();
+}
+void select_all(Gui& gui) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+    io.AddKeyEvent(ImGuiKey_A, true);
+    gui.frame();
+    io.AddKeyEvent(ImGuiKey_A, false);
+    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    gui.frame();
+}
+
+}  // namespace
+
+TEST_CASE("panels: Packets filter box: expressions, inline error, previous filter kept, worker filter") {
+    Gui gui;
+    std::vector<pcapfx::Bytes> frames;
+    for (int i = 0; i < 6; ++i)
+        frames.push_back(pcapfx::udp_frame("10.0.0.1", 5000, "10.0.0.2", uint16_t(1000 + i), pcapfx::str("payload")));
+    frames.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 1, 1, pcapfx::ACK, pcapfx::str("GET")));
+    frames.push_back(pcapfx::arp_frame());
+    frames.push_back(pcapfx::tcp_frame("10.0.0.2", 80, "10.0.0.1", 51000, 1, 4, pcapfx::ACK, pcapfx::str("200")));
+    const pcapfx::Bytes cap = pcapfx::pcap_file(frames);
+    auto doc = Document::create_from_bytes("cap.pcap", cap.data(), cap.size());
+    PacketsPanel panel;
+    std::vector<std::pair<uint64_t, uint64_t>> selects;
+    PacketsPanelCallbacks cb;
+    cb.select = [&](uint64_t off, uint64_t len) { selects.emplace_back(off, len); };
+    gui.body = [&] { panel.draw(doc.get(), {}, cb); };
+    wait_index(gui, panel);
+    const uint64_t id = doc->id();
+    CHECK(panel.shown_rows(id) == 9);
+
+    float fx = 0, fy = 0;
+    REQUIRE(panel.filter_box_pos(fx, fy));
+    gui.click(ImVec2(fx, fy));
+    type(gui, "udp.dstport == 1002");
+    CHECK(panel.applied_filter(id) == "udp.dstport == 1002");
+    CHECK(panel.filter_error(id).empty());
+    CHECK(panel.shown_rows(id) == 1);
+    float x = 0, y = 0;
+    REQUIRE(panel.row_pos(0, x, y));
+    CHECK_FALSE(panel.row_pos(1, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 2);  // the filtered row shows packet #3
+    REQUIRE(selects.size() == 1);
+
+    // An incomplete expression: error at its end, the previous filter stays.
+    gui.click(ImVec2(fx, fy));
+    type(gui, " and");
+    size_t pos = 0;
+    CHECK_FALSE(panel.filter_error(id, &pos).empty());
+    CHECK(pos == 23);
+    CHECK(panel.applied_filter(id) == "udp.dstport == 1002");
+    CHECK(panel.shown_rows(id) == 1);
+    type(gui, " not arp");
+    CHECK(panel.filter_error(id).empty());
+    CHECK(panel.applied_filter(id) == "udp.dstport == 1002 and not arp");
+    CHECK(panel.shown_rows(id) == 1);
+
+    // Replace the whole text.
+    select_all(gui);
+    type(gui, "tcp or arp");
+    CHECK(panel.applied_filter(id) == "tcp or arp");
+    CHECK(panel.shown_rows(id) == 3);
+    type(gui, " or ip.addr == 10.0.0.300");
+    CHECK(panel.filter_error(id).find("address") != std::string::npos);
+    CHECK(panel.shown_rows(id) == 3);
+
+    // Above filter_sync_max the filter runs on a worker: no rows until it is done.
+    panel.filter_sync_max = 0;
+    select_all(gui);
+    type(gui, "\"seq=1 ack=4\" or udp.port == 1005");
+    CHECK(panel.applied_filter(id) == "\"seq=1 ack=4\" or udp.port == 1005");
+    wait_for(gui, [&] { return panel.shown_rows(id) != SIZE_MAX; });
+    gui.frame();
+    CHECK(panel.shown_rows(id) == 2);
+    REQUIRE(panel.row_pos(1, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 8);
+    CHECK_FALSE(panel.wants_frames());
+
+    // Empty text: no filter.
+    gui.click(ImVec2(fx, fy));
+    select_all(gui);
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Delete, true);
+    gui.frame();
+    ImGui::GetIO().AddKeyEvent(ImGuiKey_Delete, false);
+    gui.frame();
+    CHECK(panel.applied_filter(id).empty());
+    CHECK(panel.shown_rows(id) == 9);
+}
+
+TEST_CASE("panels: Packets worker filter never adopts a result made for the previous index") {
+    // A worker filter run finishes unseen while the capture is re-indexed (here: after the last
+    // packets were deleted); the next draw takes the new index and restarts the filter. The old
+    // run's matches (same filter text, old packet numbers) must not be shown for the new index.
+    Gui gui;
+    std::vector<pcapfx::Bytes> frames;
+    for (int i = 0; i < 20000; ++i)
+        frames.push_back(i < 19900 ? pcapfx::udp_frame("10.0.0.1", 5000, "10.0.0.2", 53, pcapfx::str("q"))
+                                   : pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 1, 1, pcapfx::ACK));
+    const pcapfx::Bytes cap = pcapfx::pcap_file(frames);
+    auto doc = Document::create_from_bytes("cap.pcap", cap.data(), cap.size());
+    PacketsPanel panel;
+    panel.filter_sync_max = 0;  // always the worker
+    PacketsPanelCallbacks cb;
+    gui.body = [&] { panel.draw(doc.get(), {}, cb); };
+    wait_index(gui, panel);
+    const uint64_t id = doc->id();
+    float fx = 0, fy = 0;
+    REQUIRE(panel.filter_box_pos(fx, fy));
+    gui.click(ImVec2(fx, fy));
+    // Delete the last 50 packets, then in one frame: re-index and type the filter (the worker
+    // filter starts over the old index, the new index is being built).
+    const uint64_t rec = 16 + frames.back().size();
+    REQUIRE(doc->erase(doc->size() - 50 * rec, 50 * rec));
+    panel.request_index();
+    ImGui::GetIO().AddInputCharactersUTF8("tcp");
+    gui.frame();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // both workers finish unseen
+    wait_for(gui, [&] { return panel.shown_rows(id) != SIZE_MAX; });
+    CHECK(panel.applied_filter(id) == "tcp");
+    CHECK(panel.shown_rows(id) == 50);
+}
+
+TEST_CASE("panels: Packets Follow TCP Stream / Open Packet as Tab / Filter Conversation") {
+    Gui gui;
+    std::vector<pcapfx::Bytes> f;
+    using pcapfx::ACK;
+    using pcapfx::PSH;
+    using pcapfx::SYN;
+    f.push_back(pcapfx::udp_frame("10.0.0.9", 53, "10.0.0.1", 4000, pcapfx::str("dns")));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 100, 0, SYN));
+    f.push_back(pcapfx::tcp_frame("10.0.0.2", 80, "10.0.0.1", 51000, 900, 101, SYN | ACK));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 101, 901, PSH | ACK, pcapfx::str("GET /")));
+    f.push_back(pcapfx::tcp_frame("10.0.0.2", 80, "10.0.0.1", 51000, 901, 106, PSH | ACK, pcapfx::str("200 OK")));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51001, "10.0.0.2", 80, 5, 5, PSH | ACK, pcapfx::str("other")));
+    const pcapfx::Bytes cap = pcapfx::pcapng_file(f);
+    auto doc = Document::create_from_bytes("cap.pcapng", cap.data(), cap.size());
+    PacketsPanel panel;
+    std::vector<std::string> notes;
+    struct Opened {
+        std::string name;
+        std::vector<uint8_t> bytes;
+        std::vector<Bookmark> marks;
+    };
+    std::vector<Opened> opened;
+    PacketsPanelCallbacks cb;
+    cb.notify = [&](const std::string& m) { notes.push_back(m); };
+    cb.open_tab = [&](const std::string& n, const std::vector<uint8_t>& b, const std::vector<Bookmark>& m) {
+        opened.push_back(Opened{n, b, m});
+    };
+    gui.body = [&] { panel.draw(doc.get(), {}, cb); };
+    const uint64_t id = doc->id();
+
+    // Requested before the index exists, no row selected: the packet under the caret (#5), once
+    // the index is ready.
+    PcapIndexResult ix;
+    index_pcap(*doc->snapshot(), ix);
+    REQUIRE(ix.packets.size() == 6);
+    doc->view().cursor = doc->view().anchor = ix.packets[4].data_off + 20;
+    panel.request_follow_stream(true);
+    wait_for(gui, [&] { return !opened.empty(); });
+    REQUIRE(opened.size() == 1);
+    CHECK(opened[0].name == "TCP 10.0.0.1:51000 > 10.0.0.2:80 (interleaved)");
+    CHECK(std::string(opened[0].bytes.begin(), opened[0].bytes.end()) == "GET /200 OK");
+    REQUIRE(opened[0].marks.size() == 2);
+    CHECK(opened[0].marks[0].name == "#4 C>S");
+    CHECK(opened[0].marks[1].name == "#5 S>C");
+    CHECK(opened[0].marks[1].offset == 5);
+    CHECK(notes.back().find("TCP stream: 5 bytes client -> server, 6 bytes server -> client") == 0);
+    CHECK(panel.selected_packet(id) == 4);
+    CHECK_FALSE(panel.stream_running());
+    // The capture's list now shows that conversation only.
+    CHECK(panel.applied_filter(id) == "ip.addr == 10.0.0.2 and ip.addr == 10.0.0.1 and tcp.port == 80 and tcp.port == 51000");
+    gui.frame();
+    CHECK(panel.shown_rows(id) == 4);
+
+    // Sequential, from the selected row (a click on row 0 = packet #2, the SYN).
+    float x = 0, y = 0;
+    REQUIRE(panel.row_pos(0, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 1);
+    panel.request_follow_stream(false);
+    wait_for(gui, [&] { return opened.size() == 2; });
+    CHECK(opened[1].name == "TCP 10.0.0.1:51000 > 10.0.0.2:80");
+    CHECK(std::string(opened[1].bytes.begin(), opened[1].bytes.end()) == "GET /200 OK");
+
+    // Open Packet / Payload as Tab.
+    panel.request_open_packet(false);
+    gui.frame();
+    REQUIRE(opened.size() == 3);
+    CHECK(opened[2].name == "cap.pcapng #2");
+    CHECK(opened[2].bytes.size() == ix.packets[1].cap_len);
+    CHECK(opened[2].marks.empty());  // a SYN has no payload
+    REQUIRE(panel.row_pos(2, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 3);
+    panel.request_open_packet(true);
+    gui.frame();
+    REQUIRE(opened.size() == 4);
+    CHECK(opened[3].name == "cap.pcapng #4 payload");
+    CHECK(std::string(opened[3].bytes.begin(), opened[3].bytes.end()) == "GET /");
+    panel.request_open_packet(false);
+    gui.frame();
+    REQUIRE(opened.size() == 5);
+    REQUIRE(opened[4].marks.size() == 1);
+    CHECK(opened[4].marks[0].name == "TCP payload");
+    CHECK(opened[4].marks[0].offset == 14 + 20 + 20);
+    CHECK(opened[4].marks[0].length == 5);
+
+    // A UDP packet: no stream; its conversation filter uses udp ports.
+    gui.click(ImVec2(x, y));  // keeps the selection
+    panel.request_conversation_filter();
+    gui.frame();
+    CHECK(panel.applied_filter(id) == "ip.addr == 10.0.0.1 and ip.addr == 10.0.0.2 and tcp.port == 51000 and tcp.port == 80");
+    float fx = 0, fy = 0;
+    REQUIRE(panel.filter_box_pos(fx, fy));
+    gui.click(ImVec2(fx, fy));
+    select_all(gui);
+    type(gui, "udp");
+    REQUIRE(panel.shown_rows(id) == 1);
+    REQUIRE(panel.row_pos(0, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 0);
+    panel.request_follow_stream(false);
+    gui.frame();
+    gui.frame();
+    CHECK(opened.size() == 5);
+    CHECK(notes.back() == "Follow TCP Stream: packet #1 is not a TCP packet");
+    panel.request_conversation_filter();
+    gui.frame();
+    CHECK(panel.applied_filter(id) == "ip.addr == 10.0.0.9 and ip.addr == 10.0.0.1 and udp.port == 53 and udp.port == 4000");
+
+    // Not a capture: the request is dropped with a message.
+    const std::vector<uint8_t> junk(64, 0x11);
+    auto other = Document::create_from_bytes("junk.bin", junk.data(), junk.size());
+    gui.body = [&] { panel.draw(other.get(), {}, cb); };
+    panel.request_follow_stream(false);
+    gui.frame();
+    gui.frame();
+    CHECK(opened.size() == 5);
+    CHECK(notes.back().find("not a pcap") != std::string::npos);
 }
 
 // =============================================================================================

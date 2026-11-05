@@ -20,6 +20,8 @@ core_lib = static_library('hexer_core',
   'core/bitmap.cpp',         # bytes -> pixels (bitmap view)
   'core/diff.cpp',           # compare two documents
   'core/pcap.cpp',           # pcap/pcapng packet index
+  'core/pcap_filter.cpp',    # packet filter expressions (ip.src == ...)
+  'core/pcap_stream.cpp',    # TCP stream reassembly (Follow TCP Stream)
   'core/procmem.cpp',        # process memory as a byte source
   'core/devices.cpp',        # enumerate processes / disks
   'core/xorscan.cpp',        # XOR / ADD / ROL brute force
@@ -46,6 +48,7 @@ script_lib = static_library('hexer_script',
   'script/script_engine.cpp',
   'script/lua_api.cpp',
   'script/cexport.cpp',      # parse tree -> C header, opts.flags names
+  'script/parse_job.cpp',    # ParseJob: a parse on a worker thread, in a Lua state of its own
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [core_dep, disasm_dep, lua_dep],

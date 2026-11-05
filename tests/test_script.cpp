@@ -14,6 +14,9 @@
 
 #include "core/document.h"
 #include "core/os_file.h"
+#include "lauxlib.h"
+#include "lua.h"
+#include "lualib.h"
 #include "script/script_engine.h"
 
 using namespace hx;
@@ -2088,4 +2091,145 @@ TEST_CASE("hx.xor_scan and hx.xor_guess_key") {
     CHECK(fx.last_result() == "0");
     fx.eng.exec("hx.xor_guess_key(doc, 0, doc:size())");
     CHECK(fx.console_has("at most 16 MiB", ConsoleLine::Error));
+}
+
+// ---- Lua errors are C++ exceptions (Lua is compiled as C++, script/lua_onelua.cpp) -------------
+
+namespace {
+
+int g_dtors = 0;  // destructors run by the C functions below
+
+struct DtorProbe {
+    ~DtorProbe() { ++g_dtors; }
+};
+
+// Raises a Lua error while C++ objects with destructors are alive in this frame.
+int raise_with_locals(lua_State* L) {
+    DtorProbe probe;
+    const std::string s(1000, 'x');
+    const std::vector<int> v(1000, 7);
+    const auto sp = std::make_shared<DtorProbe>();
+    return luaL_error(L, "boom %d %d", int(s.size()), v[999]);
+}
+
+// Calls the Lua function at index 1 (it raises) while C++ objects are alive here.
+int call_with_locals(lua_State* L) {
+    DtorProbe probe;
+    const std::vector<std::string> names(50, "name");
+    lua_pushvalue(L, 1);
+    lua_call(L, 0, 0);
+    return 0;
+}
+
+}  // namespace
+
+TEST_CASE("Lua errors unwind C++ frames: destructors of live locals run") {
+    lua_State* L = luaL_newstate();
+    REQUIRE(L);
+    luaL_openlibs(L);
+    g_dtors = 0;
+    lua_pushcfunction(L, raise_with_locals);
+    CHECK(lua_pcall(L, 0, 0, 0) == LUA_ERRRUN);
+    CHECK(std::string(lua_tostring(L, -1)) == "boom 1000 7");
+    lua_pop(L, 1);
+    CHECK(g_dtors == 2);  // the probe and the shared_ptr's object
+
+    // From Lua code through pcall, also when the error passes a C++ frame on its way out.
+    lua_register(L, "raise_with_locals", raise_with_locals);
+    lua_register(L, "call_with_locals", call_with_locals);
+    g_dtors = 0;
+    const char* code = R"LUA(
+        local n = 0
+        for i = 1, 200 do
+            if not pcall(raise_with_locals) then n = n + 1 end
+            if not pcall(call_with_locals, function() error("inner") end) then n = n + 1 end
+            if not pcall(call_with_locals, raise_with_locals) then n = n + 1 end
+        end
+        return n
+    )LUA";
+    REQUIRE(luaL_loadstring(L, code) == LUA_OK);
+    REQUIRE(lua_pcall(L, 0, 1, 0) == LUA_OK);
+    CHECK(lua_tointeger(L, -1) == 600);
+    CHECK(g_dtors == 200 * (2 + 1 + 3));
+    lua_close(L);
+}
+
+TEST_CASE("Lua errors raised inside bindings: pcall catches them, the engine keeps working") {
+    Fixture fx;
+    fx.load(R"LUA(
+hx.parser { name = "errs", parse = function(p)
+    local bad = 0
+    if not pcall(p.u8, p, "f", { flags = { [99] = "X" } }) then bad = bad + 1 end  -- opts.flags
+    if not pcall(p.u32, p, "past_eof_" .. string.rep("x", 100)) then bad = bad + 1 end
+    if not pcall(p.bytes, p, "huge", 1 << 40) then bad = bad + 1 end
+    if not pcall(p.str, p, "long", 1 << 30) then bad = bad + 1 end
+    if not pcall(p.field, p, "f", 0, 1 << 40) then bad = bad + 1 end
+    if not pcall(p.u8, p, {}) then bad = bad + 1 end
+    p:note("bad " .. bad)
+    p:u8("ok")
+end }
+)LUA");
+    std::string data;
+    for (int i = 0; i < 64; ++i) data += char(i);
+    data[0] = 1;
+    data[1] = 2;
+    fx.host.add(data.substr(0, 2));
+    for (int round = 0; round < 3; ++round) {
+        ParseResult r = fx.eng.parse(*fx.host.active, "errs");
+        CHECK(r.error.empty());
+        CHECK(find_field(r, "ok"));
+        bool noted = false;
+        for (const Field& f : r.fields) noted |= f.name.find("bad 6") != std::string::npos ||
+                                                 f.value.find("bad 6") != std::string::npos ||
+                                                 f.comment.find("bad 6") != std::string::npos;
+        CHECK(noted);
+    }
+
+    fx.host.add(data);
+    const char* code = R"LUA(
+        local errs, n = {}, 0
+        local function bad(f, ...)
+            local ok, e = pcall(f, ...)
+            if not ok then n = n + 1; errs[#errs + 1] = tostring(e) end
+        end
+        for i = 1, 100 do
+            bad(doc.find, doc, "zz", 0, { hex = true })     -- not a hex pattern
+            bad(doc.find, doc, "")                          -- empty pattern
+            bad(doc.find, doc, "a", 0, 5)                   -- options not a table
+            bad(doc.hash, doc, "no-such-hash")
+            bad(doc.hash, doc, "sha256", -1)
+            bad(hx.hash, "no-such-hash", "abc")
+            bad(hx.disasm, "\x90\xC3", 0, "arm")
+            bad(doc.disasm, doc, 0, 4, 16)
+            bad(doc.disasm, doc, 0, 1 << 20)
+            bad(hx.xor_scan, doc, "")
+            bad(hx.xor_scan, doc, {})
+            bad(hx.xor_scan, doc, "abc", { max_key_len = 99 })
+            bad(hx.xor_guess_key, doc, 0, 4, { plain = "ab" })
+            bad(hx.unhex, "zz")
+            bad(doc.add_bookmark, doc, "x")
+            bad(doc.symbols, 42)
+        end
+        return n .. " " .. #errs[1] .. " " .. #errs[16]
+    )LUA";
+    fx.eng.exec(code);
+    const std::string res = fx.last_result();
+    CHECK(res.rfind("\"1600 ", 0) == 0);
+    CHECK(fx.errors() == 0);
+    // Everything still works afterwards.
+    fx.eng.exec("doc:find('\\5\\6\\7')");
+    CHECK(fx.last_result() == "5");
+    fx.eng.exec("doc:hash('crc32', 0, 4)");
+    CHECK(fx.last_result().size() == 10);
+    fx.eng.exec("#hx.disasm('\\x90\\xC3')");
+    CHECK(fx.last_result() == "2");
+    fx.eng.exec("#hx.xor_scan(doc, '\\5\\6\\7') > 0");
+    CHECK(fx.last_result() == "true");
+    // Unprotected errors go to the console with their message.
+    fx.eng.exec("hx.disasm('\\x90', 0, 'arm')");
+    CHECK(fx.console_has("mode must be 64 or 32", ConsoleLine::Error));
+    fx.eng.exec("doc:hash('no-such-hash')");
+    CHECK(fx.console_has("no-such-hash", ConsoleLine::Error));
+    fx.eng.exec("1 + 1");
+    CHECK(fx.last_result() == "2");
 }

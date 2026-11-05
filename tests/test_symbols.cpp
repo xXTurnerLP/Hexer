@@ -1,11 +1,19 @@
 // Symbol tables of executables (core/symbols.h): PE exports / imports, ELF symtab / PLT names.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "core/document.h"
@@ -312,4 +320,308 @@ TEST_CASE("symbols: kernel32.dll (when present)") {
     for (const Symbol& s : t.symbols) create_file |= s.label() == "KERNEL32.dll!CreateFileW";
     CHECK(create_file);
 #endif
+}
+
+// ---- rebuild avoidance, non-blocking restarts, Go to Symbol filtering -----------------------------
+
+namespace {
+
+using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+
+bool covered(const Ranges& r, uint64_t off) {
+    for (const auto& [b, e] : r)
+        if (off >= b && off < e) return true;
+    return false;
+}
+
+size_t find_bytes(const Bytes& b, const std::string& s) {
+    for (size_t i = 0; i + s.size() <= b.size(); ++i)
+        if (std::equal(s.begin(), s.end(), b.begin() + std::ptrdiff_t(i))) return i;
+    return SIZE_MAX;
+}
+
+// ELF64 ET_REL with `n` FUNC symbols "f0000001".. in .symtab / .strtab (no map needed).
+Bytes big_rel_elf(size_t n) {
+    const size_t symtab = 0x400, strtab = symtab + (n + 1) * 24;
+    Bytes b(strtab + 1 + n * 9, 0);
+    std::memcpy(b.data(), "\x7F" "ELF", 4);
+    b[4] = 2;
+    b[5] = 1;
+    put(b, 16, 1, 2);     // ET_REL
+    put(b, 18, 62, 2);
+    put(b, 40, 0x40, 8);  // shoff
+    put(b, 58, 64, 2);
+    put(b, 60, 4, 2);
+    auto sh = [&](size_t i, uint32_t type, uint64_t off, uint64_t size, uint32_t link, uint64_t entsize) {
+        const size_t at = 0x40 + i * 64;
+        put(b, at + 4, type, 4);
+        put(b, at + 24, off, 8);
+        put(b, at + 32, size, 8);
+        put(b, at + 40, link, 4);
+        put(b, at + 56, entsize, 8);
+    };
+    sh(1, 1, 0x200, 0x100, 0, 0);             // .text
+    sh(2, 2, symtab, (n + 1) * 24, 3, 24);    // .symtab
+    sh(3, 3, strtab, 1 + n * 9, 0, 0);        // .strtab
+    for (size_t i = 1; i <= n; ++i) {
+        const size_t at = symtab + i * 24, name = 1 + (i - 1) * 9;
+        put(b, at, name, 4);
+        b[at + 4] = 0x12;
+        put(b, at + 6, 1, 2);
+        put(b, at + 8, 1 + i % 0xF0, 8);
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "f%07zu", i);
+        std::memcpy(b.data() + strtab + name, nm, 8);
+    }
+    return b;
+}
+
+}  // namespace
+
+TEST_CASE("symbols: sources are the table bytes, not the code") {
+    const Bytes pe = symfix::make_pe();
+    const SymbolTable t = syms_of(pe);
+    REQUIRE_FALSE(t.sources.empty());
+    for (size_t i = 1; i < t.sources.size(); ++i) CHECK(t.sources[i - 1].second < t.sources[i].first);
+    CHECK(covered(t.sources, 0x3C));                      // e_lfanew
+    CHECK(covered(t.sources, find_bytes(pe, "Alpha")));   // an export name
+    CHECK(covered(t.sources, find_bytes(pe, "KERNEL32.dll")));
+    CHECK_FALSE(covered(t.sources, 0x200));               // .text: code only
+    CHECK_FALSE(covered(t.sources, 0x230));
+
+    const Bytes elf = symfix::make_elf();
+    const SymbolTable e = syms_of(elf);
+    CHECK(covered(e.sources, 0x900 + 1));                 // .strtab "main"
+    CHECK(covered(e.sources, 0x800 + 24));                // .symtab entry 1
+    CHECK(covered(e.sources, 0x300));                     // .plt.sec bytes (the @plt names)
+    CHECK_FALSE(covered(e.sources, 0x200));               // main's code
+    CHECK_FALSE(covered(e.sources, 0x250));
+}
+
+TEST_CASE("symbols: same_bytes compares where the bytes come from") {
+    Bytes data(256, 0);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = uint8_t(i);
+    auto d = doc_of(data);
+    const auto a = d->snapshot();
+    const uint8_t x = 0xEE;
+    REQUIRE(d->overwrite(10, &x, 1));
+    const auto b = d->snapshot();
+    CHECK(same_bytes(*a, *b, {{0, 10}, {11, 256}}));
+    CHECK_FALSE(same_bytes(*a, *b, {{0, 11}}));
+    CHECK_FALSE(same_bytes(*a, *b, {{10, 11}}));
+    CHECK(same_bytes(*a, *b, {}));
+    REQUIRE(d->insert(200, &x, 1));  // a size change: never the same
+    CHECK_FALSE(same_bytes(*a, *d->snapshot(), {{0, 5}}));
+    REQUIRE(d->undo());
+    REQUIRE(d->undo());
+    CHECK(same_bytes(*a, *d->snapshot(), {{0, 256}}));  // back to the same pieces
+    REQUIRE(d->overwrite(0, &data[0], 1));               // equal bytes, but typed: not the same
+    CHECK_FALSE(same_bytes(*a, *d->snapshot(), {{0, 1}}));
+    CHECK(same_bytes(*a, *d->snapshot(), {{1, 256}}));
+}
+
+TEST_CASE("symbols: the job keeps its table when an edit misses the tables") {
+    const Bytes pe = symfix::make_pe();
+    auto d = doc_of(pe);
+    SymbolJob job;
+    CHECK_FALSE(job.current());
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    REQUIRE(job.result());
+    CHECK(job.current());
+    CHECK(job.builds() == 1);
+    const SymbolTable* first = job.result().get();
+
+    // A code patch: nothing to rebuild, the same table is current for the new bytes.
+    const uint8_t nop = 0x90;
+    REQUIRE(d->overwrite(0x230, &nop, 1));
+    CHECK_FALSE(job.start(d->snapshot(), detect_address_map(*d)));
+    CHECK(job.current());
+    CHECK(job.builds() == 1);
+    CHECK(job.result().get() == first);
+
+    // An export name changes: rebuilt.
+    const size_t alpha = find_bytes(pe, "Alpha");
+    const uint8_t B = 'B';
+    REQUIRE(d->overwrite(alpha, &B, 1));
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    CHECK_FALSE(job.current());
+    job.wait();
+    CHECK(job.current());
+    CHECK(job.builds() == 2);
+    CHECK(find(*job.result(), "test.dll!Blpha"));
+    CHECK_FALSE(find(*job.result(), "test.dll!Alpha"));
+
+    // Undo the name (pieces differ from the table's snapshot again): rebuilt, Alpha is back.
+    REQUIRE(d->undo());
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    CHECK(find(*job.result(), "test.dll!Alpha"));
+    const uint64_t builds = job.builds();
+
+    // Another map or other limits: rebuilt. A size change (insert after every table): rebuilt.
+    CHECK(job.start(d->snapshot(), manual_address_map(*d, 0x1000)));
+    job.wait();
+    CHECK(job.result()->empty());
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    SymbolLimits lim;
+    lim.max_symbols = 2;
+    CHECK(job.start(d->snapshot(), detect_address_map(*d), lim));
+    job.wait();
+    CHECK(job.result()->truncated);
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    REQUIRE(d->insert(d->size(), &nop, 1));
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    CHECK(job.builds() == builds + 5);
+
+    // Process memory always rebuilds (its bytes change without edits).
+    AddressMap proc;
+    proc.kind = AddressMap::Process;
+    const auto snap = d->snapshot();
+    CHECK(job.start(snap, proc));
+    job.wait();
+    CHECK(job.start(snap, proc));
+    job.wait();
+    CHECK(job.builds() == builds + 7);
+}
+
+TEST_CASE("symbols: the job rebuilds after an in-place save rewrote the table bytes") {
+    namespace fs = std::filesystem;
+    const fs::path path = fs::temp_directory_path() / ("hexer_test_symbols_" + std::to_string(std::random_device{}()) + ".dll");
+    const Bytes pe = symfix::make_pe();
+    {
+        std::FILE* f = std::fopen(path.string().c_str(), "wb");
+        REQUIRE(f);
+        CHECK(std::fwrite(pe.data(), 1, pe.size(), f) == pe.size());
+        std::fclose(f);
+    }
+    {
+        std::string err;
+        auto d = Document::open_file(path.string(), &err);
+        REQUIRE_MESSAGE(d, err);
+        SymbolJob job;
+        job.start(d->snapshot(), detect_address_map(*d));
+        job.wait();
+        REQUIRE(find(*job.result(), "test.dll!Alpha"));
+        // The panel misses the edit (hidden / another tab): an export name is patched and saved in
+        // place. The pieces then name the original file again, as when the table was built, but
+        // its bytes are not the same any more.
+        const uint8_t B = 'B';
+        REQUIRE(d->overwrite(find_bytes(pe, "Alpha"), &B, 1));
+        REQUIRE_MESSAGE(d->save(nullptr, &err), err);
+        CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+        job.wait();
+        CHECK(find(*job.result(), "test.dll!Blpha"));
+        CHECK_FALSE(find(*job.result(), "test.dll!Alpha"));
+    }
+    std::error_code ec;
+    fs::remove(path, ec);
+    fs::remove(path.string() + ".backup", ec);
+}
+
+TEST_CASE("symbols: a truncated table is rebuilt after any edit") {
+    // Truncation may come from the time budget (a busy machine): never keep such a table.
+    const Bytes pe = symfix::make_pe();
+    auto d = doc_of(pe);
+    SymbolJob job;
+    SymbolLimits lim;
+    lim.max_symbols = 2;
+    job.start(d->snapshot(), detect_address_map(*d), lim);
+    job.wait();
+    REQUIRE(job.result()->truncated);
+    const uint8_t nop = 0x90;
+    REQUIRE(d->overwrite(0x230, &nop, 1));  // code only
+    CHECK(job.start(d->snapshot(), detect_address_map(*d), lim));
+    job.wait();
+    CHECK(job.builds() == 2);
+}
+
+TEST_CASE("symbols: restarts never wait for the running build") {
+    auto d = doc_of(big_rel_elf(300000));
+    const AddressMap map = detect_address_map(*d);
+    SymbolJob job;
+    // Every start() hands over a new request (an edit inside .strtab forces a rebuild) while the
+    // previous build still runs: none of them may wait for it.
+    double worst_ms = 0;
+    for (int i = 0; i < 20; ++i) {
+        const uint8_t c = uint8_t('a' + i);
+        REQUIRE(d->overwrite(d->size() - 2, &c, 1));  // the last name's last character
+        const auto snap = d->snapshot();
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(job.start(snap, map));
+        const auto t1 = std::chrono::steady_clock::now();
+        worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
+        CHECK(job.running());
+    }
+    MESSAGE("slowest SymbolJob::start() while building 300k symbols: " << worst_ms << " ms");
+    CHECK(worst_ms < 50.0);
+    job.wait();
+    CHECK_FALSE(job.running());
+    REQUIRE(job.result());
+    CHECK(job.current());
+    CHECK(job.result()->symbols.size() == 300000);
+    CHECK(find(*job.result(), "f030000t"));  // built from the last request's bytes
+    const uint8_t c = 'z';
+    REQUIRE(d->overwrite(d->size() - 2, &c, 1));
+    CHECK(job.start(d->snapshot(), map));  // destroyed while building: cancels and joins
+}
+
+TEST_CASE("symbols: Go to Symbol filtering over 1M labels") {
+    SymbolTable t;
+    t.symbols.reserve(1000000);
+    for (uint32_t i = 0; i < 1000000; ++i) {
+        Symbol s;
+        s.address = 0x10000 + uint64_t(i) * 16;
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "Func_%07u", i);
+        s.name = nm;
+        if (i % 4 == 0) s.module = "KERNEL32.dll";
+        s.kind = i % 4 == 0 ? Symbol::Import : Symbol::Function;
+        t.symbols.push_back(std::move(s));
+    }
+    t.finalize();
+    t.index_labels();
+    std::vector<uint32_t> m;
+    double worst = 0;
+    auto timed = [&](const char* f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        t.match(f, m);
+        const auto t1 = std::chrono::steady_clock::now();
+        worst = std::max(worst, std::chrono::duration<double, std::milli>(t1 - t0).count());
+    };
+    timed("");
+    CHECK(m.size() == 1000000);
+    timed("FUNC_0012345");
+    REQUIRE(m.size() == 1);
+    CHECK(t.symbols[m[0]].name == "Func_0012345");
+    timed("kernel32.dll!func_00000");
+    CHECK(m.size() == 25);  // 0000000, 0000004, ... 0000096
+    timed("_");
+    CHECK(m.size() == 1000000);
+    timed("1");
+    for (size_t k = 1; k < m.size(); ++k) CHECK(m[k - 1] < m[k]);
+    timed("zzz");
+    CHECK(m.empty());
+    timed("l!f");  // across module and name
+    CHECK(m.size() == 250000);
+    MESSAGE("Go to Symbol filter, 1M symbols: slowest keystroke " << worst << " ms");
+#if !defined(_DEBUG) && (!defined(__GNUC__) || defined(__OPTIMIZE__))
+    CHECK(worst < 100.0);  // generous: ~10 ms in an optimized build (unoptimized ones: only reported)
+#endif
+
+    // Without index_labels() (a table finalized by hand): the same answers, label by label.
+    SymbolTable u;
+    for (size_t i = 0; i < 2000; ++i) u.symbols.push_back(t.symbols[i * 97]);
+    u.finalize();
+    for (const char* f : {"", "1", "KERNEL", "l!f", "x", "\n"}) {
+        std::vector<uint32_t> slow, fast;
+        u.match(f, slow);
+        SymbolTable v = u;
+        v.index_labels();
+        v.match(f, fast);
+        CHECK(slow == fast);
+    }
 }
