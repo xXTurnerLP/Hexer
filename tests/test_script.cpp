@@ -1800,3 +1800,145 @@ end }
     CHECK(fx.console_has("70000 (0x11170)", ConsoleLine::Result));
     CHECK(r.error.find("read past end of data") != std::string::npos);  // a real EOF is still reported
 }
+
+TEST_CASE("parse at offset: relative cursor, absolute fields, range end is EOF") {
+    Fixture fx;
+    fx.load(R"LUA(
+hx.parser { name = "rel", parse = function(p, doc)
+    t0, sz, base = p:tell(), p:size(), p:base()
+    p:u16le("a")
+    p:u8("b")
+    t1, rem = p:tell(), p:remaining()
+    p:field("manual", 1, 2, "x")
+    seek_err = select(2, pcall(p.seek, p, sz + 1))
+    abs_byte = doc:u8(base + 1)
+    p:u32le("past")
+end }
+)LUA");
+    Document* d = fx.host.add(std::string("\xAA\xBB\x01\x02\x03\x04\x05\x06\x07\x08", 10));
+    ParseResult r = fx.eng.parse(*d, "rel", 2, 5);  // bytes 01 02 03 04 05
+    CHECK(fld(r, "a").offset == 2);
+    CHECK(fld(r, "a").value == "513 (0x201)");
+    CHECK(fld(r, "b").offset == 4);
+    CHECK(fld(r, "b").value == "3");
+    CHECK(fld(r, "manual").offset == 3);
+    CHECK(r.highlights.at(2) != nullptr);
+    CHECK(r.highlights.at(1) == nullptr);
+    CHECK(r.error.find("read past end of data") != std::string::npos);  // 2 bytes left, needs 4
+    CHECK_FALSE(find_field(r, "past"));
+    fx.eng.exec("string.format('%d %d %d %d %d %d', t0, sz, base, t1, rem, abs_byte)");
+    CHECK(fx.console_has("0 5 2 3 2 2", ConsoleLine::Result));
+    fx.eng.exec("seek_err");
+    CHECK(fx.console_has("seek out of range", ConsoleLine::Result));
+
+    // Length to EOF and clamping past the document end.
+    ParseResult all = fx.eng.parse(*d, "rel", 3, UINT64_MAX);
+    CHECK(all.error.empty());
+    CHECK(fld(all, "past").offset == 6);
+    ParseResult beyond = fx.eng.parse(*d, "rel", 100, 4);
+    CHECK(beyond.error.find("read past end of data") != std::string::npos);
+    // The default overload still parses from 0.
+    CHECK(fld(fx.eng.parse(*d, "rel"), "a").offset == 0);
+}
+
+TEST_CASE("parse at offset: PNG embedded in a larger buffer") {
+    Examples fx;
+    const std::string png = unhex(kPngHex);
+    const uint64_t base = 1000;
+    std::string blob = std::string(size_t(base), '\x55') + png + std::string(300, '\x66');
+    Document* d = fx.host.add(blob, "container.bin");
+    ParseResult whole = [&] {
+        Document* only = fx.host.add(png, "real.png");
+        return fx.eng.parse(*only, "PNG image");
+    }();
+    REQUIRE(whole.error.empty());
+
+    ParseResult r = fx.eng.parse(*d, "PNG image", base, png.size());
+    INFO(tree_dump(r));
+    CHECK(r.error.empty());
+    REQUIRE(r.fields.size() == whole.fields.size());
+    for (size_t i = 0; i < r.fields.size(); ++i) {
+        CHECK(r.fields[i].name == whole.fields[i].name);
+        CHECK(r.fields[i].offset == whole.fields[i].offset + base);
+        CHECK(r.fields[i].size == whole.fields[i].size);
+        CHECK(r.fields[i].comment == whole.fields[i].comment);  // e.g. "CRC OK" (doc:read is absolute)
+    }
+    CHECK(fld(r, "chunk[0].crc").comment.find("CRC OK") != std::string::npos);
+    CHECK(fld(r, "chunk[0].data.width").value == "4");
+    CHECK(fld(r, "chunk[0].data.width").offset == base + 16);
+    CHECK_FALSE(find_field(r, "trailing data"));  // the range ends at the PNG's end
+    const Highlight* h = r.highlights.at(base + 16);
+    REQUIRE(h);
+    CHECK(h->label == "chunk[0].data.width = 4");
+
+    // To EOF: the bytes after the PNG show up as trailing data at their absolute offset.
+    ParseResult tail = fx.eng.parse(*d, "PNG image", base, UINT64_MAX);
+    CHECK(fld(tail, "trailing data").offset == base + png.size());
+    CHECK(fld(tail, "trailing data").size == 300);
+
+    // Cut short: reads beyond the range raise the EOF error, the partial tree is kept.
+    ParseResult cut = fx.eng.parse(*d, "PNG image", base, 30);
+    CHECK(fld(cut, "signature").offset == base);
+    CHECK(fld(cut, "chunk[0].data (truncated)").offset == base + 16);
+}
+
+TEST_CASE("run_source: one-off scripts register parsers until the next reload") {
+    Fixture fx;
+    fx.load("hx.parser { name = 'file', parse = function(p) p:u8('a') end }");
+    std::string err;
+    REQUIRE(fx.eng.run_source("hx.parser { name = 'once', parse = function(p) p:u16be('w') end }", "C struct", &err));
+    bool found = false;
+    for (const ParserInfo& p : fx.eng.parsers()) found |= p.name == "once" && p.file == "C struct";
+    CHECK(found);
+    Document* d = fx.host.add(std::string("\x00\x01\x02\x03", 4));
+    ParseResult r = fx.eng.parse(*d, "once", 2, UINT64_MAX);
+    CHECK(fld(r, "w").value == "515 (0x203)");
+    CHECK(fld(r, "w").offset == 2);
+
+    CHECK_FALSE(fx.eng.run_source("hx.parser {", "broken", &err));
+    CHECK(err.find("broken") != std::string::npos);
+    CHECK_FALSE(fx.eng.run_source("error('boom')", "boomer", &err));
+    CHECK(err.find("boom") != std::string::npos);
+
+    fx.eng.reload();
+    for (const ParserInfo& p : fx.eng.parsers()) CHECK(p.name != "once");
+}
+
+TEST_CASE("hx.hash, hx.hash_algorithms, doc:hash") {
+    Fixture fx;
+    fx.load("");
+    fx.eng.exec("hx.hash('crc32', '123456789')");
+    CHECK(fx.last_result() == "\"cbf43926\"");
+    fx.eng.exec("hx.hash('SHA-256', 'abc')");
+    CHECK(fx.last_result() == "\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"");
+    fx.eng.exec("hx.hash('md5', '')");
+    CHECK(fx.last_result() == "\"d41d8cd98f00b204e9800998ecf8427e\"");
+    fx.eng.exec("hx.hash('nope', 'x')");
+    CHECK(fx.console_has("hx.hash: unknown algorithm 'nope'", ConsoleLine::Error));
+    fx.eng.exec("local t = hx.hash_algorithms() return #t .. ' ' .. t[1] .. ' ' .. t[#t]");
+    CHECK(fx.last_result() == "\"16 Sum-8 SHA-512\"");
+    fx.eng.exec("local ok = true for _, n in ipairs(hx.hash_algorithms()) do ok = ok and #hx.hash(n, 'x') > 0 end return ok");
+    CHECK(fx.last_result() == "true");
+
+    fx.host.add("xx123456789yy");
+    fx.eng.exec("doc:hash('CRC-32', 2, 9)");
+    CHECK(fx.last_result() == "\"cbf43926\"");
+    fx.eng.exec("doc:hash('crc32') == hx.hash('crc32', 'xx123456789yy')");  // default: whole doc
+    CHECK(fx.last_result() == "true");
+    fx.eng.exec("doc:hash('crc32', 2) == hx.hash('crc32', '123456789yy')");  // to EOF
+    CHECK(fx.last_result() == "true");
+    fx.eng.exec("doc:hash('crc32', 11, 100) == hx.hash('crc32', 'yy')");  // clamped
+    CHECK(fx.last_result() == "true");
+    fx.eng.exec("doc:hash('md5', 99, 5)");
+    CHECK(fx.last_result() == "\"d41d8cd98f00b204e9800998ecf8427e\"");
+    fx.eng.exec("doc:hash('bogus', 0, 1)");
+    CHECK(fx.console_has("doc:hash:", ConsoleLine::Error));
+    // Bounded: a long range is refused (it would block the UI thread).
+    Document* big = fx.host.add(std::string(1, 'z'));
+    std::vector<uint8_t> chunk(1 << 20, 0xAB);
+    for (int i = 0; i < 257; ++i) REQUIRE(big->insert(big->size(), chunk.data(), chunk.size()));
+    fx.eng.exec("doc:hash('crc32', 0, doc:size())");
+    CHECK(fx.console_has("at most 256 MiB", ConsoleLine::Error));
+    fx.eng.exec("#doc:hash('sha1', 0, 256 * 1024 * 1024)");
+    CHECK(fx.last_result() == "40 (0x28)");
+}

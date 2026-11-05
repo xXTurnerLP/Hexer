@@ -135,7 +135,7 @@ hx.parser {
                 local crc = p:u32("crc", { fmt = "hex" })
                 -- Verify the CRC for chunks of reasonable size (doc:read is cheap; hx.crc32 is native).
                 if len <= 16 * 1024 * 1024 then
-                    local actual = hx.crc32(doc:read(data_start - 4, len + 4))
+                    local actual = hx.crc32(doc:read(p:base() + data_start - 4, len + 4))  -- doc:* is absolute
                     if actual == crc then
                         p:note("CRC OK")
                     else

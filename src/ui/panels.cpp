@@ -1,4 +1,5 @@
-// Dockable panels: Inspector, Structure, Console, Search Results, Bookmarks + the status bar.
+// Dockable panels: Inspector, Structure, Console, Search Results, Bookmarks, Strings, Hashes + the
+// status bar.
 // Each panel reads the active tab through App helpers and never touches a busy (saving) document.
 #include "ui/panels.h"
 
@@ -13,8 +14,10 @@
 #include "imgui_internal.h"
 #include "misc/cpp/imgui_stdlib.h"
 
+#include "core/hash.h"
 #include "core/highlight.h"
 #include "core/inspector.h"
+#include "core/nav.h"
 #include "core/util.h"
 #include "ui/app_internal.h"
 #include "ui/hex_view.h"
@@ -88,6 +91,30 @@ void draw_swatch(uint32_t color) {
     ImGui::SameLine();
 }
 
+// A small "->" button at the right end of the current table cell. Returns true when clicked.
+bool follow_button(bool enabled, const std::string& tooltip) {
+    const char* arrow = "\xE2\x86\x92";  // U+2192
+    const float bw = ImGui::CalcTextSize(arrow).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    ImGui::SameLine();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (avail > bw) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - bw);
+    ImGui::BeginDisabled(!enabled);
+    const bool clicked = ImGui::SmallButton(arrow);
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("%s", tooltip.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !enabled) ImGui::SetTooltip("%s", tooltip.c_str());
+    return clicked && enabled;
+}
+
+// Tooltip / target of following the `width`-byte pointer at `at`.
+std::string follow_tip(App& app, const Document& d, uint64_t at, int width, bool be, bool& ok) {
+    uint64_t target = 0;
+    ok = decode_pointer(d, at, width, be, app.settings.pointer_base, target);
+    std::string base = app.settings.pointer_base ? " - base " + fmt_offset(app.settings.pointer_base) : std::string();
+    return ok ? "Follow pointer" + base + " \xE2\x86\x92 " + fmt_offset(target) + "  (Alt+Left goes back)"
+              : "Cannot follow: the value" + base + " points beyond EOF";
+}
+
 std::string hex_preview(const uint8_t* data, size_t n) {
     std::string s;
     s.reserve(n * 3);
@@ -129,7 +156,7 @@ void commit_inspector_edit(App& app, Document& d, const InspRow& r, bool be) {
                         fmt_offset(at));
 }
 
-void draw_inspector_row(App& app, Document& d, const InspRow& r, int i, bool be) {
+void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, bool be) {
     const uint64_t cur = focus_offset(d.view());
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
@@ -165,6 +192,12 @@ void draw_inspector_row(App& app, Document& d, const InspRow& r, int i, bool be)
         else
             ImGui::TextUnformatted(value);
         ImGui::PopFont();
+        const int width = r.type == InspType::U32 ? 4 : r.type == InspType::U64 ? 8 : 0;
+        if (width && r.size) {
+            bool ok = false;
+            const std::string tip = follow_tip(app, d, cur, width, be, ok);
+            if (follow_button(ok, tip)) follow_pointer(app, t, cur, width, be);
+        }
     }
     ImGui::PopID();
 }
@@ -212,6 +245,7 @@ void draw_inspector_panel(App& app) {
     // Enter edits the selected row when the panel has focus (and no text field is active).
     if (app.insp_sel >= 0 && app.insp_sel < int(rows.size()) && app.insp_edit.row < 0 &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !ImGui::GetIO().WantTextInput &&
+        !ImGui::GetIO().KeyCtrl &&  // Ctrl+Enter = Follow Pointer at Cursor
         (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
         const InspRow& r = rows[size_t(app.insp_sel)];
         if (r.editable && !d->read_only()) app.insp_edit.begin(app.insp_sel, at, r.value);
@@ -227,7 +261,7 @@ void draw_inspector_panel(App& app) {
         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 96.0f * app.ui_scale);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
-        for (size_t i = 0; i < rows.size(); ++i) draw_inspector_row(app, *d, rows[i], int(i), be);
+        for (size_t i = 0; i < rows.size(); ++i) draw_inspector_row(app, *active_tab(app), *d, rows[i], int(i), be);
         ImGui::EndTable();
     }
     ImGui::Separator();
@@ -255,9 +289,10 @@ void run_parse(App& app, Tab& t) {
         st.result = ParseResult{};
         st.has_result = false;
     } else {
-        st.result = app.engine->parse(d, name);
+        st.result = st.base ? app.engine->parse(d, name, st.base, UINT64_MAX) : app.engine->parse(d, name);
         st.has_result = true;
     }
+    st.parsed_base = st.base;
     st.used_parser = name;
     st.last_parse_ms = (now_s() - t0) * 1000.0;
     st.slow = st.has_result && (st.last_parse_ms > kAutoParseBudgetMs || st.result.truncated);
@@ -350,6 +385,36 @@ void draw_parser_combo(App& app, Tab& t, Document& d) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run the parser again (F5)");
 }
 
+// "Parse at [offset] [Cursor] [File start]": where the parser starts (e.g. a PNG inside a dump).
+void draw_parse_base(App& app, Tab& t, Document& d) {
+    StructureState& st = t.st;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Parse at");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.0f * app.ui_scale);
+    const bool enter = ImGui::InputTextWithHint("##base", "0 (file start)", &st.base_input,
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemDeactivated() && !enter) st.base_input = st.base ? fmt_offset(st.base) : std::string();
+    ImGui::SetItemTooltip("Offset to parse from, like Go to: 0x1F00, #1234, cur, end-0x100 (Enter applies)");
+    if (enter) {
+        uint64_t v = 0;
+        std::string err;
+        if (st.base_input.empty())
+            set_parse_base(app, t, 0);
+        else if (parse_offset(st.base_input, d.view().cursor, d.size(), app.settings.goto_default_hex, v, &err))
+            set_parse_base(app, t, v);
+        else
+            set_status(app, "Parse at: " + (err.empty() ? std::string("invalid offset") : err));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cursor")) set_parse_base(app, t, focus_offset(d.view()));
+    ImGui::SetItemTooltip("Parse from the cursor / selection start");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(st.base == 0);
+    if (ImGui::Button("File start")) set_parse_base(app, t, 0);
+    ImGui::EndDisabled();
+}
+
 void draw_parse_info(App& app, StructureState& st, const Document& d) {
     if (!st.has_result) {
         if (st.gen == UINT64_MAX)
@@ -360,7 +425,11 @@ void draw_parse_info(App& app, StructureState& st, const Document& d) {
         return;
     }
     const ParseResult& r = st.result;
-    ImGui::TextDisabled("%zu fields  \xC2\xB7  %.1f ms", r.fields.size(), r.ms);
+    if (st.parsed_base)
+        ImGui::TextDisabled("%s @ %s  \xC2\xB7  %zu fields  \xC2\xB7  %.1f ms", r.parser.c_str(),
+                            fmt_offset(st.parsed_base).c_str(), r.fields.size(), r.ms);
+    else
+        ImGui::TextDisabled("%zu fields  \xC2\xB7  %.1f ms", r.fields.size(), r.ms);
     if (st.slow && st.gen != d.generation()) {
         ImGui::SameLine();
         ImGui::TextColored(kWarnColor, "(stale: press F5 to re-parse)");
@@ -398,6 +467,30 @@ bool commit_field_edit(App& app, Document& d, const Field& f) {
     return true;
 }
 
+// Width (1, 2, 4, 8) and byte order of an integer field from its pack format ("<I4", ">H", "B"...);
+// 0 for anything else (floats, strings, structs, 3-byte ints).
+int int_field_width(const Field& f, bool& be) {
+    const std::string& p = f.pack;
+    size_t i = 0;
+    be = false;
+    if (i < p.size() && (p[i] == '<' || p[i] == '>' || p[i] == '=')) be = p[i++] == '>';
+    if (i >= p.size()) return 0;
+    int w = 0;
+    switch (p[i++]) {
+        case 'b': case 'B': w = 1; break;
+        case 'h': case 'H': w = 2; break;
+        case 'j': case 'J': w = 8; break;
+        case 'i': case 'I':
+            w = 0;
+            while (i < p.size() && p[i] >= '0' && p[i] <= '9' && w < 100) w = w * 10 + (p[i++] - '0');
+            if (w == 0) w = 4;
+            break;
+        default: return 0;
+    }
+    if (i != p.size() || uint64_t(w) != f.size || (w != 1 && w != 2 && w != 4 && w != 8)) return 0;
+    return w;
+}
+
 // Returns whether the row is visible (taken from the name cell: the last cell may be in a hidden column).
 bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     StructureState& st = t.st;
@@ -406,6 +499,8 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     const bool leaf = f.children.empty();
     // A stale result (content changed, not re-parsed yet) has stale offsets: no field edits.
     const bool can_edit = f.editable() && !d.read_only() && st.gen == d.generation();
+    bool ptr_be = false;
+    const int ptr_w = int_field_width(f, ptr_be);
     ImGui::TableNextRow();
     if (fi == hover_field && fi != st.cursor_field)
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, ImGui::GetColorU32(ImGuiCol_HeaderHovered, 0.45f));
@@ -448,6 +543,11 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
         if (ImGui::MenuItem("Copy value")) ImGui::SetClipboardText(f.value.c_str());
         if (ImGui::MenuItem("Copy name")) ImGui::SetClipboardText(f.name.c_str());
         if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(f.offset).c_str());
+        if (ptr_w) {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Follow as pointer", nullptr, false, st.gen == d.generation()))
+                follow_pointer(app, t, f.offset, ptr_w, ptr_be);
+        }
         close_popup_on_escape();
         ImGui::EndPopup();
     }
@@ -464,6 +564,12 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     } else {
         draw_swatch(f.color);
         ImGui::TextUnformatted(f.value.c_str());
+        // 32/64-bit integers that point inside the file get a follow button (any width: context menu).
+        if ((ptr_w == 4 || ptr_w == 8) && st.gen == d.generation()) {
+            bool ok = false;
+            const std::string tip = follow_tip(app, d, f.offset, ptr_w, ptr_be, ok);
+            if (ok && follow_button(true, tip)) follow_pointer(app, t, f.offset, ptr_w, ptr_be);
+        }
     }
     ImGui::PushFont(app.fonts.mono, 0.0f);
     ImGui::TableSetColumnIndex(2);
@@ -544,7 +650,7 @@ void update_structure(App& app, Tab& t) {
     const uint64_t gen = d.generation();
     const uint64_t rel = app.engine->reload_count();
     const std::string& want = d.view().parser;
-    if (gen == st.gen && rel == st.reload && want == st.requested) {
+    if (gen == st.gen && rel == st.reload && want == st.requested && st.base == st.parsed_base) {
         st.due = 0.0;
         return;
     }
@@ -566,6 +672,26 @@ void update_structure(App& app, Tab& t) {
     if (now >= st.due) run_parse(app, t);
 }
 
+void set_parse_base(App& app, Tab& t, uint64_t base) {
+    StructureState& st = t.st;
+    Document& d = *t.doc;
+    if (d.busy()) return;
+    base = std::min(base, d.size());
+    st.base = base;
+    st.base_input = base ? fmt_offset(base) : std::string();
+    // detect() looks at the file start: keep the parser that is shown now.
+    if (base && d.view().parser.empty() && !st.used_parser.empty()) {
+        d.view().parser = st.used_parser;
+        d.view_generation++;
+    }
+    st.gen = UINT64_MAX;  // re-parse now
+    st.pending_gen = UINT64_MAX - 1;
+    if (base && d.view().parser.empty())
+        set_status(app, "Parse at " + fmt_offset(base) + ": pick a parser in the Structure panel");
+    else
+        set_status(app, base ? "Parsing from " + fmt_offset(base) : std::string("Parsing from the file start"), 3.0);
+}
+
 void draw_structure_panel(App& app) {
     if (!begin_panel(kWinStructure, &app.show_structure)) return;
     Tab* t = active_tab(app);
@@ -576,6 +702,7 @@ void draw_structure_panel(App& app) {
         return;
     }
     draw_parser_combo(app, *t, *d);
+    draw_parse_base(app, *t, *d);
     draw_parse_info(app, t->st, *d);
     if (t->st.has_result && !t->st.result.fields.empty()) draw_field_table(app, *t, *d);
     ImGui::End();
@@ -991,6 +1118,63 @@ void draw_bookmarks_panel(App& app) {
 }
 
 // =============================================================================================
+// Strings / Hashes (self-contained panels, ui/panel_strings.h / ui/panel_hash.h)
+// =============================================================================================
+
+namespace {
+
+// A panel added after the user's layout.ini was written docks into `like`'s node on first use.
+void dock_like(const char* like) {
+    if (ImGuiWindow* w = ImGui::FindWindowByName(like); w && w->DockId)
+        ImGui::SetNextWindowDockID(w->DockId, ImGuiCond_FirstUseEver);
+}
+
+}  // namespace
+
+void draw_strings_panel(App& app) {
+    dock_like(kWinConsole);
+    if (!begin_panel(kWinStrings, &app.show_strings)) return;
+    Tab* t = active_tab(app);
+    StringsPanel& sp = app.strings_panel;
+    sp.mono = app.fonts.mono;
+    sp.ui_scale = app.ui_scale;
+    StringsPanelCallbacks cb;
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    cb.jump = [&app, doc_id](uint64_t off, uint64_t len) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, len, false);
+    };
+    cb.copy = [&app](const std::string& s) {
+        ImGui::SetClipboardText(s.c_str());
+        set_status(app, "Copied " + std::to_string(s.size()) + " characters");
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    sp.draw(t ? t->doc.get() : nullptr, cb);  // a busy document is shown but not rescanned
+    if (sp.wants_frames()) app.wants_poll = true;
+    ImGui::End();
+}
+
+void draw_hash_panel(App& app) {
+    dock_like(kWinInspector);
+    HashPanelCallbacks cb;
+    cb.status = [&app](const std::string& m) { set_status(app, m); };
+    HashPanel& hp = app.hash_panel;
+    hp.draw(kWinHashes, &app.show_hashes, usable_doc(app), app.fonts.mono, app.ui_scale, cb);
+    if (hp.wants_frames()) app.wants_poll = true;
+    // Remember the algorithm choice ("-" = none, "" = the defaults, so an untouched choice is not
+    // written to settings.ini and follows future defaults).
+    std::string names, defaults;
+    for (const std::string& n : hp.selected()) names += (names.empty() ? "" : ",") + n;
+    for (const HashAlgorithm& a : hash_algorithms())
+        if (a.is_default) defaults += (defaults.empty() ? "" : ",") + std::string(a.name);
+    if (names == defaults) names.clear();
+    else if (names.empty()) names = "-";
+    if (names != app.settings.hash_algorithms) {
+        app.settings.hash_algorithms = names;
+        mark_settings_dirty(app);
+    }
+}
+
+// =============================================================================================
 // Status bar
 // =============================================================================================
 
@@ -1052,7 +1236,10 @@ void draw_doc_status(App& app, Tab& t) {
     }
     if (!t.st.used_parser.empty()) {
         status_sep();
-        ImGui::Text("Parser: %s", t.st.used_parser.c_str());
+        if (t.st.parsed_base)
+            ImGui::Text("Parser: %s @ %s", t.st.used_parser.c_str(), fmt_offset(t.st.parsed_base).c_str());
+        else
+            ImGui::Text("Parser: %s", t.st.used_parser.c_str());
     }
 }
 

@@ -25,6 +25,7 @@
 #include "nfd.h"
 
 #include "core/highlight.h"
+#include "core/nav.h"
 #include "core/os_file.h"
 #include "core/util.h"
 #include "ui/app_internal.h"
@@ -200,9 +201,15 @@ void report_edit_failure(App& app, const Document& doc) {
         set_status(app, "Edit rejected (out of range)");
 }
 
-void reveal_range(App& app, Tab& tab, uint64_t offset, uint64_t len, bool focus_view) {
+// The position a jump leaves (and Back / Forward restore): selection start + length.
+static NavEntry nav_here(const Document& d) {
+    const ViewState& v = d.view();
+    return {v.sel_begin(), v.sel_len()};
+}
+
+// reveal_range without the history: select [offset, offset+len) (clamped), caret at `offset`.
+static void select_range(Tab& tab, uint64_t offset, uint64_t len, bool focus_view) {
     Document& d = *tab.doc;
-    if (d.busy()) return;
     const uint64_t size = d.size();
     offset = std::min(offset, size);
     uint64_t end = (len > size - offset) ? size : offset + len;
@@ -213,8 +220,52 @@ void reveal_range(App& app, Tab& tab, uint64_t offset, uint64_t len, bool focus_
     d.view_generation++;
     tab.view.request_scroll_to(offset, true);
     if (focus_view) tab.view.request_focus();
+}
+
+void reveal_range(App& app, Tab& tab, uint64_t offset, uint64_t len, bool focus_view) {
+    Document& d = *tab.doc;
+    if (d.busy()) return;
+    const NavEntry from = nav_here(d);
+    select_range(tab, offset, len, focus_view);
+    if (nav_here(d) != from) tab.nav.push(from);
     int idx = tab_index(app, &tab);
     if (idx >= 0 && idx != app.active) app.select_request = idx;
+}
+
+static std::string pointer_desc(const App& app, int width, bool big_endian) {
+    std::string s = "u" + std::to_string(width * 8) + (width > 1 ? (big_endian ? " BE" : " LE") : "");
+    if (app.settings.pointer_base) s += ", base " + fmt_offset(app.settings.pointer_base);
+    return s;
+}
+
+bool follow_pointer(App& app, Tab& tab, uint64_t at, int width, bool big_endian) {
+    Document& d = *tab.doc;
+    if (d.busy()) return false;
+    uint64_t target = 0;
+    if (!decode_pointer(d, at, width, big_endian, app.settings.pointer_base, target)) {
+        set_status(app, "No pointer to follow at " + fmt_offset(at) + " (" + pointer_desc(app, width, big_endian) +
+                            "): unreadable, below the base or beyond EOF");
+        return false;
+    }
+    reveal_range(app, tab, target, 0, true);
+    set_status(app, "Followed " + pointer_desc(app, width, big_endian) + " at " + fmt_offset(at) + " -> " +
+                        fmt_offset(target) + "  (Alt+Left goes back)", 6.0);
+    return true;
+}
+
+// Back / Forward through the tab's jump history.
+static void navigate(App& app, Tab& t, bool forward) {
+    Document& d = *t.doc;
+    if (d.busy()) return;
+    if (forward ? !t.nav.can_forward() : !t.nav.can_back()) {
+        set_status(app, forward ? "No later position in the jump history" : "No earlier position in the jump history");
+        return;
+    }
+    const NavEntry cur = nav_here(d);
+    const NavEntry e = forward ? t.nav.forward(cur) : t.nav.back(cur);
+    select_range(t, e.offset, e.length, true);
+    set_status(app, std::string(forward ? "Forward to " : "Back to ") +
+                        (e.length ? fmt_range(e.offset, e.length) : fmt_offset(e.offset)));
 }
 
 void InlineEdit::begin(int r, uint64_t c, std::string text) {
@@ -270,6 +321,7 @@ void close_tab_now(App& app, int index) {
     std::unique_ptr<Tab> t = std::move(app.tabs[size_t(index)]);
     app.tabs.erase(app.tabs.begin() + index);
     t->ev = HexViewEvents{};
+    app.strings_panel.forget(t->doc->id());  // results are cheap to rescan; free the memory now
     app.closed.push_back(std::move(t));  // keeps the Document: edits + history come back on reopen
     if (app.closed.size() > kMaxClosedTabs) app.closed.erase(app.closed.begin());
     app.insp_edit.end();
@@ -1046,10 +1098,66 @@ bool has_file(App& a) {
     return d && d->has_path();
 }
 bool idle(App& a) { return !a.save.running; }
+bool can_back(App& a) {
+    Tab* t = active_tab(a);
+    return usable_doc(a) && t->nav.can_back();
+}
+bool can_forward(App& a) {
+    Tab* t = active_tab(a);
+    return usable_doc(a) && t->nav.can_forward();
+}
+
+// C struct "Apply at cursor": load the generated source into the running engine (it stays until the
+// next script reload) and parse the active document from the cursor with it.
+bool apply_parser_at_cursor(App& app, const std::string& lua, const std::string& name, std::string* err) {
+    Tab* t = active_tab(app);
+    Document* d = usable_doc(app);
+    if (!d || app.save.running) {
+        if (err) *err = !t ? "Open a document first" : "Wait for the save to finish";
+        return false;
+    }
+    if (!app.engine->run_source(lua, "C struct: " + name, err)) return false;
+    d->view().parser = name;
+    d->view_generation++;
+    set_parse_base(app, *t, focus_offset(d->view()));
+    app.show_structure = app.focus_structure = true;
+    return true;
+}
+
+// The same from the palette, with the dialog's current definitions (also while it is closed).
+void apply_cstruct_at_cursor(App& a) {
+    CStructDialog& c = a.cstruct_dlg;
+    c.regenerate();
+    std::string err;
+    if (!c.error().empty())
+        set_status(a, "C struct: " + c.error(), 8.0);
+    else if (!apply_parser_at_cursor(a, c.lua(), c.options.name, &err))
+        set_status(a, "C struct: " + err, 8.0);
+}
+
+void follow_at_cursor(App& a) {
+    Tab* t = active_tab(a);
+    Document* d = usable_doc(a);
+    if (!d) return;
+    follow_pointer(a, *t, focus_offset(d->view()), a.settings.pointer_width, a.settings.big_endian_inspector);
+}
+
+void show_strings(App& a) { a.show_strings = a.focus_strings = true; }
+void show_hashes(App& a) { a.show_hashes = a.focus_hashes = true; }
+
+// Structure panel: parse from the cursor (with the chosen / detected parser).
+void parse_at_cursor(App& a) {
+    Tab* t = active_tab(a);
+    Document* d = usable_doc(a);
+    if (!d) return;
+    set_parse_base(a, *t, focus_offset(d->view()));
+    a.show_structure = a.focus_structure = true;
+}
 
 constexpr ImGuiKeyChord C(ImGuiKeyChord k) { return ImGuiMod_Ctrl | k; }
 constexpr ImGuiKeyChord CS(ImGuiKeyChord k) { return ImGuiMod_Ctrl | ImGuiMod_Shift | k; }
 constexpr ImGuiKeyChord S(ImGuiKeyChord k) { return ImGuiMod_Shift | k; }
+constexpr ImGuiKeyChord A(ImGuiKeyChord k) { return ImGuiMod_Alt | k; }
 
 const Action kActions[] = {
     // File
@@ -1091,6 +1199,10 @@ const Action kActions[] = {
      }, nullptr, true, false},
     {"Next Tab", {C(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, +1); }, nullptr, true, true},
     {"Previous Tab", {CS(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, -1); }, nullptr, true, true},
+    // Jump history (also the mouse back / forward buttons over the hex view)
+    {"Navigate Back", {A(ImGuiKey_LeftArrow), 0}, [](App& a) { navigate(a, *active_tab(a), false); }, can_back, false, true},
+    {"Navigate Forward", {A(ImGuiKey_RightArrow), 0}, [](App& a) { navigate(a, *active_tab(a), true); }, can_forward, false, true},
+    {"Follow Pointer at Cursor", {C(ImGuiKey_Enter), C(ImGuiKey_KeypadEnter)}, follow_at_cursor, has_doc, false, false},
     // View
     // "+" is Shift+= on US layouts and keeps the US "]" key code on e.g. German ones (GLFW backend).
     {"Zoom In", {C(ImGuiKey_Equal), C(ImGuiKey_KeypadAdd), CS(ImGuiKey_Equal), C(ImGuiKey_RightBracket)}, [](App& a) { zoom(a, +1.0f); }, nullptr, true, true},
@@ -1102,12 +1214,34 @@ const Action kActions[] = {
     {"Toggle Console", {0, 0}, [](App& a) { a.show_console = !a.show_console; }, nullptr, true, false},
     {"Toggle Search Results", {0, 0}, [](App& a) { a.show_results = !a.show_results; }, nullptr, true, false},
     {"Toggle Bookmarks", {0, 0}, [](App& a) { a.show_bookmarks = !a.show_bookmarks; }, nullptr, true, false},
+    {"Toggle Strings", {0, 0}, [](App& a) { a.show_strings = !a.show_strings; }, nullptr, true, false},
+    {"Toggle Hashes", {0, 0}, [](App& a) { a.show_hashes = !a.show_hashes; }, nullptr, true, false},
     {"Reset Layout", {0, 0}, [](App& a) {
          a.build_layout = true;
          a.show_inspector = a.show_structure = a.show_console = a.show_results = a.show_bookmarks = true;
+         a.show_strings = a.show_hashes = true;
      }, nullptr, true, false},
+    // Analysis panels
+    {"Strings: Scan File", {0, 0}, [](App& a) { show_strings(a); a.strings_panel.request_scan(false); }, has_doc, true, false},
+    {"Strings: Scan Selection", {0, 0}, [](App& a) { show_strings(a); a.strings_panel.request_scan(true); }, has_selection, true, false},
+    {"Hash Selection", {0, 0}, [](App& a) {  // the whole file when nothing is selected
+         show_hashes(a);
+         a.hash_panel.whole_file = false;
+         a.hash_panel.request_compute();
+     }, has_doc, true, false},
+    {"Hash File", {0, 0}, [](App& a) {
+         show_hashes(a);
+         a.hash_panel.whole_file = true;
+         a.hash_panel.request_compute();
+     }, has_doc, true, false},
     // Scripts
     {"Reparse Structure", {ImGuiKey_F5, 0}, [](App& a) { force_reparse(a); }, has_doc, true, false},
+    {"Structure: Parse at Cursor", {0, 0}, parse_at_cursor, has_doc, true, false},
+    {"Structure: Parse from File Start", {0, 0}, [](App& a) {
+         if (Tab* t = active_tab(a); t && usable_doc(a)) set_parse_base(a, *t, 0);
+     }, [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && t->st.base != 0; }, true, false},
+    {"New Parser from C Struct...", {0, 0}, [](App& a) { a.cstruct_dlg.open(); }, nullptr, true, false},
+    {"C Struct: Apply at Cursor", {0, 0}, apply_cstruct_at_cursor, has_doc, true, false},
     {"Reload Scripts", {0, 0}, [](App& a) { a.engine->reload(); set_status(a, "Scripts reloaded"); }, idle, true, false},
     {"Open Scripts Folder", {0, 0}, [](App&) { os_reveal_in_file_manager(paths::user_scripts_dir()); }, nullptr, true, false},
     {"Clear Console", {0, 0}, [](App& a) { a.engine->clear_console(); }, nullptr, true, false},
@@ -1203,6 +1337,42 @@ void close_popup_on_escape() {
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
 }
 
+// Follow pointer settings, shared by the Search menu and the Settings window. True on change.
+bool pointer_settings(App& app, bool in_menu) {
+    Settings& s = app.settings;
+    bool changed = false;
+    if (in_menu) {
+        if (ImGui::BeginMenu("Pointer Width")) {
+            for (int w : {1, 2, 4, 8}) {
+                const std::string label = std::to_string(w) + (w == 1 ? " byte" : " bytes") + " (u" + std::to_string(w * 8) + ")";
+                if (ImGui::MenuItem(label.c_str(), nullptr, s.pointer_width == w)) {
+                    changed |= s.pointer_width != w;
+                    s.pointer_width = w;
+                }
+            }
+            ImGui::EndMenu();
+        }
+        changed |= ImGui::MenuItem("Big Endian (same as the Inspector)", nullptr, &s.big_endian_inspector);
+    } else {
+        ImGui::SetNextItemWidth(200.0f * app.ui_scale);
+        if (ImGui::BeginCombo("Pointer width", (std::to_string(s.pointer_width * 8) + " bit").c_str())) {
+            for (int w : {1, 2, 4, 8})
+                if (ImGui::Selectable((std::to_string(w * 8) + " bit").c_str(), s.pointer_width == w)) {
+                    changed |= s.pointer_width != w;
+                    s.pointer_width = w;
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(byte order: the Inspector's, %s)", s.big_endian_inspector ? "BE" : "LE");
+    }
+    ImGui::SetNextItemWidth((in_menu ? 140.0f : 200.0f) * app.ui_scale);
+    changed |= ImGui::InputScalar("Pointer base (hex)", ImGuiDataType_U64, &s.pointer_base, nullptr, nullptr, "%llX",
+                                  ImGuiInputTextFlags_CharsHexadecimal);
+    ImGui::SetItemTooltip("Subtracted from the value: target offset = value - base (e.g. the load address of an image)");
+    return changed;
+}
+
 void draw_edit_menu(App& app) {
     Document* d = usable_doc(app);
     std::string undo = "Undo", redo = "Redo";
@@ -1268,6 +1438,8 @@ void draw_view_menu(App& app) {
     ImGui::MenuItem(kWinConsole, nullptr, &app.show_console);
     ImGui::MenuItem(kWinResults, nullptr, &app.show_results);
     ImGui::MenuItem(kWinBookmarks, nullptr, &app.show_bookmarks);
+    ImGui::MenuItem(kWinStrings, nullptr, &app.show_strings);
+    ImGui::MenuItem(kWinHashes, nullptr, &app.show_hashes);
     ImGui::Separator();
     menu_action(app, "Command Palette");
     ImGui::Separator();
@@ -1312,6 +1484,10 @@ void draw_view_menu(App& app) {
 
 void draw_scripts_menu(App& app) {
     menu_action(app, "Reparse Structure");
+    menu_action(app, "Structure: Parse at Cursor", "Parse at Cursor");
+    menu_action(app, "Structure: Parse from File Start", "Parse from File Start");
+    ImGui::Separator();
+    menu_action(app, "New Parser from C Struct...");
     menu_action(app, "Reload Scripts");
     menu_action(app, "Open Scripts Folder");
     const auto& cmds = app.engine->commands();
@@ -1326,6 +1502,18 @@ void draw_scripts_menu(App& app) {
             ImGui::SetTooltip("%s", c.description.c_str());
     }
     if (!run.empty()) app.engine->run_command(run);
+}
+
+void draw_navigate_items(App& app) {
+    menu_action(app, "Navigate Back", "Back");
+    menu_action(app, "Navigate Forward", "Forward");
+    menu_action(app, "Follow Pointer at Cursor");
+    if (ImGui::BeginMenu("Follow Pointer Settings")) {
+        if (pointer_settings(app, true)) mark_settings_dirty(app);
+        ImGui::Separator();
+        ImGui::TextDisabled("Ctrl+hover a byte to preview the target, Ctrl+click to follow it");
+        ImGui::EndMenu();
+    }
 }
 
 void draw_main_menu(App& app) {
@@ -1356,6 +1544,8 @@ void draw_main_menu(App& app) {
         menu_action(app, "Find All");
         ImGui::Separator();
         menu_action(app, "Go to Offset...");
+        ImGui::Separator();
+        draw_navigate_items(app);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Bookmarks")) {
@@ -1568,6 +1758,9 @@ HexViewConfig make_view_config(App& app, const Tab& t) {
     // Whole pixels: a fractional size (e.g. 16 px at 125 %) would rasterise blurrier glyphs.
     cfg.font_size = std::round(app.settings.font_size * app.ui_scale);
     if (!t.hits.offsets.empty()) cfg.tick_offsets = &t.hits.offsets;
+    cfg.pointer_width = app.settings.pointer_width;
+    cfg.pointer_big_endian = app.settings.big_endian_inspector;  // follows the Inspector's LE / BE
+    cfg.pointer_base = app.settings.pointer_base;
     return cfg;
 }
 
@@ -1587,6 +1780,11 @@ void draw_hex_context_menu(App& app) {
     menu_action(app, "Toggle Bookmark");
     menu_action(app, "Go to Offset...");
     menu_action(app, "Find...");
+    ImGui::Separator();
+    menu_action(app, "Follow Pointer at Cursor");
+    menu_action(app, "Navigate Back", "Back");
+    menu_action(app, "Navigate Forward", "Forward");
+    menu_action(app, "Structure: Parse at Cursor", "Parse Structure Here");
     close_popup_on_escape();
     ImGui::EndPopup();
 }
@@ -1611,6 +1809,14 @@ void draw_hex_view(App& app, Tab& t) {
         t.last_top_row = d.view().top_row;
         d.view_generation++;
     }
+    if (t.ev.follow_requested) {
+        reveal_range(app, t, t.ev.follow_target, 0, true);
+        set_status(app, "Followed " + pointer_desc(app, app.settings.pointer_width, app.settings.big_endian_inspector) +
+                            " at " + fmt_offset(t.ev.follow_from) + " -> " + fmt_offset(t.ev.follow_target) +
+                            "  (Alt+Left / mouse back returns)", 6.0);
+    }
+    if (t.ev.nav_back) navigate(app, t, false);
+    if (t.ev.nav_forward) navigate(app, t, true);
     if (t.ev.open_context_menu) ImGui::OpenPopup("##hexctx");
     draw_hex_context_menu(app);
 }
@@ -1922,6 +2128,7 @@ void draw_goto(App& app) {
     ImGui::TextDisabled("Enter: go    Shift+Enter: select from cursor    Esc: close");
     if (enter && ok) {
         ViewState& vs = d->view();
+        const NavEntry from = nav_here(*d);
         if (shift) {
             if (!vs.has_selection()) vs.anchor = vs.cursor;
             vs.cursor = target;
@@ -1930,6 +2137,7 @@ void draw_goto(App& app) {
         }
         vs.low_nibble = false;
         d->view_generation++;
+        if (nav_here(*d) != from) t->nav.push(from);
         t->view.request_scroll_to(target, true);
         t->view.request_focus();
         ImGui::CloseCurrentPopup();
@@ -2374,6 +2582,9 @@ void draw_settings_window(App& app) {
     }
     help_marker("A typing run longer than this many bytes starts a new undo step (0 = no limit).");
 
+    ImGui::SeparatorText("Follow pointer (Ctrl+click, Ctrl+Enter)");
+    changed |= pointer_settings(app, false);
+
     ImGui::SeparatorText("Saving");
     if (ImGui::Checkbox("Keep the original as <file>.backup on the first save", &st.backup_on_save))
         changed = core = true;
@@ -2625,10 +2836,12 @@ void build_default_layout(ImGuiID dock_id) {
     ImGuiID right_bottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.58f, nullptr, &right);
     ImGui::DockBuilderDockWindow(kWinEditor, center);
     ImGui::DockBuilderDockWindow(kWinInspector, right);
+    ImGui::DockBuilderDockWindow(kWinHashes, right);
     ImGui::DockBuilderDockWindow(kWinStructure, right_bottom);
     ImGui::DockBuilderDockWindow(kWinConsole, bottom);
     ImGui::DockBuilderDockWindow(kWinResults, bottom);
     ImGui::DockBuilderDockWindow(kWinBookmarks, bottom);
+    ImGui::DockBuilderDockWindow(kWinStrings, bottom);
     ImGui::DockBuilderFinish(dock_id);
 }
 
@@ -2642,6 +2855,30 @@ void draw_dockspace(App& app) {
     ImGui::DockSpaceOverViewport(dock_id, ImGui::GetMainViewport());
 }
 
+// "C Struct to Parser" window (Scripts > New Parser from C Struct...).
+void draw_cstruct_dialog(App& app) {
+    if (!app.cstruct_dlg.is_open()) return;
+    CStructDialogCallbacks cb;
+    cb.scripts_dir = paths::user_scripts_dir();
+    cb.status = [&app](const std::string& m) { set_status(app, m, 6.0); };
+    // Save: write the script, load it right away and make it the active document's parser.
+    cb.save = [&app](const std::string& path, const std::string& lua, std::string* err) {
+        os_mkdirs(path_dirname(path));
+        if (!os_write_whole_atomic(path, lua.data(), lua.size(), err)) return false;
+        if (!app.save.running) app.engine->reload();  // else hot reload picks it up after the save
+        if (Document* d = usable_doc(app)) {
+            d->view().parser = app.cstruct_dlg.options.name;
+            d->view_generation++;
+            app.show_structure = app.focus_structure = true;
+        }
+        return true;
+    };
+    cb.apply_at_cursor = [&app](const std::string& lua, const std::string& name, std::string* err) {
+        return apply_parser_at_cursor(app, lua, name, err);
+    };
+    app.cstruct_dlg.draw(kWinCStruct, app.fonts.mono, app.ui_scale, cb);
+}
+
 void draw_panels(App& app) {
     // Inline edits are keyed by row / cursor within one document: end them when the active
     // document changes (Ctrl+Tab, new tab, script reveal...) so Enter cannot commit into another.
@@ -2653,8 +2890,18 @@ void draw_panels(App& app) {
         app.st_edit.end();
         app.bm_edit.end();
     }
-    if (app.show_inspector) draw_inspector_panel(app);
-    if (app.show_structure) draw_structure_panel(app);
+    // Fresh layout: the first tab of each dock node in front (Inspector, Console; see layout_focus_step).
+    if (app.show_inspector) {
+        if (app.layout_focus_step == 3) ImGui::SetNextWindowFocus();
+        draw_inspector_panel(app);
+    }
+    if (app.show_structure) {
+        if (app.focus_structure) {
+            ImGui::SetNextWindowFocus();
+            app.focus_structure = false;
+        }
+        draw_structure_panel(app);
+    }
     if (app.show_console) {
         if (app.layout_focus_step == 2) ImGui::SetNextWindowFocus();  // fresh layout: Console in front
         draw_console_panel(app);
@@ -2667,6 +2914,21 @@ void draw_panels(App& app) {
         draw_search_results_panel(app);
     }
     if (app.show_bookmarks) draw_bookmarks_panel(app);
+    if (app.show_strings) {
+        if (app.focus_strings) {
+            ImGui::SetNextWindowFocus();
+            app.focus_strings = false;
+        }
+        draw_strings_panel(app);
+    }
+    if (app.show_hashes) {
+        if (app.focus_hashes) {
+            ImGui::SetNextWindowFocus();
+            app.focus_hashes = false;
+        }
+        draw_hash_panel(app);
+    }
+    draw_cstruct_dialog(app);
     // New windows take focus when they first appear, so on the first frame the last panel drawn
     // (Bookmarks) would steal its dock node's selected tab from the one saved in the layout.
     if (ImGui::GetFrameCount() == 1) ImGui::SetWindowFocus(kWinEditor);
@@ -2813,6 +3075,16 @@ void startup(App& app) {
     app.hot_exit = app.session && app.settings.restore_session;
     if (app.hot_exit) restore_session(app);
     app.inbox = app.session && app.session->primary();
+    if (!app.settings.hash_algorithms.empty()) {  // "" = the defaults
+        std::vector<std::string> names;
+        for (size_t b = 0; b <= app.settings.hash_algorithms.size();) {
+            size_t e = app.settings.hash_algorithms.find(',', b);
+            if (e == std::string::npos) e = app.settings.hash_algorithms.size();
+            names.push_back(app.settings.hash_algorithms.substr(b, e - b));
+            b = e + 1;
+        }
+        app.hash_panel.set_selected(names);
+    }
     for (const std::string& f : app.opts.files) open_path(app, f);
     app.next_autosave = now_s() + std::max(1, app.settings.session_autosave_seconds);
 }
@@ -3000,9 +3272,18 @@ int run_app(const AppOptions& opts) {
             actions_done = true;
             for (const std::string& name : opts.actions) {
                 const Action* a = find_action(name.c_str());
-                if (!a)
-                    std::fprintf(stderr, "hexer: --action: unknown action '%s'\n", name.c_str());
-                else if (!action_enabled(app, *a))
+                if (!a) {  // any other palette entry by its label, e.g. "Parser: PNG image", "Script: ..."
+                    app.palette_bookmarks = false;
+                    build_palette(app);
+                    auto it = std::find_if(app.palette_all.begin(), app.palette_all.end(),
+                                           [&](const PaletteItem& p) { return p.label == name; });
+                    if (it == app.palette_all.end())
+                        std::fprintf(stderr, "hexer: --action: unknown action '%s'\n", name.c_str());
+                    else if (!it->enabled)
+                        std::fprintf(stderr, "hexer: --action: '%s' is not available now\n", name.c_str());
+                    else
+                        run_palette_item(app, *it);
+                } else if (!action_enabled(app, *a))
                     std::fprintf(stderr, "hexer: --action: '%s' is not available now\n", name.c_str());
                 else
                     a->run(app);

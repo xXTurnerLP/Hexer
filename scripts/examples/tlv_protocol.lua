@@ -161,7 +161,7 @@ hx.parser {
             p:struct(string.format("packet[%d]", index), function()
                 local msg, length, wanted = parse_packet(p)
                 if wanted then
-                    local actual = crc16(doc:read(start, 6 + length))
+                    local actual = crc16(doc:read(p:base() + start, 6 + length))  -- doc:* is absolute
                     p:note(actual == wanted and "CRC OK" or string.format("CRC MISMATCH: computed 0x%04X", actual))
                 end
                 p:label(MSG_TYPE[msg] or "?")

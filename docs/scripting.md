@@ -88,7 +88,8 @@ The cursor starts at offset 0. Typed readers read at the cursor, advance it, **e
 | Call | Notes |
 |---|---|
 | `p:tell()` `p:seek(off)` `p:skip(n)` | cursor; `skip` may be negative; seeking past the end is an error |
-| `p:size()` `p:remaining()` `p:eof()` | |
+| `p:size()` `p:remaining()` `p:eof()` | size of the parsed range (the document, or the range of a parse at an offset) |
+| `p:base()` | absolute document offset of the range start (0 for a whole-document parse) |
 | `p:endian("le"\|"be")` | default for readers without a suffix; returns the current one |
 | `p:u8 i8 u16 i16 u24 i24 u32 i32 u64 i64 f32 f64 (name, opts?)` | default endianness |
 | `p:u16le(name)`, `p:u32be(name)`, ... | explicit endianness (`le`/`be` suffix on every multi-byte type) |
@@ -117,6 +118,80 @@ The cursor starts at offset 0. Typed readers read at the cursor, advance it, **e
 Default integer display is `13 (0xD)`; values below 10 show as plain `7`. u64 values are shown
 unsigned. (In Lua they are plain integers, so values >= 2^63 come out negative.) Bytes show
 the first 16 bytes in hex followed by `…`. Strings are shown quoted, with escapes.
+
+### Parsing at an offset
+
+A parser can also run over a part of a document, e.g. a PNG embedded inside an executable or a
+packet inside a capture. In the Structure panel, pick the parser and type an offset into
+**Parse at** (Go to syntax: `0x1234`, `cur`, `end-0x100`; Enter applies), or press **Cursor**
+(also Scripts > Parse at Cursor and the hex view's context menu); **File start** goes back. The
+panel and the status bar then show e.g. `PNG image @ 0x00001234`. (From C++:
+`ScriptEngine::parse(doc, name, base, length)`, `length` = `UINT64_MAX` for "to the end".) The
+parser sees the range from there to the end of the file as its whole input:
+
+* `p:tell()` is 0 at the range start; `p:seek`, `p:skip`, `p:size`, `p:remaining`, `p:eof`,
+  `p:peek` and the `off` of `p:field` are relative to it.
+* Reads stop at the range end with the usual `read past end of data` error.
+* The emitted fields and highlights use **absolute** offsets, so the hex view shows them in place.
+* `doc:*` calls stay absolute. Convert with `p:base()`:
+  `hx.crc32(doc:read(p:base() + start, len))`. A parser that only uses `p` works unchanged at
+  any offset.
+* `detect()` is not called; the parser is chosen explicitly (in Auto mode, setting an offset keeps
+  the parser that is shown at that moment).
+
+### Generating a parser from C structs
+
+The **C struct → parser** window (Scripts > New Parser from C Struct...) turns pasted C
+definitions into a parser script like the ones above (readable, one reader per line, meant to be
+edited further). "Save as parser..." writes it to `<user scripts>/<name>.lua`, loads it and makes
+it the active document's parser; "Apply at cursor" (also the palette action *C Struct: Apply at
+Cursor*) runs it once at the cursor without saving: the Structure panel then parses from the
+cursor with it (from C++: `ScriptEngine::run_source(lua, name, &err)`, then `parse(doc, name,
+cursor, UINT64_MAX)`). A one-off parser is forgotten at the next script reload, so save it to keep
+it.
+
+```c
+#define NAME_LEN 8
+enum MsgType : uint8_t { HELLO = 1, DATA = 2 };
+// @be
+struct Packet {
+    uint16_t len;
+    uint8_t  version : 4;
+    uint8_t  flags   : 4;
+    enum MsgType type;
+    char     name[NAME_LEN];
+    uint8_t  data[len];          // dynamic: sized by an earlier field
+    uint16_t words[len * 2];
+    uint8_t  rest[];             // the rest of the data
+};
+```
+
+What it understands:
+
+* `struct` / `union`, `typedef struct X {...} Y;`, nested named and anonymous structs/unions,
+  earlier struct types used as members, array typedefs (`typedef uint8_t mac_t[6];`).
+* Types: `uint8_t`..`uint64_t`, `int8_t`..`int64_t`, `u8`..`u64`, `i8`/`s8`..`i64`/`s64`,
+  `BYTE`/`WORD`/`DWORD`/`QWORD`, `char`, `signed`/`unsigned` `char`/`short`/`int`/`long`/
+  `long long`, `float`, `double`, `bool`/`_Bool`, `__le16`/`__be32`/... (fixed endianness).
+  `long` is 32-bit (as on Windows). Pointers are rejected.
+* Arrays (multi-dimensional): `char` arrays become `p:str`, other 1-byte arrays one `p:bytes`
+  field, everything else `p:array`. Sizes are constant expressions (numbers, `#define`s, enum
+  constants, `sizeof(type)`, `+ - * / % << >> & | ^ ~`) or expressions over **earlier integer
+  fields** of the same struct (or an enclosing unnamed one). `x[]` / `x[0]` as the last member
+  takes the rest of the data.
+* Enums with a base type (`enum E : uint16_t {...}`, also `enum class`) or plain (4 bytes).
+* Bit fields: consecutive ones share a storage unit of their declared type (a new unit starts when
+  the type size changes or the bits do not fit, `: 0` closes it); bits are allocated from the
+  least significant bit (from the most significant one in big-endian structs). Each bit field is
+  shown over its unit's bytes; they are not editable.
+* Packing: the window's default (packed, max 2/4/8, or natural alignment), `#pragma pack(n)`,
+  `pack(push, n)`, `pack(pop)`, `pack()`, `__attribute__((packed))`.
+* Endianness: the window's default; a comment containing `@be` or `@le` on the line(s) right
+  before `struct` / `typedef` (or right after the struct's `{`) overrides it for that struct.
+  Unnamed nested structs inherit it; named struct types keep their own.
+* Comments, `#define NAME <constant>`; other preprocessor lines are ignored.
+
+Errors name the line: `line 7: unknown type 'uint9_t'`.
 
 ### Editing (serializer for free)
 
@@ -158,6 +233,7 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | `doc:cursor()` `doc:selection()` → start, len | |
 | `doc:select(off, len)` `doc:jump(off)` | moves the selection/cursor and scrolls it into view (`doc:goto` also exists, but `goto` is a Lua keyword: call it as `doc["goto"](doc, off)`) |
 | `doc:find(needle, start?, {hex=bool, backward=bool})` | offset or `nil`; `hex=true` takes patterns like `"DE ?? AD"` |
+| `doc:hash(algo, off?, len?)` | lowercase hex digest of the range (default: the whole document; clamped to the end). It blocks, so at most 256 MiB per call; the Hashes panel hashes any size in the background |
 
 All edits are undoable. They fail with an error on read-only documents (`document is read-only`)
 and while a save is running.
@@ -181,6 +257,8 @@ and while a save is running.
 | `hx.color(c)` | packed color from a name, `"#rrggbb"` or `0xRRGGBB`. Names: red green blue yellow orange purple cyan pink gray teal white |
 | `hx.hex(s)` → `"DE AD"` / `hx.unhex("de:ad")` → bytes | `unhex` is as lenient as paste: `0x`, commas, `\x`, `b64:` |
 | `hx.crc32(s, prev?)` | zlib/PNG/ZIP CRC-32; pass the previous result to continue over chunks |
+| `hx.hash(algo, s)` | lowercase hex digest of a string: `hx.hash("sha256", data)`. Names ignore case and punctuation (`"CRC-32C"`, `"crc32c"`, `"md5"`) |
+| `hx.hash_algorithms()` | the names, in display order: Sum-8, XOR-8, CRC-8, CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-16/XMODEM, CRC-32, CRC-32C, Adler-32, Fletcher-16, FNV-1a/32, FNV-1a/64, MD5, SHA-1, SHA-256, SHA-512 |
 | `string.pack` / `string.unpack` | standard Lua, the recommended way to (de)serialize |
 
 `os.exit` and stdin are disabled: Hexer has no stdin (`io.read`, `io.lines()`, `io.stdin`,

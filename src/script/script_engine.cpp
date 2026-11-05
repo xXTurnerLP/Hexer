@@ -469,6 +469,28 @@ void ScriptEngine::reload() {
     log(failed ? ConsoleLine::Warn : ConsoleLine::Info, buf);
 }
 
+bool ScriptEngine::run_source(const std::string& lua, const std::string& chunk_name, std::string* err) {
+    auto fail = [&](const std::string& m) {
+        log(ConsoleLine::Error, m);
+        if (err) *err = m;
+        return false;
+    };
+    lua_State* L = impl_->L;
+    if (!L) return fail("script engine not initialised");
+    std::string chunk = "=" + chunk_name;
+    if (luaL_loadbufferx(L, lua.data(), lua.size(), chunk.c_str(), "t") != LUA_OK) {
+        std::string m = lua_tostring(L, -1) ? lua_tostring(L, -1) : "syntax error";
+        lua_pop(L, 1);
+        return fail(m);
+    }
+    impl_->loading_file = chunk_name;
+    std::string e;
+    bool ok = impl_->pcall(0, 0, impl_->script_limit_ms, &e);
+    impl_->loading_file.clear();
+    if (!ok) return fail(e);
+    return true;
+}
+
 bool ScriptEngine::poll_hot_reload() {
     // Forget highlights of closed documents (cheap, piggybacks on the periodic poll).
     if (host_) {
@@ -603,6 +625,10 @@ std::string ScriptEngine::detect_parser(Document& doc) {
 }
 
 ParseResult ScriptEngine::parse(Document& doc, const std::string& parser_name) {
+    return parse(doc, parser_name, 0, UINT64_MAX);
+}
+
+ParseResult ScriptEngine::parse(Document& doc, const std::string& parser_name, uint64_t base, uint64_t length) {
     ParseResult r;
     r.parser = parser_name;
     r.doc_generation = doc.generation();
@@ -612,7 +638,7 @@ ParseResult ScriptEngine::parse(Document& doc, const std::string& parser_name) {
         r.error = "unknown parser '" + parser_name + "'";
     } else {
         int top = lua_gettop(impl_->L);
-        run_parse(*impl_, doc, it->second, r);
+        run_parse(*impl_, doc, it->second, r, base, length);
         lua_settop(impl_->L, top);
     }
     r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

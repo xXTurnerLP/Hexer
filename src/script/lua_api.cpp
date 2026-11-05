@@ -13,6 +13,7 @@
 #include <future>
 #include <memory>
 
+#include "core/hash.h"
 #include "core/highlight.h"
 #include "core/os_file.h"
 #include "core/search.h"
@@ -30,6 +31,7 @@ constexpr const char* kParserMeta = "hexer.Parser";
 constexpr uint64_t kMaxRead = 64ull << 20;        // doc:read / p:peekbytes cap
 constexpr uint64_t kSmall = 64ull << 10;          // p:bytes returns data up to this size; cstr limit
 constexpr uint64_t kMaxStr = 16ull << 20;         // p:str cap
+constexpr uint64_t kMaxHash = 256ull << 20;       // doc:hash cap (it blocks the UI thread)
 constexpr size_t kMaxScriptHighlights = 1000000;  // per document
 constexpr const char* kEllipsis = "\xE2\x80\xA6";
 
@@ -376,6 +378,28 @@ int doc_goto(lua_State* L) {
     return 0;
 }
 
+// doc:hash(algo, off?, len?) -> lowercase hex digest of [off, off+len) (clamped to EOF; default
+// the whole document). Blocking, so at most kMaxHash bytes per call.
+int doc_hash(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const char* algo = luaL_checkstring(L, 2);
+    const uint64_t size = d->size();
+    const uint64_t off = std::min<uint64_t>(lua_isnoneornil(L, 3) ? 0 : check_u64(L, 3), size);
+    const uint64_t len = std::min<uint64_t>(lua_isnoneornil(L, 4) ? size - off : check_u64(L, 4), size - off);
+    if (len > kMaxHash)
+        return luaL_error(L, "doc:hash: at most 256 MiB per call (the Hashes panel hashes any size in the background)");
+    char err[256] = {};
+    {
+        std::string out, e;
+        if (hash_snapshot_hex(*d->snapshot(), algo, off, len, out, &e))
+            lua_pushlstring(L, out.data(), out.size());
+        else
+            std::snprintf(err, sizeof err, "doc:hash: %s", e.empty() ? "failed" : e.c_str());
+    }
+    if (err[0]) return luaL_error(L, "%s", err);
+    return 1;
+}
+
 int doc_find(lua_State* L) {
     Document* d = check_doc(L, 1);
     size_t n;
@@ -462,6 +486,7 @@ const luaL_Reg kDocMethods[] = {
     {"transaction", doc_transaction},                      {"cursor", doc_cursor},
     {"selection", doc_selection},                          {"select", doc_select},
     {"goto", doc_goto},       {"jump", doc_goto},          {"find", doc_find},
+    {"hash", doc_hash},
     {nullptr, nullptr},
 };
 
@@ -472,6 +497,10 @@ using EnumList = std::vector<Field::EnumItem>;
 struct ParseCtx {
     Document* doc = nullptr;
     ParseResult* out = nullptr;
+    // Parse range [base, end) in document offsets (parse at offset). `pos` is absolute; p:tell /
+    // p:seek / p:size / p:field offsets are relative to `base`, emitted fields are absolute.
+    uint64_t base = 0;
+    uint64_t end = UINT64_MAX;
     uint64_t pos = 0;
     bool big_endian = false;
     struct Open {
@@ -499,15 +528,18 @@ ParseCtx* check_ctx(lua_State* L) {
     return ud->ctx;
 }
 
-uint64_t ctx_size(const ParseCtx* c) { return c->doc->size(); }
+// Absolute end of the parse range (clamped to the document).
+uint64_t ctx_end(const ParseCtx* c) { return std::max(c->base, std::min(c->end, c->doc->size())); }
+uint64_t ctx_size(const ParseCtx* c) { return ctx_end(c) - c->base; }  // range length
 uint64_t ctx_remaining(const ParseCtx* c) {
-    uint64_t s = ctx_size(c);
-    return c->pos < s ? s - c->pos : 0;
+    uint64_t e = ctx_end(c);
+    return c->pos < e ? e - c->pos : 0;
 }
 
+// `off` is absolute; false if [off, off+n) leaves the parse range.
 bool ctx_read(ParseCtx* c, uint64_t off, uint8_t* dst, size_t n) {
-    uint64_t s = ctx_size(c);
-    if (off > s || n > s - off) return false;
+    uint64_t e = ctx_end(c);
+    if (off < c->base || off > e || n > e - off) return false;
     return c->doc->read(off, dst, n) == n;
 }
 
@@ -937,7 +969,7 @@ int p_field(lua_State* L) {
     read_opts(L, 6, o);
     uint64_t total = ctx_size(c);
     if (off > total || size > total - off) return luaL_error(L, "p:field: range is beyond the end of the data");
-    int idx = emit(L, c, name, "custom", off, size, o);
+    int idx = emit(L, c, name, "custom", c->base + off, size, o);
     c->out->fields[idx].value = text;
     return 0;
 }
@@ -961,7 +993,8 @@ int p_note(lua_State* L) {
 }
 
 int p_tell(lua_State* L) {
-    lua_pushinteger(L, lua_Integer(check_ctx(L)->pos));
+    ParseCtx* c = check_ctx(L);
+    lua_pushinteger(L, lua_Integer(c->pos - c->base));
     return 1;
 }
 
@@ -973,7 +1006,7 @@ int seek_to(lua_State* L, ParseCtx* c, int64_t target) {
                       (unsigned long long)size);
         return luaL_error(L, "%s", buf);
     }
-    c->pos = uint64_t(target);
+    c->pos = c->base + uint64_t(target);
     return 0;
 }
 
@@ -984,7 +1017,12 @@ int p_seek(lua_State* L) {
 
 int p_skip(lua_State* L) {
     ParseCtx* c = check_ctx(L);
-    return seek_to(L, c, int64_t(c->pos) + luaL_checkinteger(L, 2));
+    return seek_to(L, c, int64_t(c->pos - c->base) + luaL_checkinteger(L, 2));
+}
+
+int p_base(lua_State* L) {
+    lua_pushinteger(L, lua_Integer(check_ctx(L)->base));
+    return 1;
 }
 
 int p_size(lua_State* L) {
@@ -1016,7 +1054,7 @@ int p_endian(lua_State* L) {
 
 int p_tostring(lua_State* L) {
     auto* ud = static_cast<ParserUd*>(luaL_checkudata(L, 1, kParserMeta));
-    if (ud->ctx) lua_pushfstring(L, "Parser@%I", lua_Integer(ud->ctx->pos));
+    if (ud->ctx) lua_pushfstring(L, "Parser@%I", lua_Integer(ud->ctx->pos - ud->ctx->base));
     else lua_pushliteral(L, "Parser (finished)");
     return 1;
 }
@@ -1027,7 +1065,7 @@ const luaL_Reg kParserMethods[] = {
     {"read", p_read},       {"bytes", p_bytes},   {"str", p_str},       {"cstr", p_cstr},
     {"uleb", p_uleb},       {"sleb", p_sleb},     {"struct", p_struct}, {"array", p_array},
     {"field", p_field},     {"label", p_label},   {"note", p_note},     {"peek", p_peek},
-    {"peekbytes", p_peekbytes},
+    {"peekbytes", p_peekbytes},                   {"base", p_base},
     {nullptr, nullptr},
 };
 
@@ -1408,6 +1446,32 @@ int l_crc32(lua_State* L) {
     return 1;
 }
 
+// hx.hash(algo, bytes) -> lowercase hex digest (core/hash.h; names ignore case and punctuation).
+int l_hash(lua_State* L) {
+    const char* algo = luaL_checkstring(L, 1);
+    size_t n = 0;
+    const char* data = luaL_checklstring(L, 2, &n);
+    bool ok = false;
+    {
+        std::string hex = hash_hex(algo, reinterpret_cast<const uint8_t*>(data), n);
+        ok = !hex.empty();
+        if (ok) lua_pushlstring(L, hex.data(), hex.size());
+    }
+    if (!ok) return luaL_error(L, "hx.hash: unknown algorithm '%s' (see hx.hash_algorithms())", algo);
+    return 1;
+}
+
+// hx.hash_algorithms() -> { "Sum-8", ..., "SHA-512" } (display names, in display order)
+int l_hash_algorithms(lua_State* L) {
+    const auto& all = hash_algorithms();
+    lua_createtable(L, int(all.size()), 0);
+    for (size_t i = 0; i < all.size(); ++i) {
+        lua_pushstring(L, all[i].name);
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    return 1;
+}
+
 // Continuation of an inline hx.run (stack: name, message handler, [error]).
 int run_inline_k(lua_State* L, int status, lua_KContext) {
     Impl& im = impl_of(L);
@@ -1482,6 +1546,7 @@ const luaL_Reg kHexerFuncs[] = {
     {"new_doc", l_new_doc},   {"highlight", l_highlight},
     {"clear_highlights", l_clear_highlights},           {"color", l_color},
     {"hex", l_hex},           {"unhex", l_unhex},       {"crc32", l_crc32},
+    {"hash", l_hash},         {"hash_algorithms", l_hash_algorithms},
     {"run", l_run},           {"prompt", l_prompt},
     {nullptr, nullptr},
 };
@@ -1828,10 +1893,13 @@ std::string lua_inspect(lua_State* L, int idx, int max_depth) {
     return in.value(idx, 0, 0);
 }
 
-void run_parse(Impl& im, Document& doc, int parser_ref, ParseResult& out) {
+void run_parse(Impl& im, Document& doc, int parser_ref, ParseResult& out, uint64_t base, uint64_t length) {
     lua_State* L = im.L;
     auto ctx = std::make_unique<ParseCtx>();
     ctx->doc = &doc;
+    ctx->base = base;
+    ctx->end = length > UINT64_MAX - base ? UINT64_MAX : base + length;
+    ctx->pos = base;
     ctx->out = &out;
     ctx->parser_ref = parser_ref;
     lua_pushcfunction(L, parse_main);

@@ -21,16 +21,19 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
 ```
 src/core/    no UI, no Lua — os_file, file_source, piece_table, highlight, document (edits, undo,
              save), session (hot exit), search, inspector, util (goto exprs, copy-as, paste parse),
-             settings (+ paths)
+             settings (+ paths), nav (follow pointer + jump history), strings_scan (StringsJob),
+             hash (16 algorithms + HashJob), cstruct (C struct definitions -> Lua parser source)
 src/script/  script_engine.h (Lua API contract — the header comment is the API spec),
              script_engine.cpp, lua_api.cpp
 src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
-             menus, shortcuts, tabs, ScriptHost impl)
+             menus, shortcuts, tabs, ScriptHost impl); self-contained feature UIs without App
+             dependency: panel_strings, panel_hash, dialog_cstruct (App owns one of each)
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
 tests/       doctest; one exe per module: test_core, test_util, test_script, test_search,
-             test_ui (headless ImGui: drives HexView with simulated mouse/keyboard)
+             test_ui (headless ImGui: drives HexView with simulated mouse/keyboard), test_nav,
+             test_strings, test_hash, test_cstruct
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there)
 assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file
@@ -60,7 +63,9 @@ python tools\ppm2png.py shot.ppm shot.png      # then view the PNG
 ```
 Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`,
 `--action "<name>"` (run a menu/palette action once the layout settled, e.g. `"Settings..."`,
-`"Show All Bookmarks"`, `"Jump to Bookmark..."`; repeatable).
+`"Show All Bookmarks"`, `"Jump to Bookmark..."`, `"Strings: Scan File"`, `"Hash Selection"`,
+`"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`; any palette
+label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable).
 Script commands can be driven from `--exec` with `hx.run("<command name>")`; a command that calls
 `hx.prompt` leaves its modal open in the screenshot.
 
@@ -71,6 +76,9 @@ mods)`, `ui.drag(a, b)`, `ui.key(ImGuiKey_X, mods)`, `ui.type("ab")` queue io ev
 and `ui.hex(off)` / `ui.txt(off)` give the screen position of a drawn byte (`HexView::cell_pos`).
 Every change to input handling or hit testing in `ui/hex_view.cpp` gets a case there.
 Use `Document::set_clock_for_tests` for undo-merge timing.
+
+Jump history: `reveal_range()` (app_internal.h) is the one "big jump" helper: it pushes the
+position it leaves onto the tab's `NavHistory`. Use it for new jump sources (not for caret moves).
 
 Selection convention (one for the whole UI, see `ui/hex_view.h`): `ViewState` selection is
 half-open `[sel_begin, sel_end)`; the caret is drawn on `caret_byte()` (inside the selection);

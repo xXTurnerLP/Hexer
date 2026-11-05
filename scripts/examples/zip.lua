@@ -102,9 +102,10 @@ local function local_file(p, doc)
 
     if flags & 0x0008 ~= 0 and csize == 0 then
         -- Streamed entry: the size is only known after the data. Find the next header instead.
-        local next_hdr = doc:find("PK\7\8", p:tell()) or doc:find("PK\3\4", p:tell()) or doc:find("PK\1\2", p:tell())
+        local here = p:base() + p:tell()   -- doc:find works on absolute offsets
+        local next_hdr = doc:find("PK\7\8", here) or doc:find("PK\3\4", here) or doc:find("PK\1\2", here)
         if not next_hdr then return zip64 end
-        csize = next_hdr - p:tell()
+        csize = next_hdr - here
     end
     if csize < 0 or csize > p:remaining() then   -- (u64 values >= 2^63 are negative in Lua)
         p:bytes("data (truncated)", p:remaining(), { color = "red" })

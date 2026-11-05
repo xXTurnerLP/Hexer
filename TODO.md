@@ -38,7 +38,9 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 ## Later
 - [ ] History panel (click to jump to any undo state)
 - [ ] Undo for the remaining view-level actions that benefit from it (read-only toggle, chosen parser)
-- [ ] Hashes & checksums of selection (CRC32, MD5, SHA-1, SHA-256, Adler32; custom via Lua)
+- [x] Hashes & checksums of selection (Hashes panel: 16 CRCs/checksums/hashes, background, expected
+      value match; `hx.hash` / `doc:hash`)
+- [ ] Custom hash algorithms registered from Lua (`hx.hash_algorithm{...}`)
 - [ ] Entropy / byte-class minimap next to the scrollbar
 - [ ] Structure → C header export (turn a parsed tree into `struct` definitions)
 - [ ] Bit-field / flags display in the Inspector (named bits, editable)
@@ -46,9 +48,15 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Open process memory and raw disks/devices
 - [ ] pcap/pcapng import: one tab per packet, run protocol parsers on each
 - [ ] Split view of the same document, multi-selection
-- [ ] C struct → overlay: paste a C struct definition, get an instant parser/highlight (no Lua needed)
-- [ ] Follow pointer: Ctrl+click a u32/u64 to jump to it as an offset; jump history (Alt+Left / Alt+Right)
-- [ ] Strings panel (ASCII / UTF-16, min length, background scan, click to jump)
+- [x] C struct → parser: paste C definitions, get a Lua parser (apply at the cursor or save it)
+- [x] Parse at offset (Structure panel "Parse at", e.g. a PNG inside a dump)
+- [ ] Remember the parse offset in the session (it is per tab and lost on restart now)
+- [x] Follow pointer: Ctrl+click / Ctrl+Enter, width + base + byte order settings, Inspector /
+      Structure buttons; jump history (Alt+Left / Alt+Right, mouse back / forward)
+- [x] Strings panel (ASCII / UTF-16, min length, background scan, click to jump, live filter)
+- [ ] Strings: deduplicate an ASCII-in-UTF-16 string found again shifted by one byte when both
+      UTF-16LE and UTF-16BE are on
+- [ ] Verify by hand: Ctrl+hover underline / tooltip and mouse X1/X2 (headless tests only)
 - [ ] Bitmap view: render bytes as pixels (adjustable width / pixel format) to spot tables & images
 - [ ] Byte-class coloring mode (zero / printable / whitespace / control / high bytes)
 - [ ] Disassembly at cursor (Capstone: x86/x64/ARM/AArch64/...)

@@ -106,8 +106,10 @@ int lua_msg_handler(lua_State* L);                       // adds "stack tracebac
 void lua_time_hook(lua_State* L, lua_Debug* ar);         // count hook enforcing Impl::deadline
 void push_doc(lua_State* L, uint64_t doc_id);          // Doc userdata
 std::string lua_inspect(lua_State* L, int idx, int max_depth = 6);
-// Runs parser `ref` over `doc`; fills `out` (fields, highlights, error). Never throws/longjmps.
-void run_parse(ScriptEngine::Impl& im, Document& doc, int parser_ref, ParseResult& out);
+// Runs parser `ref` over `doc` range [base, base+length) (clamped to the document); fills `out`
+// (fields with absolute offsets, highlights, error). Never throws/longjmps.
+void run_parse(ScriptEngine::Impl& im, Document& doc, int parser_ref, ParseResult& out, uint64_t base = 0,
+               uint64_t length = UINT64_MAX);
 
 // Single numeric string.pack option ("<I2", ">i3", "B", "<d", ...): size and kind. False for
 // anything else (multi-value, strings, padding-only formats).

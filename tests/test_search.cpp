@@ -872,3 +872,29 @@ TEST_CASE("settings: recent dedupe ignores case and slash direction on Windows")
     CHECK(s.recent_files.front() == "c:/data/file.BIN");
 }
 #endif
+
+TEST_CASE("settings: follow pointer and hash algorithm fields round trip, bad widths ignored") {
+    TempDir tmp;
+    std::string f = path_join(tmp.path, "settings.ini");
+    Settings def;
+    CHECK(def.pointer_width == 4);
+    CHECK(def.pointer_base == 0);
+    CHECK(def.hash_algorithms.empty());
+    Settings s;
+    s.pointer_width = 8;
+    s.pointer_base = 0x140000000ull;
+    s.hash_algorithms = "CRC-32,SHA-256";
+    REQUIRE(s.save(f));
+    Settings t;
+    REQUIRE(t.load(f));
+    CHECK(t.pointer_width == 8);
+    CHECK(t.pointer_base == 0x140000000ull);
+    CHECK(t.hash_algorithms == "CRC-32,SHA-256");
+    for (const char* bad : {"3", "16", "0", "-4", "x"}) {
+        std::string text = std::string("pointer_width = ") + bad + "\n";
+        REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+        Settings u;
+        REQUIRE(u.load(f));
+        CHECK(u.pointer_width == 4);
+    }
+}

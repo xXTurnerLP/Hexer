@@ -45,6 +45,26 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Structure panel.** Lua parsers decode the file into a tree. Each field is highlighted in the
   hex view in its own color. Double-click a value to edit it, and it is re-encoded in place.
   Bundled parsers: PNG, ZIP (including ZIP64) and an example TLV protocol ("HXP").
+- **Parse at an offset.** The Structure panel's **Parse at** field (or **Cursor**, Scripts > Parse
+  at Cursor) runs a parser from any offset, e.g. a PNG embedded in a firmware dump; fields are
+  highlighted in place and the panel shows `PNG image @ 0x00001234`.
+- **C struct to parser** (Scripts > New Parser from C Struct...). Paste C `struct`/`union`/`enum`
+  definitions (bit fields, `#pragma pack`, arrays sized by earlier fields, `// @be`) and get a
+  readable Lua parser live. Apply it at the cursor, or save it as a script.
+- **Follow pointer and jump history.** Hold `Ctrl` over a byte to see where the 32-bit value
+  there points (underlined, with a tooltip), `Ctrl+click` jumps there; `Ctrl+Enter` follows the
+  value at the cursor. Width (8/16/32/64 bit), base address and byte order (the Inspector's LE/BE)
+  are in Search > Follow Pointer Settings and the Settings window. The Inspector's uint32/uint64
+  rows and the Structure panel's 32/64-bit integer fields have a `→` button. Every big jump (Go
+  to, search hits, bookmarks, Structure / Strings rows, follow) is recorded: `Alt+Left` /
+  `Alt+Right` or the mouse back / forward buttons walk the history.
+- **Strings panel.** ASCII, UTF-16LE and UTF-16BE strings of the file or the selection, with a
+  minimum length, scanned in the background (progress, Cancel), up to a million results with a
+  live filter. Click a row to select the string.
+- **Hashes panel.** CRC-8/16/32/32C, Adler-32, Fletcher-16, FNV-1a, Sum-8, XOR-8, MD5, SHA-1,
+  SHA-256 and SHA-512 of the selection (or the whole file), computed in the background and
+  automatically up to 64 MiB. Paste an expected value to highlight the matching row. Scripts get
+  `hx.hash(algo, bytes)` and `doc:hash(algo, off, len)`.
 - **Search.** Hex with wildcards (`DE ?? BE`, `4?`), text, UTF-16, optionally case-insensitive.
   Searches run in the background. Find All lists every match and highlights them.
 - **Smart Go to.** `0x1F00`, `1F00h`, `#1234` (decimal), `+0x10` (relative), `end-0x100`, `50%`,
@@ -61,8 +81,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Fonts** are rasterised with FreeType (hinted, pixel-snapped hex cells). `font_hinting`
   (`normal`, `light`, `none`, `mono`), `mono_font` and `ui_font` (file paths, empty = auto) are
   in the Settings window and `settings.ini`.
-- **Command palette** (`Ctrl+Shift+P`) with fuzzy search over actions, script commands,
-  parsers and recent files.
+- **Command palette** (`Ctrl+Shift+P`) with fuzzy search over actions (e.g. *Strings: Scan File*,
+  *Hash Selection*, *Structure: Parse at Cursor*), script commands, parsers and recent files.
 - **Lua console** (REPL), script commands, and hot reload: save a `.lua` file and it reloads.
   Commands can ask for a value with `hx.prompt(title, default)` (a small dialog; Enter = OK,
   Esc = Cancel), e.g. *Selection: XOR with key* asks for the key.
@@ -131,7 +151,8 @@ hexer [options] [files...]
   --no-session         do not restore or write the hot-exit session
   --new-instance       open a new window even if Hexer is already running
   --exec "LUA"         run Lua in the console after startup
-  --action "NAME"      run a menu/palette action after startup, e.g. "Settings..." (repeatable)
+  --action "NAME"      run a menu/palette action after startup, e.g. "Settings..." or
+                       "Parser: PNG image" (repeatable)
   --screenshot OUT.ppm render, save the window as a PPM and exit
   --frames N           exit after N frames
 ```
@@ -162,6 +183,8 @@ hexer [options] [files...]
 | `Ctrl+B` | Toggle bookmark (on the selection, else the caret byte) |
 | `F2` / `Shift+F2` | Next / previous bookmark |
 | `Ctrl+Shift+B` | Jump to a bookmark in any open file (fuzzy search) |
+| `Ctrl+click` / `Ctrl+Enter` | Follow the pointer under the mouse / at the cursor (`Ctrl+hover` previews the target) |
+| `Alt+Left` / `Alt+Right`, mouse back / forward | Back / forward through the jump history |
 | `Ctrl+,` | Settings |
 | `Ctrl+Shift+P` | Command palette |
 | `F5` | Re-parse structure |
@@ -171,7 +194,7 @@ hexer [options] [files...]
 Mouse: click and drag to select (bytes a..b inclusive; clicking the second hex digit puts the
 caret on the low nibble; clicking below the last row puts it at the end of the file),
 `Shift+click` extends the selection from its fixed end, double-click selects the field under the
-mouse, right-click opens the context menu.
+mouse, `Ctrl+click` follows the pointer there, right-click opens the context menu.
 
 ## Hot exit
 
@@ -234,7 +257,8 @@ See **[docs/scripting.md](docs/scripting.md)** for the full guide and API refere
 ## Project layout
 
 `src/core` holds documents, streaming I/O, the piece table, undo, saving, the session, search,
-the inspector and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
+the inspector, strings extraction, hashes, the C struct converter, the jump history and
+utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
 live in `tests/`, one executable per module; `tests/test_ui.cpp` drives the hex view headlessly
 (simulated mouse and keyboard, no window). See `CLAUDE.md` for contributor notes and `TODO.md`
 for the roadmap.

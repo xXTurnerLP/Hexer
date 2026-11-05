@@ -39,6 +39,9 @@
 //                                         yellow, orange, purple, cyan, pink, gray, teal)
 //   hx.hex(str) -> "DE AD BE EF"   hx.unhex("de ad be ef") -> str (lenient, like paste)
 //   hx.crc32(str, prev?) -> int       -- zlib/PNG/ZIP CRC-32; pass `prev` to continue over chunks
+//   hx.hash(algo, str) -> "cbf43926"   -- lowercase hex digest; algo: any of hx.hash_algorithms()
+//                                         (case and punctuation ignored: "sha256", "CRC-32C", "md5")
+//   hx.hash_algorithms() -> {"Sum-8", "XOR-8", "CRC-8", ..., "SHA-256", "SHA-512"}
 //   string.pack / string.unpack       -- standard Lua; the recommended way to serialize
 //
 // Doc (userdata; every call raises "document closed" if its tab was closed):
@@ -53,10 +56,17 @@
 //   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:goto(off)
 //       (`goto` is a Lua keyword: write doc:jump(off), the same function, or doc["goto"](doc, off))
 //   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")
+//   doc:hash(algo, off?, len?) -> hex   (default: the whole doc; clamped to EOF; at most 256 MiB per
+//                                         call since it blocks - the Hashes panel does any size)
 //   All script edits are undoable and respect read-only mode (error "document is read-only").
 //
-// Parser context `p` (argument of parse; reads relative to the document, cursor starts at 0):
+// Parser context `p` (argument of parse; reads relative to the parse range, cursor starts at 0):
 //   p:tell()  p:seek(off)  p:skip(n)  p:size()  p:remaining()  p:eof()
+//   Parse at offset (ScriptEngine::parse with base/length, e.g. a PNG embedded in another file):
+//   tell/seek/skip/size/remaining/eof/peek and p:field offsets are relative to the range start and
+//   reads stop at the range end ("read past end of data"); emitted fields and highlights use
+//   absolute document offsets; doc:* calls stay absolute. A whole-document parse has base 0.
+//   p:base() -> absolute document offset of the range start: doc:read(p:base() + p:tell(), n).
 //   p:endian("le"|"be")                 -- default endianness for u16/u32/... without suffix
 //   Typed readers: read at tell(), advance, emit a field, return the value:
 //     p:u8/i8/u16/i16/u24/i24/u32/i32/u64/i64/f32/f64(name, opts?)  (+ "le"/"be" suffixed variants,
@@ -175,6 +185,11 @@ public:
     void reload();                 // fresh lua_State, run every script; errors go to the console
     bool poll_hot_reload();        // cheap mtime check (call ~once per second); true if reloaded
     uint64_t reload_count() const { return reload_count_; }
+    // Runs `lua` in the current state as if it were one more script file named `chunk_name`
+    // (hx.parser / hx.command register as usual, replacing same-named ones). Not persisted: the
+    // next reload() forgets it. Used for one-off generated parsers (C struct -> "Apply at cursor").
+    // Errors (syntax / runtime, with traceback) go to *err and the console.
+    bool run_source(const std::string& lua, const std::string& chunk_name, std::string* err);
 
     // ---- console --------------------------------------------------------------------------
     void exec(const std::string& code);  // REPL line (echoed as Input)
@@ -188,6 +203,10 @@ public:
     // First parser whose detect(doc) returns true, else first whose extensions match the path, else "".
     std::string detect_parser(Document& doc);
     ParseResult parse(Document& doc, const std::string& parser_name);
+    // Parse at offset: runs the parser over [base, base+length) (length UINT64_MAX = to EOF;
+    // clamped to the document). The parser sees that range as its whole input (p:tell() == 0 at
+    // `base`); Field::offset and highlights are absolute. detect() is not involved.
+    ParseResult parse(Document& doc, const std::string& parser_name, uint64_t base, uint64_t length);
     // Serializer: encode `text` with the field's pack format (or enum name) and overwrite the
     // field's bytes in `doc` (one undo step).
     bool edit_field(Document& doc, const Field& field, const std::string& text, std::string* err);

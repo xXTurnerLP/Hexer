@@ -1,7 +1,7 @@
 #pragma once
 // Private to the UI module: the one App struct shared by app.cpp (main loop, menus, shortcuts,
 // tabs, popups, ScriptHost) and panels.cpp (Inspector, Structure, Console, Search Results,
-// Bookmarks, status bar). Plain data + a few helper functions; no class hierarchy.
+// Bookmarks, Strings, Hashes, status bar). Plain data + a few helper functions; no class hierarchy.
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -10,12 +10,16 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/nav.h"
 #include "core/search.h"
 #include "core/session.h"
 #include "core/settings.h"
 #include "script/script_engine.h"
 #include "ui/app.h"
+#include "ui/dialog_cstruct.h"
 #include "ui/hex_view.h"
+#include "ui/panel_hash.h"
+#include "ui/panel_strings.h"
 #include "ui/theme.h"
 
 struct GLFWwindow;
@@ -29,6 +33,9 @@ inline constexpr const char* kWinStructure = "Structure";
 inline constexpr const char* kWinConsole = "Console";
 inline constexpr const char* kWinResults = "Search Results";
 inline constexpr const char* kWinBookmarks = "Bookmarks";
+inline constexpr const char* kWinStrings = "Strings";
+inline constexpr const char* kWinHashes = "Hashes";
+inline constexpr const char* kWinCStruct = "C Struct to Parser";
 
 // ---- per-tab state -------------------------------------------------------------------------
 
@@ -55,6 +62,11 @@ struct StructureState {
     // click put it, although the caret byte belongs to one of its children.
     int clicked_field = -1;
     uint64_t clicked_cursor = 0;
+    // Parse at offset: the parser runs over [base, EOF) (0 = the whole file). Needs a chosen
+    // parser (detect() looks at the file start). Kept per tab, not in the session.
+    uint64_t base = 0;
+    uint64_t parsed_base = 0;         // base of `result`
+    std::string base_input;           // the panel's "@" field
     // Wall time of the last detect + parse. A slow (or truncated) parse is not re-run on every
     // edit; the panel shows it as stale until F5 / Reparse.
     double last_parse_ms = 0.0;
@@ -92,6 +104,7 @@ struct Tab {
     uint64_t bookmark_sig = 0;
     SearchHits hits;
     StructureState st;
+    NavHistory nav;                   // Back / Forward over big jumps (Alt+Left / Alt+Right)
 };
 
 // ---- app-level state -----------------------------------------------------------------------
@@ -189,7 +202,7 @@ struct App final : ScriptHost {
 
     // Panels / layout.
     bool show_inspector = true, show_structure = true, show_console = true, show_results = true,
-         show_bookmarks = true;
+         show_bookmarks = true, show_strings = true, show_hashes = true;
     bool show_settings = false;       // Settings window (Edit > Settings..., Ctrl+,)
     bool bm_all_files = false;        // Bookmarks panel lists every open file
     bool focus_bookmarks = false;     // bring the Bookmarks panel to the front next frame
@@ -197,6 +210,12 @@ struct App final : ScriptHost {
     int layout_focus_step = 0;        // after a layout build: front the Console tab, then the Editor
     bool focus_results = false;
     bool focus_console_input = false;
+    bool focus_structure = false, focus_strings = false, focus_hashes = false;
+
+    // Feature panels (self-contained; App members so their worker threads are joined before exit).
+    StringsPanel strings_panel;
+    HashPanel hash_panel;
+    CStructDialog cstruct_dlg;
 
     FindState find;
     SaveTask save;
@@ -280,7 +299,11 @@ Tab* find_tab(App& app, uint64_t doc_id);
 // Active tab's document if it may be touched right now (not saving), else nullptr.
 Document* usable_doc(App& app);
 // Select [offset, offset+len) with the caret at `offset`, scroll it into view, optionally focus.
+// A "big jump": the position it leaves is pushed onto the tab's NavHistory (Back returns to it).
 void reveal_range(App& app, Tab& tab, uint64_t offset, uint64_t len, bool focus_view);
+// Follow pointer: decode the `width`-byte pointer at `at` (byte order `big_endian`, minus
+// settings.pointer_base) and jump there (recorded in the history). Reports failures in the status bar.
+bool follow_pointer(App& app, Tab& tab, uint64_t at, int width, bool big_endian);
 void set_status(App& app, const std::string& text, double seconds = 4.0);
 void notify(App& app, const std::string& text, bool error);
 void show_message(App& app, const std::string& title, const std::string& text);

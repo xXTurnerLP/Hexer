@@ -3,3 +3,4 @@
 !/subprojects/packagefiles/
 /subprojects/packagecache/
 *.ppm
+/.claude/worktrees/

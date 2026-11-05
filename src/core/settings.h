@@ -14,7 +14,13 @@ struct Settings {
     bool uppercase_hex = true;
     bool show_ascii = true;
     bool insert_mode = false;          // default typing mode for new tabs
-    bool big_endian_inspector = false;
+    bool big_endian_inspector = false;  // also the byte order of Follow pointer (Ctrl+click)
+    // Follow pointer: a Ctrl+click reads an unsigned pointer_width-byte integer (1, 2, 4 or 8) at
+    // the byte and jumps to value - pointer_base (e.g. a load address).
+    int pointer_width = 4;
+    uint64_t pointer_base = 0;
+    // Hashes panel: selected algorithms, comma-separated display names ("" = the defaults).
+    std::string hash_algorithms;
     float font_size = 16.0f;           // monospace font pixel size (Ctrl +/- / Ctrl+wheel)
     // User zoom factor for the UI on top of the monitor's content scale (DPI), which is read at
     // startup and followed when the window moves to another monitor: 1.0 = native size everywhere.
