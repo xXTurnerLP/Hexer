@@ -1,6 +1,7 @@
 """Generate Hexer's app icon (stdlib only, no PIL).
 
-Draws the icon with signed-distance shapes + supersampling so every size is crisp, then writes:
+Draws the icon with signed-distance shapes + supersampling (anti-aliased at every size; 16/24/32 px
+use whole-pixel layouts so vertical strokes stay sharp), then writes:
   assets/icon/hexer-<N>.png      for N in SIZES (Linux hicolor theme / docs)
   assets/icon/hexer.ico          multi-size Windows icon (PNG-compressed entries)
   src/ui/icon_data.h             RGBA pixels for glfwSetWindowIcon (Linux/X11 window icon)
@@ -42,9 +43,9 @@ def sd_round_rect(px, py, cx, cy, hw, hh, r):
 
 
 def sd_hexagon(px, py, cx, cy, r):
-    """Flat-top regular hexagon with circumradius r (iq's exact SDF, rotated)."""
+    """Pointy-top regular hexagon with circumradius r (iq's exact SDF, rotated)."""
     kx, ky, kz = -0.866025404, 0.5, 0.577350269
-    x, y = abs(py - cy), abs(px - cx)  # swap -> flat top
+    x, y = abs(py - cy), abs(px - cx)  # swap -> pointy top (vertical sides)
     d = 2.0 * min(kx * x + ky * y, 0.0)
     x -= d * kx
     y -= d * ky
@@ -81,29 +82,81 @@ ACC_B = hexc("#22d3c5")   # teal
 INK = hexc("#eef1f5")
 INK_DIM = hexc("#9aa3b2")
 
+# Small sizes (16 / 24 / 32 px): the same anti-aliased vector design, but laid out in whole pixels
+# so it stays crisp: the hexagon's vertical sides, the digit stems and the "0" ring sit exactly on
+# pixel columns/rows (sharp), while the hexagon diagonals and rounded corners stay anti-aliased like
+# the large sizes. All numbers below are in pixels of that size.
+#   margin  tile inset            hex_hw  half width of the hexagon (centre line of its vertical sides)
+#   hex_w   hexagon stroke        digits  ("1" | "0", x0, x1) boxes, rows y0..y1, stroke `stroke`
+SMALL = {
+    16: dict(margin=0, hex_hw=5.5, hex_w=1.0, y=(5, 11), stroke=1.0, zero_r=1.5,
+             digits=[("1", 4, 5), ("0", 6, 10), ("1", 11, 12)]),
+    24: dict(margin=1, hex_hw=7.5, hex_w=1.0, y=(9, 15), stroke=1.0, zero_r=1.5,
+             digits=[("1", 8, 9), ("0", 10, 14), ("1", 15, 16)]),
+    32: dict(margin=1, hex_hw=10.0, hex_w=2.0, y=(12, 20), stroke=1.5, zero_r=2.0,
+             digits=[("1", 11, 12.5), ("0", 13.5, 18.5), ("1", 19.5, 21)]),
+}
+
+
+def hex_gradient(x, y):
+    return mix(ACC_A, ACC_B, clamp((x + y - 0.45) / 1.1))
+
+
+def tile_layers(x, y, px, bg_r, rad):
+    """Background tile + rim. Returns (layers, d_bg) or (None, d_bg) outside the tile."""
+    d_bg = sd_round_rect(x, y, 0.5, 0.5, bg_r, bg_r, rad)
+    if d_bg > 0:
+        return None, d_bg
+    col = mix(BG_TOP, BG_BOT, clamp(y))
+    g = clamp(1.0 - math.hypot(x - 0.5, y - 0.45) / 0.55)  # soft inner glow towards the centre
+    col = mix(col, hexc("#23324f"), 0.35 * g * g)
+    layers = [(col, d_bg)]
+    rim_in, rim_w = max(0.012, 0.9 * px), max(0.006, 0.45 * px)
+    layers.append((RIM, abs(d_bg + rim_in) - rim_w, 0.55))
+    return layers, d_bg
+
+
+def design_small(size):
+    sp = SMALL[size]
+    px = 1.0 / size
+    bg_r = 0.5 - sp["margin"] * px
+    rad = 0.21 / 0.47 * bg_r                      # same corner ratio as the vector tile
+    hex_r = sp["hex_hw"] / 0.866025404 * px       # circumradius from the vertical sides' position
+    hex_w = sp["hex_w"] * px
+    y0, y1 = sp["y"]
+    st = sp["stroke"]
+
+    def shade(x, y):
+        layers, d_bg = tile_layers(x, y, px, bg_r, rad)
+        if layers is None:
+            return None, d_bg
+        layers.append((hex_gradient(x, y), abs(sd_hexagon(x, y, 0.5, 0.5, hex_r)) - hex_w / 2))
+        X, Y = x * size, y * size
+        for ch, x0, x1 in sp["digits"]:
+            cx, hw, cy, hh = (x0 + x1) / 2, (x1 - x0) / 2, (y0 + y1) / 2, (y1 - y0) / 2
+            if ch == "1":
+                d = sd_round_rect(X, Y, cx, cy, hw, hh, 0.0)
+            else:
+                d = abs(sd_round_rect(X, Y, cx, cy, hw - st / 2, hh - st / 2, sp["zero_r"] - st / 2)) - st / 2
+            layers.append((INK, d * px))
+        return layers, d_bg
+
+    return shade
+
 
 def design(size):
-    """Returns a function (x, y) -> (r, g, b, a) in unit coords, tuned per pixel size."""
-    small = size <= 24
+    """Returns a function (x, y) -> (layers, d_bg) in unit coords, tuned per pixel size."""
+    if size in SMALL:
+        return design_small(size)
     px = 1.0 / size  # one pixel in unit space (for stroke minimums)
-
-    bg_r = 0.47
-    rad = 0.21
-    hex_r = 0.40 if small else 0.355
-    hex_w = max(0.10 if small else 0.052, 1.6 * px)
-    cy = 0.5
-
-    # digits: "1 0 1" (>= 32 px) or "1 0" (small sizes)
-    if small:
-        glyphs = [("1", 0.37), ("0", 0.60)]
-        gh, gw, stroke = 0.19, 0.12, 1.0 * px
-    else:
-        glyphs = [("1", 0.355), ("0", 0.50), ("1", 0.645)]
-        gh, gw, stroke = 0.125, 0.058, max(0.046, 1.3 * px)
+    bg_r, rad, hex_r, cy = 0.47, 0.21, 0.355, 0.5
+    hex_w = max(0.052, 1.6 * px)
+    glyphs = [("1", 0.355), ("0", 0.50), ("1", 0.645)]
+    gh, gw, stroke = 0.125, 0.058, max(0.046, 1.3 * px)
 
     if size <= 48:
-        # Pixel-fit small sizes: whole-pixel stroke widths, strokes centred so their edges land on
-        # pixel boundaries -> crisp digits instead of grey smears.
+        # Pixel-fit: whole-pixel stroke widths, strokes centred so their edges land on pixel
+        # boundaries -> crisp digits instead of grey smears.
         def snap_w(w):
             return max(1, round(w * size)) / size
 
@@ -111,7 +164,7 @@ def design(size):
             n = round(w * size)
             return (math.floor(c * size) + 0.5) / size if n % 2 else round(c * size) / size
 
-        stroke = snap_w(stroke) if small else max(2.0 / size, snap_w(stroke))
+        stroke = max(2.0 / size, snap_w(stroke))
         hex_w = snap_w(hex_w)
         glyphs = [(ch, snap_c(gx, stroke)) for ch, gx in glyphs]
         # ring half-width (centre line) so the ring's outer edges are on pixel boundaries
@@ -121,29 +174,17 @@ def design(size):
         gh = cy - top
 
     def shade(x, y):
-        # background tile
-        d_bg = sd_round_rect(x, y, 0.5, 0.5, bg_r, bg_r, rad)
-        if d_bg > 0:
+        layers, d_bg = tile_layers(x, y, px, bg_r, rad)
+        if layers is None:
             return None, d_bg
-        col = mix(BG_TOP, BG_BOT, clamp(y))
-        # soft inner glow towards the centre
-        g = clamp(1.0 - math.hypot(x - 0.5, y - 0.45) / 0.55)
-        col = mix(col, hexc("#23324f"), 0.35 * g * g)
-        layers = [(col, d_bg)]
-        # rim highlight (1px-ish inside edge)
-        layers.append((RIM, abs(d_bg + max(0.012, 0.9 * px)) - max(0.006, 0.45 * px), 0.55))
-        # hexagon outline with diagonal gradient
         d_hex = abs(sd_hexagon(x, y, 0.5, cy, hex_r)) - hex_w / 2
-        t = clamp((x + y - 0.45) / 1.1)
-        layers.append((mix(ACC_A, ACC_B, t), d_hex))
-        # glyphs
+        layers.append((hex_gradient(x, y), d_hex))
         for ch, gx in glyphs:
             if ch == "1":
                 d = sd_capsule_v(x, y, gx, cy - gh + stroke / 2, cy + gh - stroke / 2, stroke / 2)
-                layers.append((INK, d))
             else:
                 d = sd_ellipse_ring(x, y, gx, cy, gw, gh - stroke / 2, stroke)
-                layers.append((INK, d))
+            layers.append((INK, d))
         return layers, d_bg
 
     return shade
@@ -174,13 +215,13 @@ def render(size, ss=6):
                     acc[1] += g * a
                     acc[2] += b * a
                     acc[3] += a
-            n = ss * ss
-            a = acc[3] / n
+            a = acc[3] / (ss * ss)
             k = (j * size + i) * 4
             if a > 0:
-                out[k + 0] = int(round(clamp(acc[0] / acc[3]) * 255))
-                out[k + 1] = int(round(clamp(acc[1] / acc[3]) * 255))
-                out[k + 2] = int(round(clamp(acc[2] / acc[3]) * 255))
+                col = (acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3])
+                out[k + 0] = int(round(clamp(col[0]) * 255))
+                out[k + 1] = int(round(clamp(col[1]) * 255))
+                out[k + 2] = int(round(clamp(col[2]) * 255))
             out[k + 3] = int(round(a * 255))
     return bytes(out)
 
