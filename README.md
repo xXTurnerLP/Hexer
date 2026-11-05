@@ -312,9 +312,19 @@ mouse, `Ctrl+click` follows the pointer there, right-click opens the context men
 
 Hexer never asks whether to save when you close it. Instead it writes a session to
 `<config>/session/`: the open tabs, each document's unsaved edits and full undo/redo history,
-cursor, selection, scroll position and bookmarks, plus each tab's split view, live tail and Parse
-at offset, and the Compare tab. The session is also autosaved a few seconds after each change,
-so a crash loses almost nothing. The next launch restores everything.
+cursor, selection, scroll position and bookmarks, plus each tab's split view, live tail, Parse
+at offset, insert mode, Back / Forward history, Packets filter and "Parse with" parser, and the
+Compare tab, the Find bar's pattern, the Bitmap panel's fixed start and an unsaved C Struct to
+Parser draft. The session is also autosaved a few seconds after each change, so a crash loses
+almost nothing. The next launch restores everything.
+
+Independent of hot exit, `settings.ini` remembers which panels are open (a panel you closed stays
+closed), the window's size, position and maximized state (put back on a connected monitor, else
+centred on the main one), and the panels' options (Find kind / Ignore case, Strings encodings and
+minimum length, XOR transforms, Bitmap format / zoom / Fit / Alpha / source, Packets Absolute
+time / Payload only, Compare Sync scroll / caret, Disassembly options, console Word wrap). The
+console's Up / Down history is kept in `<config>/console_history.txt`. The dock layout itself is
+in `<config>/layout.ini` (View > Reset Layout rebuilds it).
 
 - Only your **edits** are stored, never a copy of the original file. A restored tab reads its
   original bytes from the file on disk.

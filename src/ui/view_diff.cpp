@@ -11,6 +11,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
+#include "core/settings.h"
 #include "core/util.h"
 
 namespace hx {
@@ -113,6 +114,18 @@ std::string shift_message(const ShiftResult& r) {
 
 DiffView::DiffView() = default;
 DiffView::~DiffView() = default;
+
+void DiffView::load_settings(const Settings& s) {
+    sync_scroll = s.compare_sync_scroll;
+    sync_caret = s.compare_sync_caret;
+}
+
+bool DiffView::save_settings(Settings& s) const {
+    if (s.compare_sync_scroll == sync_scroll && s.compare_sync_caret == sync_caret) return false;
+    s.compare_sync_scroll = sync_scroll;
+    s.compare_sync_caret = sync_caret;
+    return true;
+}
 
 // Offset on the other side: A -> B adds the shift, B -> A subtracts it (saturating).
 uint64_t DiffView::map_off(uint64_t off, bool a_to_b) const {

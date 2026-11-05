@@ -41,6 +41,19 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Follow pointer type picked in the Inspector: clicking an integer row (int8..uint64, 24-bit
       too) sets width + signedness (byte order = LE/BE), the row is marked and its bytes are
       outlined in the hex view; signed and relative pointers; Structure fields follow as their own type
+- [x] Windows and options persist across restarts: which panels are open (a closed panel stays
+      closed, an opened one stays open; Packets / Regions only auto-open for a newly opened capture /
+      process), the OS window's size / position / maximized state (restored onto a connected
+      monitor's work area, else centred on the primary), the Find bar kind + Ignore case, console
+      Word wrap + Up/Down history (`console_history.txt`), Strings / XOR / Bitmap (Fit, Alpha,
+      follow source) / Packets (Absolute time, Payload only) / Compare (Sync scroll / caret)
+      options; per tab: insert mode, Back / Forward history, Packets filter + "Parse with"; per
+      session: Find pattern, Bitmap fixed start, the C Struct to Parser draft (see CLAUDE.md
+      "Persistence")
+- [ ] Persistence follow-ups: script `doc:jump` / `doc:select` do not record Back / Forward
+      history (move_view sets the caret before ScriptHost::reveal); Regions / Modules filters and
+      in-panel tab choices (XOR, Regions) stay transient; Reset Layout re-shows the default panels
+      but leaves on-demand ones open
 
 ## Later
 - [x] History panel (View > History: every undo state with its label and changed range; click to

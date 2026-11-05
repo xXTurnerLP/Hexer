@@ -29,6 +29,7 @@ struct ImFont;
 namespace hx {
 
 class Document;
+struct Settings;
 
 struct XorPanelCallbacks {
     std::function<void(uint64_t offset, uint64_t len)> jump;  // select [offset, offset+len) and reveal it
@@ -55,6 +56,11 @@ struct XorPanel {
     float ui_scale = 1.0f;
 
     static constexpr size_t kGuessMax = size_t(256) << 10;  // bytes of the selection key_guess reads
+
+    // Options <-> settings.ini (Settings::xor_*: the transforms and the key length): load_settings at startup; save_settings writes
+    // them back and returns true when one changed (the host then saves settings.ini).
+    void load_settings(const Settings& s);
+    bool save_settings(Settings& s) const;
 
     // Draws the panel contents into the current window (the caller owns Begin/End). `doc` may be
     // null. Only "Decode selection" changes the document (through cb.apply / Document undo).

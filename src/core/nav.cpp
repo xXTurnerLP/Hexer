@@ -1,8 +1,11 @@
 #include "core/nav.h"
 
+#include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/document.h"
@@ -39,6 +42,45 @@ NavEntry NavHistory::forward(const NavEntry& current) {
     fwd_.pop_back();
     push_capped(back_, current);
     return t;
+}
+
+void NavHistory::set_stacks(std::vector<NavEntry> back, std::vector<NavEntry> forward) {
+    back_ = std::move(back);
+    fwd_ = std::move(forward);
+    if (back_.size() > kMax) back_.erase(back_.begin(), back_.begin() + ptrdiff_t(back_.size() - kMax));
+    if (fwd_.size() > kMax) fwd_.erase(fwd_.begin(), fwd_.begin() + ptrdiff_t(fwd_.size() - kMax));
+}
+
+std::string nav_encode(const std::vector<NavEntry>& stack) {
+    std::string s;
+    for (const NavEntry& e : stack) {
+        if (!s.empty()) s += ' ';
+        s += std::to_string(e.offset) + ':' + std::to_string(e.length);
+    }
+    return s;
+}
+
+std::vector<NavEntry> nav_decode(const std::string& text, uint64_t size) {
+    std::vector<NavEntry> out;
+    auto num = [](const std::string& t, uint64_t& v) {
+        auto r = std::from_chars(t.data(), t.data() + t.size(), v);
+        return !t.empty() && r.ec == std::errc() && r.ptr == t.data() + t.size();
+    };
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find(' ', pos);
+        if (end == std::string::npos) end = text.size();
+        const std::string item = text.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t colon = item.find(':');
+        NavEntry e;
+        if (colon == std::string::npos || !num(item.substr(0, colon), e.offset) || !num(item.substr(colon + 1), e.length))
+            continue;
+        e.offset = std::min(e.offset, size);
+        e.length = std::min(e.length, size - e.offset);
+        out.push_back(e);
+    }
+    return out;
 }
 
 void NavHistory::clear() {

@@ -1197,8 +1197,11 @@ void run_console_input(App& app) {
         return;
     }
     auto& h = app.console_history;
-    if (h.empty() || h.back() != code) h.push_back(code);
-    if (h.size() > 100) h.erase(h.begin());
+    if (h.empty() || h.back() != code) {
+        h.push_back(code);
+        if (h.size() > 100) h.erase(h.begin());
+        save_history(paths::console_history_file(), h);  // global, like a shell history
+    }
     app.console_force_scroll = true;
     app.engine->exec(code);
 }
@@ -1625,16 +1628,7 @@ void draw_bitmap_panel(App& app) {
     }
     bp.draw(t ? t->doc.get() : nullptr, cursor, top, cb);  // a busy document is not read
     if (bp.wants_frames()) app.wants_poll = true;
-    // Remember format / width / zoom ("" = the default format, Gray 8-bit).
-    Settings& s = app.settings;
-    const std::string fmt = bp.format == PixelFormat::Gray8 ? std::string() : std::string(pixel_format_name(bp.format));
-    if (fmt != s.bitmap_format || bp.width != s.bitmap_width || bp.zoom != s.bitmap_zoom) {
-        s.bitmap_format = fmt;
-        s.bitmap_width = bp.width;
-        s.bitmap_zoom = bp.zoom;
-        mark_settings_dirty(app);
-    }
-    ImGui::End();
+    ImGui::End();  // its options are saved by store_ui_settings
 }
 
 void draw_packets_panel(App& app) {
@@ -1898,36 +1892,6 @@ void draw_status_bar(App& app) {
 // Disassembly (self-contained panel, ui/panel_disasm.h)
 // =============================================================================================
 
-namespace {
-
-// Writes the panel's options back into app.settings (settings.ini) when one changed.
-void save_disasm_settings(App& app) {
-    const DisasmPanel& dp = app.disasm_panel;
-    Settings& s = app.settings;
-    const bool att = dp.syntax == DisasmSyntax::Att;
-    if (s.disasm_mode == dp.mode && s.disasm_att == att && s.disasm_uppercase == dp.uppercase &&
-        s.disasm_follow == dp.follow && s.disasm_bytes == dp.show_bytes)
-        return;
-    s.disasm_mode = dp.mode;
-    s.disasm_att = att;
-    s.disasm_uppercase = dp.uppercase;
-    s.disasm_follow = dp.follow;
-    s.disasm_bytes = dp.show_bytes;
-    mark_settings_dirty(app);
-}
-
-}  // namespace
-
-void load_disasm_settings(App& app) {
-    DisasmPanel& dp = app.disasm_panel;
-    const Settings& s = app.settings;
-    dp.mode = s.disasm_mode;
-    dp.syntax = s.disasm_att ? DisasmSyntax::Att : DisasmSyntax::Intel;
-    dp.uppercase = s.disasm_uppercase;
-    dp.follow = s.disasm_follow;
-    dp.show_bytes = s.disasm_bytes;
-}
-
 void draw_disasm_panel(App& app) {
     dock_like(kWinStructure);  // the right column: a tall listing
     if (!begin_panel(kWinDisasm, &app.show_disasm)) return;
@@ -1958,8 +1922,7 @@ void draw_disasm_panel(App& app) {
     };
     cb.notify = [&app](const std::string& m) { set_status(app, m); };
     const uint64_t caret = t && !t->doc->busy() ? focus_offset(t->doc->view()) : 0;
-    dp.draw(t ? t->doc.get() : nullptr, caret, cb);
-    save_disasm_settings(app);
+    dp.draw(t ? t->doc.get() : nullptr, caret, cb);  // its options are saved by store_ui_settings
     ImGui::End();
 }
 

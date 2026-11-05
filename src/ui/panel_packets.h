@@ -22,7 +22,7 @@
 //     a parser chosen in "Parse with", the same range is also handed to cb.parse: stepping through
 //     packets re-parses each one (the protocol-analysis loop).
 // State (index, filter, selection, parser choice) is kept per document (by Document::id()); call
-// forget() when a document is closed.
+// forget() when a document is closed. Absolute time / Payload only apply to every document.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -40,6 +40,7 @@ struct ImFont;
 namespace hx {
 
 class Document;
+struct Settings;
 
 struct PacketsPanelCallbacks {
     std::function<void(uint64_t offset, uint64_t len)> select;  // select [offset, offset+len) and reveal it
@@ -64,6 +65,18 @@ struct PacketsPanel {
     size_t filter_sync_max = kFilterSyncMax;  // more packets than this: the filter runs on a worker
     uint64_t stream_max = kTcpStreamMax;      // bytes of a followed TCP stream
     bool follow_interleaved = false;          // the last Follow TCP Stream choice (palette actions)
+    bool absolute_time = false;               // Time column: UTC time of day (else relative)
+    bool payload_only = false;                // a row selects / parses only its L7 payload
+
+    // Absolute time / Payload only / follow_interleaved <-> settings.ini (Settings::packets_*):
+    // load_settings at startup; save_settings writes them back, true when one changed.
+    void load_settings(const Settings& s);
+    bool save_settings(Settings& s) const;
+    // Per-document choices <-> Document extras (hot exit): "packets.filter" = the filter box,
+    // "packets.parser" = the "Parse with" parser ("" erases). restore_extras applies the filter
+    // as typed (it filters once the capture is indexed); a no-op for a document without them.
+    void save_extras(Document& doc) const;
+    void restore_extras(const Document& doc);
 
     // Draws the panel contents into the current window (the caller owns Begin/End). `doc` may be
     // null. Never mutates the document. `parser_names` fills the "Parse with" combo.

@@ -55,8 +55,6 @@ void disasm_go_to_entry(App& app);
 void disasm_follow_target(App& app);
 // Shows the Disassembly panel with its "Go to Symbol" list (PE exports / imports, ELF symbols).
 void disasm_go_to_symbol(App& app);
-// Reads the Disassembly panel options (mode, syntax, uppercase, follow, bytes) from app.settings.
-void load_disasm_settings(App& app);
 void draw_status_bar(App& app);            // fixed bottom bar (call before the dockspace)
 
 // Bookmark the selection (or the caret byte) of `d`, undoable; reports in the status bar.

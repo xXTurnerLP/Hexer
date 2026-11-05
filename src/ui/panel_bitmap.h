@@ -31,6 +31,7 @@ struct ImGuiContext;
 namespace hx {
 
 class Document;
+struct Settings;
 
 struct BitmapPanelCallbacks {
     std::function<void(uint64_t offset)> jump;                   // move the hex caret there + reveal
@@ -61,6 +62,14 @@ public:
     ImFont* mono = nullptr;        // font for offsets (nullptr = current font)
     float ui_scale = 1.0f;
 
+    // Options <-> settings.ini (Settings::bitmap_*: format, width, zoom, Fit, Alpha and the follow
+    // source): load_settings at startup; save_settings writes them back and returns true when one
+    // changed (the host then saves settings.ini). "Fixed offset" is not a setting (an offset
+    // belongs to one file): save_settings keeps the saved follow source while it is on, and the
+    // host keeps the fixed offset in its session (fixed_offset / set_fixed_offset).
+    void load_settings(const Settings& s);
+    bool save_settings(Settings& s) const;
+
     // Draws into the current window (the caller owns Begin/End). `doc` may be null. `cursor` is the
     // hex caret (doc->view().cursor, or focus_offset()), `view_top_offset` the first byte of the hex
     // view's top row. Never mutates the document; a busy (saving) document is not read.
@@ -82,6 +91,7 @@ public:
         source = BitmapSource::Fixed;
         fixed_ = off;
     }
+    uint64_t fixed_offset() const { return fixed_; }  // the "Fixed offset" source value
 
     // The last draw (for headless tests, tests/test_panels.cpp): the image's top-left screen
     // corner, and the decoded window: zoom, cols x rows pixels (packed 0xAABBGGRR, row-major).

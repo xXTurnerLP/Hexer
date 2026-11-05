@@ -17,6 +17,7 @@
 
 #include "core/diff.h"
 #include "core/document.h"
+#include "core/settings.h"
 #include "ui/hex_view.h"
 #include "ui/view_diff.h"
 
@@ -212,4 +213,20 @@ TEST_CASE("diffview: both sides scroll together, the shift applied") {
     c.a->view().top_row = 10;
     c.frame();
     CHECK(c.b->view().top_row != 26);
+}
+
+TEST_CASE("diffview: Sync scroll / Sync caret load from and save to Settings") {
+    Settings s;
+    DiffView dv;
+    CHECK_FALSE(dv.save_settings(s));  // the view's defaults are the settings' defaults
+    dv.sync_scroll = false;
+    dv.sync_caret = true;
+    CHECK(dv.save_settings(s));
+    CHECK_FALSE(dv.save_settings(s));
+    CHECK_FALSE(s.compare_sync_scroll);
+    CHECK(s.compare_sync_caret);
+    DiffView next;  // the next compare starts with the user's choice
+    next.load_settings(s);
+    CHECK_FALSE(next.sync_scroll);
+    CHECK(next.sync_caret);
 }

@@ -13,6 +13,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
+#include "core/settings.h"
 #include "core/util.h"
 
 namespace hx {
@@ -111,6 +112,27 @@ struct DisasmPanel::DocState {
 
 DisasmPanel::DisasmPanel() = default;
 DisasmPanel::~DisasmPanel() = default;
+
+void DisasmPanel::load_settings(const Settings& s) {
+    mode = s.disasm_mode >= 0 && s.disasm_mode <= 2 ? s.disasm_mode : 0;  // unknown: auto
+    syntax = s.disasm_att ? DisasmSyntax::Att : DisasmSyntax::Intel;
+    uppercase = s.disasm_uppercase;
+    follow = s.disasm_follow;
+    show_bytes = s.disasm_bytes;
+}
+
+bool DisasmPanel::save_settings(Settings& s) const {
+    const bool att = syntax == DisasmSyntax::Att;
+    if (s.disasm_mode == mode && s.disasm_att == att && s.disasm_uppercase == uppercase && s.disasm_follow == follow &&
+        s.disasm_bytes == show_bytes)
+        return false;
+    s.disasm_mode = mode;
+    s.disasm_att = att;
+    s.disasm_uppercase = uppercase;
+    s.disasm_follow = follow;
+    s.disasm_bytes = show_bytes;
+    return true;
+}
 
 DisasmPanel::DocState& DisasmPanel::state(const Document& doc) {
     std::unique_ptr<DocState>& p = docs_[doc.id()];

@@ -15,6 +15,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
+#include "core/settings.h"
 #include "core/util.h"
 
 namespace hx {
@@ -92,8 +93,6 @@ struct PacketsPanel::DocState {
     std::unordered_map<size_t, PacketInfo> cache;  // visible rows
     size_t selected = SIZE_MAX;                   // packet index
     size_t scroll_to = SIZE_MAX;                  // row to bring into view on this draw
-    bool absolute_time = false;
-    bool payload_only = false;
     std::string parser;                           // "" = none (select only)
 
     void reset_filter(size_t sync_max) {
@@ -153,6 +152,38 @@ PacketsPanel::DocState& PacketsPanel::state(uint64_t doc_id) {
     auto& p = docs_[doc_id];
     if (!p) p = std::make_unique<DocState>();
     return *p;
+}
+
+void PacketsPanel::load_settings(const Settings& s) {
+    absolute_time = s.packets_absolute_time;
+    payload_only = s.packets_payload_only;
+    follow_interleaved = s.packets_follow_interleaved;
+}
+
+bool PacketsPanel::save_settings(Settings& s) const {
+    if (s.packets_absolute_time == absolute_time && s.packets_payload_only == payload_only &&
+        s.packets_follow_interleaved == follow_interleaved)
+        return false;
+    s.packets_absolute_time = absolute_time;
+    s.packets_payload_only = payload_only;
+    s.packets_follow_interleaved = follow_interleaved;
+    return true;
+}
+
+void PacketsPanel::save_extras(Document& doc) const {
+    auto it = docs_.find(doc.id());
+    const DocState* st = it != docs_.end() ? it->second.get() : nullptr;
+    doc.set_extra("packets.filter", st ? st->filter_text : std::string());
+    doc.set_extra("packets.parser", st ? st->parser : std::string());
+}
+
+void PacketsPanel::restore_extras(const Document& doc) {
+    const std::string f = doc.extra("packets.filter"), parser = doc.extra("packets.parser");
+    if (f.empty() && parser.empty()) return;
+    DocState& st = state(doc.id());
+    st.parser = parser;
+    st.filter_text = f;
+    st.set_filter_text(filter_sync_max);  // applied once the index is there (an invalid one shows its error)
 }
 
 void PacketsPanel::forget(uint64_t doc_id) {
@@ -370,11 +401,11 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
         }
     }
     ImGui::SameLine();
-    ImGui::Checkbox("Absolute time", &st.absolute_time);
+    ImGui::Checkbox("Absolute time", &absolute_time);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("UTC time of day instead of seconds since the first packet (hover a row for the date)");
     ImGui::SameLine();
-    ImGui::Checkbox("Payload only", &st.payload_only);
+    ImGui::Checkbox("Payload only", &payload_only);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Select / parse only the L7 payload (after the TCP / UDP / ... header)");
 
@@ -401,7 +432,7 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
     ImGui::SameLine();
     const bool can_parse = st.res && st.selected < st.packet_count() && !st.parser.empty();
     ImGui::BeginDisabled(!can_parse);
-    if (ImGui::Button("Parse") && can_parse) activate(*st.res, st.selected, st.payload_only, st.parser, cb);
+    if (ImGui::Button("Parse") && can_parse) activate(*st.res, st.selected, payload_only, st.parser, cb);
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::GetContentRegionAvail().x >= 260.0f * s) {
@@ -565,7 +596,7 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
         if (next != SIZE_MAX && next != cur) {
             st.selected = st.packet_at(next);
             st.scroll_to = next;
-            activate(res, st.selected, st.payload_only, st.parser, cb);
+            activate(res, st.selected, payload_only, st.parser, cb);
         }
     }
 
@@ -596,7 +627,7 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
             std::snprintf(buf, sizeof buf, "%llu", static_cast<unsigned long long>(i + 1));
             if (ImGui::Selectable(buf, st.selected == i, ImGuiSelectableFlags_SpanAllColumns)) {
                 st.selected = i;
-                activate(res, i, st.payload_only, st.parser, cb);
+                activate(res, i, payload_only, st.parser, cb);
             }
             {
                 const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
@@ -635,7 +666,7 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
             ImGui::TextUnformatted(fmt_off(p.record_off).c_str());
             ImGui::TableSetColumnIndex(2);
             if (p.ts_ns == kNoTimestamp) ImGui::TextDisabled("-");
-            else if (st.absolute_time) ImGui::TextUnformatted(fmt_pcap_abstime(p.ts_ns, ix.time_decimals).substr(11).c_str());
+            else if (absolute_time) ImGui::TextUnformatted(fmt_pcap_abstime(p.ts_ns, ix.time_decimals).substr(11).c_str());
             else ImGui::TextUnformatted(fmt_pcap_reltime(int64_t(uint64_t(p.ts_ns) - uint64_t(st.first_ts)), ix.time_decimals).c_str());
             if (mono) ImGui::PopFont();
             ImGui::TableSetColumnIndex(3);

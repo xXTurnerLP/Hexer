@@ -420,3 +420,31 @@ TEST_CASE("nav: settings follow pointer type round trip") {
     CHECK(u.pointer_type() == ptype(3, true, true, true, 0x400000));
     std::filesystem::remove_all(dir, ec);
 }
+
+TEST_CASE("nav: Back / Forward stacks as session text (encode, decode, clamp, set_stacks)") {
+    const std::vector<NavEntry> back = {{0, 0}, {0x1000, 16}, {123456789012ull, 4}};
+    const std::string text = nav_encode(back);
+    CHECK(text == "0:0 4096:16 123456789012:4");
+    CHECK(nav_encode({}).empty());
+    CHECK(nav_decode(text, UINT64_MAX) == back);
+    CHECK(nav_decode("", 100).empty());
+    // Clamped to the document (it may have shrunk since): offset <= size, offset + length <= size.
+    CHECK(nav_decode(text, 4100) == std::vector<NavEntry>{{0, 0}, {4096, 4}, {4100, 0}});
+    // Malformed entries are skipped, the rest kept.
+    CHECK(nav_decode("5:1 x:2 7 :3 8: -1:0 9:9z  10:0", 100) == std::vector<NavEntry>{{5, 1}, {10, 0}});
+    CHECK(nav_decode("99999999999999999999:0 3:0", 100) == std::vector<NavEntry>{{3, 0}});
+
+    NavHistory h;
+    std::vector<NavEntry> big;
+    for (uint64_t i = 0; i < NavHistory::kMax + 10; ++i) big.push_back({i, 0});
+    h.set_stacks(big, {{7, 1}});
+    REQUIRE(h.back_stack().size() == NavHistory::kMax);
+    CHECK(h.back_stack().front().offset == 10);  // the oldest entries are dropped
+    CHECK(h.back_stack().back().offset == NavHistory::kMax + 9);
+    REQUIRE(h.forward_stack().size() == 1);
+    CHECK(h.forward(NavEntry{50, 0}) == NavEntry{7, 1});
+    CHECK(h.back(NavEntry{7, 1}) == NavEntry{50, 0});
+    h.set_stacks({}, {});
+    CHECK_FALSE(h.can_back());
+    CHECK_FALSE(h.can_forward());
+}

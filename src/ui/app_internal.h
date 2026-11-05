@@ -263,8 +263,11 @@ struct App final : ScriptHost {
     std::vector<std::unique_ptr<Tab>> closed;  // reopen with Ctrl+Shift+T (max 20)
     int untitled_counter = 0;
     std::vector<std::string> pending_open;     // drag & drop paths, processed next frame
+    bool restoring = false;           // restore_session is adding the session's tabs (no auto-show)
 
-    // Panels / layout.
+    // Panels / layout. The show_* flags are settings.ini panel_* (load_ui_settings /
+    // store_ui_settings); Packets / Regions also open by themselves when a capture / process is
+    // opened (not when the session restores one: then the saved visibility wins).
     bool show_inspector = true, show_structure = true, show_console = true, show_results = true,
          show_bookmarks = true, show_strings = true, show_hashes = true;
     bool show_bitmap = false, show_packets = false;  // opened on demand (Packets: for captures)
@@ -406,6 +409,11 @@ bool open_path(App& app, const std::string& path);
 // active file's folder. False when cancelled (dialog errors are reported).
 bool save_file_dialog(App& app, const std::string& default_name, std::string& out);
 void mark_settings_dirty(App& app);
+// Persistence of UI state (see CLAUDE.md "Persistence"): load_ui_settings copies settings.ini
+// values into App / panel state at startup; store_ui_settings copies them back (every frame and
+// before the final save) and marks the settings dirty when one changed.
+void load_ui_settings(App& app);
+void store_ui_settings(App& app);
 // Status text for an edit call that returned false.
 void report_edit_failure(App& app, const Document& doc);
 std::string fmt_offset(uint64_t v);  // "0x0000001F" (at least 8 hex digits)

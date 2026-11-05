@@ -12,6 +12,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
+#include "core/settings.h"
 #include "core/util.h"
 #include "ui/hex_view.h"
 
@@ -97,6 +98,27 @@ struct XorPanel::DocState {
 
 XorPanel::XorPanel() = default;
 XorPanel::~XorPanel() = default;
+
+void XorPanel::load_settings(const Settings& s) {
+    options.xor8 = s.xor_xor;
+    options.add8 = s.xor_add;
+    options.rol = s.xor_rol;
+    options.xor_multi = s.xor_key;
+    options.max_key_len = uint32_t(std::clamp(s.xor_max_key_len, 2, int(kXorMaxKeyLen)));
+}
+
+bool XorPanel::save_settings(Settings& s) const {
+    const int len = int(std::clamp<uint32_t>(options.max_key_len, 2, kXorMaxKeyLen));
+    if (s.xor_xor == options.xor8 && s.xor_add == options.add8 && s.xor_rol == options.rol &&
+        s.xor_key == options.xor_multi && s.xor_max_key_len == len)
+        return false;
+    s.xor_xor = options.xor8;
+    s.xor_add = options.add8;
+    s.xor_rol = options.rol;
+    s.xor_key = options.xor_multi;
+    s.xor_max_key_len = len;
+    return true;
+}
 
 XorPanel::DocState& XorPanel::state(uint64_t doc_id) {
     auto& p = docs_[doc_id];

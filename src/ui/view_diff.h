@@ -30,6 +30,7 @@
 namespace hx {
 
 class Document;
+struct Settings;
 
 struct DiffViewCallbacks {
     // Base config for both hex views (font, font_size, bytes_per_row, group_size, uppercase,
@@ -66,6 +67,11 @@ public:
     int64_t shift = 0;        // B offset = A offset + shift
     bool sync_scroll = true;
     bool sync_caret = false;  // moving the caret on one side moves the other (shift applied)
+
+    // Sync scroll / Sync caret <-> settings.ini (Settings::compare_sync_*): the host applies them
+    // to every new DiffView; save_settings returns true when one changed.
+    void load_settings(const Settings& s);
+    bool save_settings(Settings& s) const;
 
     // Actions (e.g. from the host's menu / palette). Jumps apply on the next draw().
     void request_next() { nav_request_ = 1; }

@@ -16,6 +16,7 @@
 
 #include "core/document.h"
 #include "core/highlight.h"
+#include "core/settings.h"
 #include "core/util.h"
 #include "ui/hex_view.h"
 #include "ui/theme.h"
@@ -113,6 +114,33 @@ const char* source_name(BitmapSource s) {
 BitmapPanel::BitmapPanel() = default;
 
 BitmapPanel::~BitmapPanel() { shutdown(); }
+
+void BitmapPanel::load_settings(const Settings& s) {
+    format = PixelFormat::Gray8;
+    for (int i = 0; i < kPixelFormatCount; ++i)
+        if (s.bitmap_format == pixel_format_name(PixelFormat(i))) format = PixelFormat(i);
+    width = std::clamp(s.bitmap_width, 1, kMaxWidth);
+    zoom = std::clamp(s.bitmap_zoom, 1, kMaxZoom);
+    fit_width = s.bitmap_fit;
+    use_alpha = s.bitmap_alpha;
+    source = s.bitmap_source == 1 ? BitmapSource::FollowCursor : BitmapSource::FollowView;
+}
+
+bool BitmapPanel::save_settings(Settings& s) const {
+    // "" = the default format (Gray 8-bit), so an untouched choice follows future defaults.
+    const std::string fmt = format == PixelFormat::Gray8 ? std::string() : std::string(pixel_format_name(format));
+    const int src = source == BitmapSource::Fixed ? s.bitmap_source : source == BitmapSource::FollowCursor ? 1 : 0;
+    if (fmt == s.bitmap_format && width == s.bitmap_width && zoom == s.bitmap_zoom && fit_width == s.bitmap_fit &&
+        use_alpha == s.bitmap_alpha && src == s.bitmap_source)
+        return false;
+    s.bitmap_format = fmt;
+    s.bitmap_width = width;
+    s.bitmap_zoom = zoom;
+    s.bitmap_fit = fit_width;
+    s.bitmap_alpha = use_alpha;
+    s.bitmap_source = src;
+    return true;
+}
 
 void BitmapPanel::shutdown() {
     ImGuiContext* ctx = ImGui::GetCurrentContext();

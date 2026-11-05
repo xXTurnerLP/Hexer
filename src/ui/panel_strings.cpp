@@ -13,6 +13,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
+#include "core/settings.h"
 #include "core/util.h"
 #include "ui/hex_view.h"
 
@@ -49,6 +50,27 @@ struct StringsPanel::DocState {
 
 StringsPanel::StringsPanel() = default;
 StringsPanel::~StringsPanel() = default;
+
+void StringsPanel::load_settings(const Settings& s) {
+    options.ascii = s.strings_ascii;
+    options.utf16le = s.strings_utf16le;
+    options.utf16be = s.strings_utf16be;
+    options.include_newlines = s.strings_newlines;
+    options.min_length = uint32_t(std::clamp(s.strings_min_length, 1, 4096));
+}
+
+bool StringsPanel::save_settings(Settings& s) const {
+    const int min_len = int(std::clamp<uint32_t>(options.min_length, 1, 4096));
+    if (s.strings_ascii == options.ascii && s.strings_utf16le == options.utf16le && s.strings_utf16be == options.utf16be &&
+        s.strings_newlines == options.include_newlines && s.strings_min_length == min_len)
+        return false;
+    s.strings_ascii = options.ascii;
+    s.strings_utf16le = options.utf16le;
+    s.strings_utf16be = options.utf16be;
+    s.strings_newlines = options.include_newlines;
+    s.strings_min_length = min_len;
+    return true;
+}
 
 StringsPanel::DocState& StringsPanel::state(uint64_t doc_id) {
     auto& p = docs_[doc_id];

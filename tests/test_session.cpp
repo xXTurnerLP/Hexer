@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/nav.h"
 #include "core/os_file.h"
 #include "core/session.h"
 #include "core/settings.h"
@@ -412,4 +413,55 @@ TEST_CASE("settings: bookmarks_all_files round trip") {
         CHECK(c.bookmarks_all_files == want);
         CHECK(c.unknown_keys.empty());
     }
+}
+
+TEST_CASE("session: the app's per-tab and session-level persistence keys round trip") {
+    TempDir t;
+    auto a = make_doc("A", std::string(5000, 'a'));
+    auto b = make_doc("B", "bbbb");
+    const std::vector<NavEntry> back = {{0, 0}, {4096, 16}, {4999, 1}};
+    const std::vector<NavEntry> fwd = {{100, 0}};
+    // Per tab (App save_tab_extras / PacketsPanel::save_extras): insert mode, Back / Forward,
+    // the Packets filter and parser.
+    a->set_extra("edit.insert", "1");
+    a->set_extra("nav.back", nav_encode(back));
+    a->set_extra("nav.fwd", nav_encode(fwd));
+    a->set_extra("packets.filter", "ip.src == 10.0.0.1 and \"GET /x=1%\"");
+    a->set_extra("packets.parser", "My proto");
+    b->set_extra("edit.insert", "0");
+    // Session level (App save_session_extras): Find pattern, Bitmap fixed start, C struct draft.
+    const std::string pattern("DE AD\n\0\xff", 8);
+    const std::string draft = "struct hdr {\n\tuint32_t magic; // \"MZ\" = 0x5A4D\n\tchar name[8];\r\n};\n";
+    {
+        Session s(t.path());
+        s.set_extra("find.pattern", pattern);
+        s.set_extra("bitmap.fixed", "123456789012");
+        s.set_extra("cstruct.open", "1");
+        s.set_extra("cstruct.source", draft);
+        s.set_extra("cstruct.name", "My hdr");
+        s.set_extra("cstruct.root", "hdr");
+        s.set_extra("cstruct.endian", "be");
+        s.set_extra("cstruct.pack", "4");
+        REQUIRE(s.save({a.get(), b.get()}, 0));
+    }
+    Session s(t.path());
+    auto r = s.load();
+    REQUIRE(r.docs.size() == 2);
+    const Document& ra = *r.docs[0];
+    CHECK(ra.extra("edit.insert") == "1");
+    CHECK(nav_decode(ra.extra("nav.back"), ra.size()) == back);
+    CHECK(nav_decode(ra.extra("nav.fwd"), ra.size()) == fwd);
+    CHECK(ra.extra("packets.filter") == "ip.src == 10.0.0.1 and \"GET /x=1%\"");
+    CHECK(ra.extra("packets.parser") == "My proto");
+    CHECK(r.docs[1]->extra("edit.insert") == "0");
+    CHECK(r.docs[1]->extra("nav.back").empty());
+    CHECK(s.extra("find.pattern") == pattern);
+    CHECK(s.extra("bitmap.fixed") == "123456789012");
+    CHECK(s.extra("cstruct.open") == "1");
+    CHECK(s.extra("cstruct.source") == draft);
+    CHECK(s.extra("cstruct.name") == "My hdr");
+    CHECK(s.extra("cstruct.root") == "hdr");
+    CHECK(s.extra("cstruct.endian") == "be");
+    CHECK(s.extra("cstruct.pack") == "4");
+    s.clear();
 }

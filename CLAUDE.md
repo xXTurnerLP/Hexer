@@ -52,7 +52,8 @@ src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, 
              panel_xor, dialog_targets (Open Process / Open Disk + RegionsPanel) (App owns one of
              each), minimap (one per tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
              panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly);
-             panel_bitmap, panel_packets and view_diff are in hexer_ui_view too (headless tests)
+             panel_bitmap / panel_packets / view_diff / panel_strings / panel_xor are in
+             hexer_ui_view too (headless tests: test_panels / test_diffview)
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
@@ -146,10 +147,35 @@ LE/BE) is the one source; clicking an integer Inspector row sets it, `follow_poi
 The Inspector's Bits row (after "binary") has the selected integer row's width, else 8 bits; a
 click flips one bit through `inspector_toggle_bit()` (core/inspector.h, one undo step).
 
-Session extras: per-tab view state (Parse at, live tail, split) goes to `Document::set_extra` in
-`save_tab_extras()` (app.cpp) and comes back in `restore_tab_extras()`; state spanning tabs (the
-Compare tab) goes to `Session::set_extra`. Process documents are not persistable: the session
-skips them (hot exit drops them with a console line). The Disassembly panel keeps its per-doc
+Persistence (every new window / option must land in exactly one of these; nothing else persists):
+- **Global preferences** (how the user likes to work, all files): real `Settings` members
+  (core/settings.h) with a default, a range-checked `load` (bad values keep the default) and
+  `save`; keys are grouped by prefix (`window_*`, `panel_*`, `find_*`, `strings_*`, `xor_*`,
+  `bitmap_*`, `packets_*`, `compare_*`, `disasm_*`). A self-contained panel gets
+  `load_settings(const Settings&)` / `bool save_settings(Settings&) const` (true = changed);
+  App calls them in `load_ui_settings()` (startup, before the session) and `store_ui_settings()`
+  (every frame + shutdown; marks settings dirty, saved ~1 s later and on exit). App-level flags
+  (the `show_*` panel visibility, Find bar kind / Ignore case, console wrap) go through the same
+  two functions. Add a round trip + bad-value case to tests/test_search.cpp (`UiFields`).
+- **OS window**: `window_w/h` (logical px, i.e. / the monitor scale), `window_x/y` (+ `window_pos`),
+  `window_maximized`, tracked each frame while not minimized (`track_window`), applied to the
+  hidden window before it is shown (`place_window`: onto the work area it overlaps most, else
+  centred on the primary monitor; `window_area` / `fit_window` in settings.h are unit-tested).
+- **Dock layout, window positions, table columns**: ImGui's `layout.ini` (not panel visibility).
+- **Per-file view state** (only things that belong to one file): `Document::set_extra` in
+  `save_tab_extras()` (app.cpp) or the panel's `save_extras(Document&)` (Disassembly, Packets),
+  back in `restore_tab_extras()` / `restore_extras()`. Keys today: parse.*, tail.enabled,
+  split.*, edit.insert, nav.back / nav.fwd, disasm.*, packets.filter / packets.parser.
+- **Session working context spanning tabs**: `Session::set_extra` in `save_session_extras()`,
+  restored by `restore_session_extras()` / `restore_context_extras()`, and mixed into
+  `session_signature()` so a change triggers a save: compare.0 / active, find.pattern,
+  bitmap.fixed, cstruct.* (the C Struct to Parser draft + open state).
+- **Console input history**: `<config>/console_history.txt` (`load_history` / `save_history`).
+- Deliberately transient: search results, filters / inputs of pickers and popups, Whole file /
+  Selection radios (the actions set them), Writable checkboxes (safety), the Settings window.
+Packets / Regions auto-open when a capture / process is newly opened (`add_tab`), not when the
+session restores one (`App::restoring`): the saved `panel_*` visibility wins. Process documents
+are not persistable: the session skips them (hot exit drops them with a console line). The Disassembly panel keeps its per-doc
 state ("disasm.map" / "disasm.base" / "disasm.top") itself: `DisasmPanel::save_extras` /
 `restore_extras`, called next to the tab extras.
 

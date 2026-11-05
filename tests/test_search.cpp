@@ -1071,3 +1071,202 @@ TEST_CASE("search: Snapshot::readable_end finds the data before a hole") {
     CHECK(plain->readable_end(10, 500) == 100);
     CHECK(plain->readable_end(60, 50) == 60);
 }
+
+// ---- persisted UI state: main window, panel visibility, panel options ----
+
+namespace {
+
+// Every UI-state field added for persistence, as one comparable struct.
+struct UiFields {
+    int window_w, window_h, window_x, window_y;
+    bool window_pos, window_maximized;
+    bool p_insp, p_struct, p_console, p_results, p_bm, p_strings, p_hashes;
+    bool p_bitmap, p_packets, p_history, p_xor, p_disasm, p_regions;
+    int find_kind;
+    bool find_icase, console_wrap;
+    bool s_ascii, s_le, s_be, s_nl;
+    int s_min;
+    bool x_xor, x_add, x_rol, x_key;
+    int x_len;
+    bool b_fit, b_alpha;
+    int b_source;
+    bool k_abs, k_payload, k_inter, c_scroll, c_caret;
+    bool operator==(const UiFields&) const = default;
+};
+
+UiFields ui_fields(const Settings& s) {
+    return {s.window_w, s.window_h, s.window_x, s.window_y, s.window_pos, s.window_maximized,
+            s.panel_inspector, s.panel_structure, s.panel_console, s.panel_results, s.panel_bookmarks,
+            s.panel_strings, s.panel_hashes, s.panel_bitmap, s.panel_packets, s.panel_history, s.panel_xor,
+            s.panel_disasm, s.panel_regions, s.find_kind, s.find_ignore_case, s.console_wrap,
+            s.strings_ascii, s.strings_utf16le, s.strings_utf16be, s.strings_newlines, s.strings_min_length,
+            s.xor_xor, s.xor_add, s.xor_rol, s.xor_key, s.xor_max_key_len, s.bitmap_fit, s.bitmap_alpha,
+            s.bitmap_source, s.packets_absolute_time, s.packets_payload_only, s.packets_follow_interleaved,
+            s.compare_sync_scroll, s.compare_sync_caret};
+}
+
+const char* const kUiKeys[] = {
+    "window_w", "window_h", "window_x", "window_y", "window_maximized",
+    "panel_inspector", "panel_structure", "panel_console", "panel_results", "panel_bookmarks",
+    "panel_strings", "panel_hashes", "panel_bitmap", "panel_packets", "panel_history", "panel_xor",
+    "panel_disasm", "panel_regions", "find_kind", "find_ignore_case", "console_wrap",
+    "strings_ascii", "strings_utf16le", "strings_utf16be", "strings_newlines", "strings_min_length",
+    "xor_xor", "xor_add", "xor_rol", "xor_key", "xor_max_key_len", "bitmap_fit", "bitmap_alpha",
+    "bitmap_source", "packets_absolute_time", "packets_payload_only", "packets_follow_interleaved",
+    "compare_sync_scroll", "compare_sync_caret"};
+
+}  // namespace
+
+TEST_CASE("settings: window, panel visibility and panel option keys round trip") {
+    TempDir tmp;
+    const std::string f = path_join(tmp.path, "settings.ini");
+    Settings def;
+    CHECK(def.window_w == 0);
+    CHECK_FALSE(def.window_pos);
+    CHECK_FALSE(def.window_maximized);
+    CHECK(def.panel_inspector);
+    CHECK(def.panel_hashes);
+    CHECK_FALSE(def.panel_bitmap);
+    CHECK_FALSE(def.panel_regions);
+    CHECK(def.find_kind == 0);
+    CHECK(def.console_wrap);
+    CHECK(def.strings_min_length == 5);
+    CHECK(def.xor_max_key_len == 16);
+    CHECK(def.bitmap_source == 0);
+    CHECK(def.compare_sync_scroll);
+    CHECK_FALSE(def.compare_sync_caret);
+    // A default file does not write a window position (none known yet).
+    REQUIRE(def.save(f));
+    std::string text;
+    REQUIRE(os_read_whole(f, text));
+    CHECK(text.find("window_x") == std::string::npos);
+    CHECK(text.find("panel_bitmap = false") != std::string::npos);
+    Settings d2;
+    REQUIRE(d2.load(f));
+    CHECK(ui_fields(d2) == ui_fields(def));
+    CHECK(d2.unknown_keys.empty());
+
+    // Every field flipped from its default (two variants for the multi-valued ones).
+    for (int variant : {0, 1}) {
+        Settings s;
+        s.window_w = 1000 + variant;
+        s.window_h = 700;
+        s.window_pos = true;
+        s.window_x = variant ? -1920 : 100;  // a monitor left of the primary one
+        s.window_y = -8;
+        s.window_maximized = true;
+        s.panel_inspector = s.panel_structure = s.panel_console = s.panel_results = false;
+        s.panel_bookmarks = s.panel_strings = s.panel_hashes = false;
+        s.panel_bitmap = s.panel_packets = s.panel_history = s.panel_xor = s.panel_disasm = s.panel_regions = true;
+        s.find_kind = variant ? 2 : 1;
+        s.find_ignore_case = true;
+        s.console_wrap = false;
+        s.strings_ascii = s.strings_utf16le = false;
+        s.strings_utf16be = s.strings_newlines = true;
+        s.strings_min_length = variant ? 4096 : 1;
+        s.xor_xor = s.xor_add = s.xor_rol = false;
+        s.xor_key = true;
+        s.xor_max_key_len = variant ? 2 : 9;
+        s.bitmap_fit = s.bitmap_alpha = true;
+        s.bitmap_source = 1;
+        s.packets_absolute_time = s.packets_payload_only = s.packets_follow_interleaved = true;
+        s.compare_sync_scroll = false;
+        s.compare_sync_caret = true;
+        REQUIRE(s.save(f));
+        Settings t;
+        REQUIRE(t.load(f));
+        CHECK(ui_fields(t) == ui_fields(s));
+        CHECK(t.unknown_keys.empty());
+    }
+}
+
+TEST_CASE("settings: bad values of the window / panel keys keep the defaults") {
+    TempDir tmp;
+    const std::string f = path_join(tmp.path, "settings.ini");
+    const Settings def;
+    for (const char* bad : {"banana", "", "1.5", "-", "0x10", "maybe"}) {
+        std::string text;
+        for (const char* k : kUiKeys) text += std::string(k) + " = " + bad + "\n";
+        REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+        Settings s;
+        REQUIRE(s.load(f));
+        CHECK(ui_fields(s) == ui_fields(def));
+        CHECK(s.unknown_keys.empty());  // known keys, even with a bad value
+    }
+    // Numbers are clamped (like every int setting); a lone window_x is no position.
+    const std::string text =
+        "window_w = 50\nwindow_h = 99999\nwindow_x = 12\nstrings_min_length = 0\nxor_max_key_len = 40\n"
+        "find_kind = UTF16\nbitmap_source = fixed\nwindow_maximized = 1\npanel_bitmap = on\n";
+    REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+    Settings s;
+    REQUIRE(s.load(f));
+    CHECK(s.window_w == 200);
+    CHECK(s.window_h == 32768);
+    CHECK_FALSE(s.window_pos);
+    CHECK(s.strings_min_length == 1);
+    CHECK(s.xor_max_key_len == 16);
+    CHECK(s.find_kind == 2);      // case-insensitive
+    CHECK(s.bitmap_source == 0);  // "fixed" is session state, not a setting
+    CHECK(s.window_maximized);
+    CHECK(s.panel_bitmap);
+    REQUIRE(s.save(f));  // a lone window_x is not written back either
+    std::string back;
+    REQUIRE(os_read_whole(f, back));
+    CHECK(back.find("window_x") == std::string::npos);
+    // window_w = 0 means "the default size".
+    const std::string zero = "window_w = 0\nwindow_h = 0\n";
+    REQUIRE(os_write_whole_atomic(f, zero.data(), zero.size()));
+    Settings z;
+    z.window_w = 5;
+    REQUIRE(z.load(f));
+    CHECK(z.window_w == 0);
+    CHECK(z.window_h == 0);
+}
+
+TEST_CASE("settings: console history file round trip (multi-line entries, cap, missing file)") {
+    TempDir tmp;
+    CHECK(paths::console_history_file() == path_join(paths::config_dir(), "console_history.txt"));
+    const std::string f = path_join(path_join(tmp.path, "sub"), "console_history.txt");
+    CHECK(load_history(f).empty());  // missing file
+    const std::vector<std::string> h = {"print(1)", "for i = 1, 3 do\n  print(i)\nend", "s = \"a\\\\b\\n\"",
+                                        "x = 1\r\ny = 2", "trailing \\"};
+    REQUIRE(save_history(f, h));  // creates the directory
+    CHECK(load_history(f) == h);
+    std::string text;
+    REQUIRE(os_read_whole(f, text));
+    CHECK(std::count(text.begin(), text.end(), '\n') == 5);  // one line per entry
+    std::vector<std::string> many;
+    for (int i = 0; i < 150; ++i) many.push_back("line " + std::to_string(i));
+    REQUIRE(save_history(f, many));
+    const std::vector<std::string> back = load_history(f);
+    REQUIRE(back.size() == 100);
+    CHECK(back.front() == "line 50");
+    CHECK(back.back() == "line 149");
+    // Hand-edited: CRLF line ends and blank lines are tolerated.
+    const std::string crlf = "a\r\n\r\nb\\nc\r\n";
+    REQUIRE(os_write_whole_atomic(f, crlf.data(), crlf.size()));
+    CHECK(load_history(f) == std::vector<std::string>{"a", "b\nc"});
+}
+
+TEST_CASE("settings: window placement onto the connected monitors' work areas") {
+    const std::vector<WindowRect> areas = {{0, 0, 1920, 1040}, {1920, 0, 2560, 1400}, {-1280, 100, 1280, 984}};
+    // Fully on one monitor: that one, kept as it is.
+    CHECK(window_area({100, 100, 800, 600}, areas) == 0);
+    CHECK(fit_window({100, 100, 800, 600}, areas[0], false) == WindowRect{100, 100, 800, 600});
+    // Straddling two: the one it overlaps most.
+    CHECK(window_area({1800, 50, 1000, 700}, areas) == 1);
+    CHECK(window_area({-200, 200, 900, 500}, areas) == 0);
+    CHECK(window_area({-1000, 200, 900, 500}, areas) == 2);
+    // Partly off-screen: moved inside its work area.
+    CHECK(fit_window({1800, -30, 400, 300}, areas[0], false) == WindowRect{1520, 0, 400, 300});
+    CHECK(fit_window({-50, 900, 400, 300}, areas[0], false) == WindowRect{0, 740, 400, 300});
+    // Bigger than the work area: shrunk to it.
+    CHECK(fit_window({10, 10, 3000, 2000}, areas[0], false) == WindowRect{0, 0, 1920, 1040});
+    // Its monitor is gone (no overlap): -1, and the caller centres it on the primary.
+    CHECK(window_area({5000, 3000, 800, 600}, areas) == -1);
+    CHECK(window_area({100, 100, 800, 600}, {}) == -1);
+    CHECK(fit_window({5000, 3000, 800, 600}, areas[0], true) == WindowRect{560, 220, 800, 600});
+    // Degenerate sizes never go below 1 x 1.
+    CHECK(fit_window({0, 0, 0, -5}, areas[0], false) == WindowRect{0, 0, 1, 1});
+    CHECK(window_area({100, 100, 0, 0}, areas) == -1);
+}

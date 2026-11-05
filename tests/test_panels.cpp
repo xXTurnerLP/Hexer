@@ -10,6 +10,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <system_error>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -22,8 +24,12 @@
 
 #include "core/document.h"
 #include "core/highlight.h"
+#include "core/session.h"
+#include "core/settings.h"
 #include "ui/panel_bitmap.h"
 #include "ui/panel_packets.h"
+#include "ui/panel_strings.h"
+#include "ui/panel_xor.h"
 #include "pcap_fixture.h"
 
 using namespace hx;
@@ -625,4 +631,163 @@ TEST_CASE("panels: Bitmap click jumps, drag selects, keys scroll (and fix the of
     CHECK(last_page + uint64_t(f.panel.shown_rows() - 1) * 24 >= f.doc->size() - 24);  // shows the end
     f.gui.key(ImGuiKey_Home);
     CHECK(f.panel.offset() == 0);
+}
+
+// =============================================================================================
+// Persistence: panel options <-> Settings, per-document Packets state <-> Document extras
+// =============================================================================================
+
+TEST_CASE("panels: Strings / XOR / Bitmap / Packets options load from and save to Settings") {
+    Settings s;
+    {  // defaults: the panels' own defaults are the settings' defaults (nothing to save)
+        StringsPanel sp;
+        XorPanel xp;
+        BitmapPanel bp;
+        PacketsPanel pp;
+        CHECK_FALSE(sp.save_settings(s));
+        CHECK_FALSE(xp.save_settings(s));
+        CHECK_FALSE(bp.save_settings(s));
+        CHECK_FALSE(pp.save_settings(s));
+        bp.shutdown();
+    }
+    StringsPanel sp;
+    sp.options.ascii = false;
+    sp.options.utf16be = true;
+    sp.options.include_newlines = true;
+    sp.options.min_length = 9;
+    CHECK(sp.save_settings(s));
+    CHECK_FALSE(sp.save_settings(s));  // unchanged now
+    CHECK_FALSE(s.strings_ascii);
+    CHECK(s.strings_utf16le);
+    CHECK(s.strings_utf16be);
+    CHECK(s.strings_newlines);
+    CHECK(s.strings_min_length == 9);
+    StringsPanel sp2;
+    sp2.load_settings(s);
+    CHECK_FALSE(sp2.options.ascii);
+    CHECK(sp2.options.utf16be);
+    CHECK(sp2.options.include_newlines);
+    CHECK(sp2.options.min_length == 9);
+
+    XorPanel xp;
+    xp.options.rol = false;
+    xp.options.xor_multi = true;
+    xp.options.max_key_len = 5;
+    CHECK(xp.save_settings(s));
+    CHECK_FALSE(xp.save_settings(s));
+    XorPanel xp2;
+    xp2.load_settings(s);
+    CHECK(xp2.options.xor8);
+    CHECK_FALSE(xp2.options.rol);
+    CHECK(xp2.options.xor_multi);
+    CHECK(xp2.options.max_key_len == 5);
+    s.xor_max_key_len = 99;  // a hand-edited value out of range is clamped
+    xp2.load_settings(s);
+    CHECK(xp2.options.max_key_len == kXorMaxKeyLen);
+
+    BitmapPanel bp;
+    bp.format = PixelFormat::RGB24;
+    bp.width = 640;
+    bp.zoom = 3;
+    bp.fit_width = true;
+    bp.use_alpha = true;
+    bp.source = BitmapSource::FollowCursor;
+    CHECK(bp.save_settings(s));
+    CHECK(s.bitmap_format == "RGB 24-bit");
+    CHECK(s.bitmap_source == 1);
+    // "Fixed offset" is not a setting: the saved follow source stays.
+    bp.set_fixed_offset(0x1234);
+    CHECK_FALSE(bp.save_settings(s));
+    CHECK(s.bitmap_source == 1);
+    BitmapPanel bp2;
+    bp2.load_settings(s);
+    CHECK(bp2.format == PixelFormat::RGB24);
+    CHECK(bp2.width == 640);
+    CHECK(bp2.zoom == 3);
+    CHECK(bp2.fit_width);
+    CHECK(bp2.use_alpha);
+    CHECK(bp2.source == BitmapSource::FollowCursor);
+    s.bitmap_format = "no such format";
+    s.bitmap_width = 0;
+    bp2.load_settings(s);
+    CHECK(bp2.format == PixelFormat::Gray8);
+    CHECK(bp2.width == 1);
+    bp.shutdown();
+    bp2.shutdown();
+
+    PacketsPanel pp;
+    pp.absolute_time = true;
+    pp.request_follow_stream(true);  // the palette's last choice
+    CHECK(pp.save_settings(s));
+    CHECK(s.packets_absolute_time);
+    CHECK_FALSE(s.packets_payload_only);
+    CHECK(s.packets_follow_interleaved);
+    PacketsPanel pp2;
+    pp2.load_settings(s);
+    CHECK(pp2.absolute_time);
+    CHECK_FALSE(pp2.payload_only);
+    CHECK(pp2.follow_interleaved);
+}
+
+TEST_CASE("panels: Packets filter and parser survive a session round trip (Document extras)") {
+    std::error_code ec;
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path(ec) /
+        ("hexer_panels_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    REQUIRE(std::filesystem::create_directories(dir, ec));
+    const Bytes cap = make_pcap(12);
+    const std::string filter = "udp.dstport == 1003 or udp.dstport == 1007";
+    {
+        Gui gui;
+        auto doc = Document::create_from_bytes("cap.pcap", cap.data(), cap.size());
+        auto plain = Document::create_from_bytes("plain.bin", cap.data(), 10);
+        PacketsPanel panel;
+        // A document the panel never saw: no extras.
+        panel.save_extras(*plain);
+        CHECK(plain->extras().empty());
+        // Set the state as restore_extras does (same as typing into the box / picking a parser).
+        doc->set_extra("packets.filter", filter);
+        doc->set_extra("packets.parser", "My proto");
+        panel.restore_extras(*doc);
+        doc->set_extra("packets.filter", "");
+        doc->set_extra("packets.parser", "");
+        gui.body = [&] { panel.draw(doc.get(), {}, {}); };
+        wait_index(gui, panel);
+        wait_for(gui, [&] { return panel.shown_rows(doc->id()) != SIZE_MAX; });
+        CHECK(panel.applied_filter(doc->id()) == filter);
+        CHECK(panel.shown_rows(doc->id()) == 2);
+        panel.save_extras(*doc);
+        CHECK(doc->extra("packets.filter") == filter);
+        CHECK(doc->extra("packets.parser") == "My proto");
+        Session s(dir.string());
+        REQUIRE(s.save({doc.get()}, 0));
+    }
+    Session s(dir.string());
+    auto r = s.load();
+    REQUIRE(r.docs.size() == 1);
+    Document& doc = *r.docs[0];
+    Gui gui;
+    PacketsPanel panel;
+    panel.restore_extras(doc);  // before the capture is indexed: applied once the index is there
+    gui.body = [&] { panel.draw(&doc, {}, {}); };
+    wait_index(gui, panel);
+    wait_for(gui, [&] { return panel.shown_rows(doc.id()) != SIZE_MAX; });
+    CHECK(panel.applied_filter(doc.id()) == filter);
+    CHECK(panel.shown_rows(doc.id()) == 2);
+    // Clearing them erases the extras again.
+    PacketsPanel fresh;
+    fresh.save_extras(doc);
+    CHECK(doc.extra("packets.filter").empty());
+    CHECK(doc.extra("packets.parser").empty());
+    // An invalid saved filter shows its error and filters nothing.
+    doc.set_extra("packets.filter", "ip.src ==");
+    PacketsPanel bad;
+    bad.restore_extras(doc);
+    gui.body = [&] { bad.draw(&doc, {}, {}); };
+    wait_index(gui, bad);
+    CHECK(bad.applied_filter(doc.id()).empty());
+    CHECK_FALSE(bad.filter_error(doc.id()).empty());
+    CHECK(bad.shown_rows(doc.id()) == 12);
+    s.clear();
+    std::filesystem::remove_all(dir, ec);
 }

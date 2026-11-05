@@ -15,6 +15,7 @@
 #include "core/document.h"
 #include "core/exe_map.h"
 #include "core/session.h"
+#include "core/settings.h"
 #include "core/symbols.h"
 #include "imgui.h"
 #include "script/script_engine.h"
@@ -1177,4 +1178,32 @@ TEST_CASE("lua: doc:symbols reuses the host's current table") {
     host.table.reset();  // nothing cached: built as before
     CHECK(eng.run_source("assert(#hx.doc():symbols() == 6)", "symbols_built", &err));
     CHECK(err.empty());
+}
+
+TEST_CASE("disasm panel: options load from and save to Settings") {
+    Settings s;
+    DisasmPanel p;
+    CHECK_FALSE(p.save_settings(s));  // the panel's defaults are the settings' defaults
+    p.mode = 2;
+    p.syntax = DisasmSyntax::Att;
+    p.uppercase = true;
+    p.follow = false;
+    p.show_bytes = false;
+    CHECK(p.save_settings(s));
+    CHECK_FALSE(p.save_settings(s));
+    CHECK(s.disasm_mode == 2);
+    CHECK(s.disasm_att);
+    CHECK(s.disasm_uppercase);
+    CHECK_FALSE(s.disasm_follow);
+    CHECK_FALSE(s.disasm_bytes);
+    DisasmPanel q;
+    q.load_settings(s);
+    CHECK(q.mode == 2);
+    CHECK(q.syntax == DisasmSyntax::Att);
+    CHECK(q.uppercase);
+    CHECK_FALSE(q.follow);
+    CHECK_FALSE(q.show_bytes);
+    s.disasm_mode = 7;  // out of range: auto
+    q.load_settings(s);
+    CHECK(q.mode == 0);
 }

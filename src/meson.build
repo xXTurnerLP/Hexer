@@ -64,6 +64,8 @@ ui_view_lib = static_library('hexer_ui_view',
   'ui/panel_bitmap.cpp',     # Bitmap / Packets panels, Compare view: no App dependency either
   'ui/panel_packets.cpp',    # (tests/test_panels.cpp drives them headlessly)
   'ui/view_diff.cpp',
+  'ui/panel_strings.cpp',    # Strings / XOR Search panels: no App dependency
+  'ui/panel_xor.cpp',        # (tests/test_panels.cpp: their settings round trips)
   'ui/third_party/imgui_freetype.cpp',  # vendored from imgui misc/freetype (MIT)
   include_directories : inc,
   cpp_args : conf_args,
@@ -76,12 +78,10 @@ ui_view_dep = declare_dependency(link_with : ui_view_lib, include_directories : 
 ui_lib = static_library('hexer_ui',
   'ui/panels.cpp',
   'ui/app.cpp',
-  'ui/panel_strings.cpp',
   'ui/panel_hash.cpp',
   'ui/dialog_cstruct.cpp',
   'ui/dialog_targets.cpp',
   'ui/panel_history.cpp',
-  'ui/panel_xor.cpp',
   include_directories : inc,
   cpp_args : conf_args,
   link_with : ui_view_lib,

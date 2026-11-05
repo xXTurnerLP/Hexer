@@ -80,6 +80,42 @@ struct Settings {
     // shapes) | "none" (blurry, like stb_truetype) | "mono" (aliased); other values keep the default.
     std::string font_hinting = "normal";
     // ---- end fonts ----
+
+    // ---- Main window (OS window; read before it is created, tracked while it runs) ----
+    // Last normal (not maximized / minimized) client size in logical pixels: screen pixels divided
+    // by the monitor's UI scale, so the window keeps its size on a monitor with another DPI; 0 =
+    // the default 1440 x 900. window_x / window_y: its client area's top-left in screen
+    // coordinates, valid when window_pos (never on Wayland, which has no window positions). The
+    // app restores them onto a connected monitor's work area (else centered on the primary one).
+    int window_w = 0, window_h = 0;    // 0 or 200..32768
+    bool window_pos = false;           // window_x / window_y were saved (both keys present)
+    int window_x = 0, window_y = 0;
+    bool window_maximized = false;
+    // ---- Panel visibility (View menu, a panel's X, the Toggle actions; panel_<name> = true|false) ----
+    bool panel_inspector = true, panel_structure = true, panel_console = true, panel_results = true,
+         panel_bookmarks = true, panel_strings = true, panel_hashes = true;
+    bool panel_bitmap = false, panel_packets = false, panel_history = false, panel_xor = false,
+         panel_disasm = false, panel_regions = false;
+    // ---- Panel options (sticky choices; the panels' load_settings / save_settings) ----
+    int find_kind = 0;                 // Find bar: 0 = hex, 1 = text, 2 = UTF-16 (find_kind = hex | text | utf16)
+    bool find_ignore_case = false;
+    bool console_wrap = true;          // Console: Word wrap
+    // Strings: encodings, line breaks as string characters, minimum length (characters, 1..4096).
+    bool strings_ascii = true, strings_utf16le = true, strings_utf16be = false, strings_newlines = false;
+    int strings_min_length = 5;
+    // XOR Search: transforms to try (XOR / ADD-SUB / ROL-ROR 1-byte keys, multi-byte XOR key) and
+    // the longest multi-byte key (2..16).
+    bool xor_xor = true, xor_add = true, xor_rol = true, xor_key = false;
+    int xor_max_key_len = 16;
+    // Bitmap: Fit (largest zoom that fits), Alpha, where the image starts: 0 = the hex view's top
+    // row, 1 = the cursor (bitmap_source = view | cursor; "Fixed offset" is session state).
+    bool bitmap_fit = false, bitmap_alpha = false;
+    int bitmap_source = 0;
+    // Packets: Absolute time column, select the payload only, last Follow TCP Stream layout.
+    bool packets_absolute_time = false, packets_payload_only = false, packets_follow_interleaved = false;
+    // Compare tab: Sync scroll / Sync caret.
+    bool compare_sync_scroll = true, compare_sync_caret = false;
+
     std::vector<std::string> recent_files;  // most recent first, max 20
     // Keys this version does not know (e.g. written by a newer Hexer); written back unchanged by save().
     std::vector<std::pair<std::string, std::string>> unknown_keys;
@@ -97,6 +133,23 @@ struct Settings {
     bool migrate_ui_scale(float monitor_scale);
 };
 
+// Console input history (<config>/console_history.txt): one entry per line, oldest first, with
+// '\', CR and LF escaped as \\, \r, \n so a multi-line entry stays one line. A missing file
+// is an empty history. save_history keeps the last `max` entries.
+std::vector<std::string> load_history(const std::string& path);
+bool save_history(const std::string& path, const std::vector<std::string>& entries, size_t max = 100);
+
+// A rectangle in screen coordinates (window placement).
+struct WindowRect {
+    int x = 0, y = 0, w = 0, h = 0;
+    bool operator==(const WindowRect&) const = default;
+};
+// Restoring a window: the index of the work area in `areas` that the window rect `r` overlaps
+// most, or -1 when it overlaps none (its monitor is gone / it is off-screen).
+int window_area(const WindowRect& r, const std::vector<WindowRect>& areas);
+// `r` shrunk to fit `area` (never below 1 x 1) and moved inside it; with `center`, centered on it.
+WindowRect fit_window(WindowRect r, const WindowRect& area, bool center);
+
 namespace paths {
 void set_config_dir_override(const std::string& dir);  // --config-dir (tests, portable mode)
 std::string config_dir();       // %APPDATA%\Hexer  |  $XDG_CONFIG_HOME/hexer (~/.config/hexer)
@@ -105,6 +158,7 @@ std::string user_scripts_dir();  // <config>/scripts  (created on first run)
 std::string bundled_scripts_dir();  // <exe dir>/scripts, else HEXER_SOURCE_SCRIPTS_DIR (dev builds)
 std::string settings_file();     // <config>/settings.ini
 std::string imgui_ini_file();    // <config>/layout.ini
+std::string console_history_file();  // <config>/console_history.txt
 void ensure_dirs();              // create config/session/scripts dirs
 }  // namespace paths
 

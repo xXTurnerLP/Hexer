@@ -50,6 +50,7 @@ struct ImFont;
 namespace hx {
 
 class Document;
+struct Settings;
 
 struct DisasmPanelCallbacks {
     std::function<void(uint64_t offset, uint64_t len)> select;  // caret + selection, no history
@@ -75,6 +76,11 @@ public:
     bool show_bytes = true;
     ImFont* mono = nullptr;        // listing font (nullptr = current)
     float ui_scale = 1.0f;
+
+    // Options <-> settings.ini (Settings::disasm_*): load_settings at startup; save_settings writes
+    // them back and returns true when one changed (the host then saves settings.ini).
+    void load_settings(const Settings& s);
+    bool save_settings(Settings& s) const;
 
     // Draws into the current window. `doc` may be null; `caret` = focus_offset() of its view.
     void draw(Document* doc, uint64_t caret, const DisasmPanelCallbacks& cb);

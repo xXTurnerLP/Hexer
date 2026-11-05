@@ -279,9 +279,12 @@ Tab& add_tab(App& app, std::unique_ptr<Document> doc) {
     t->insert_mode = app.settings.insert_mode && !t->doc->fixed_size();
     refresh_tab_cache(*t);
     // A pcap / pcapng capture: show the Packets panel (it indexes the capture when first drawn).
-    if (PacketsPanel::is_capture(*t->doc)) app.show_packets = app.focus_packets = true;
-    // Process memory: show its region map next to it.
-    if (t->doc->target() == SourceKind::Process) app.show_regions = app.focus_regions = true;
+    // Process memory: show its region map next to it. Not for the tabs of a restored session:
+    // the panels' saved visibility (settings.ini panel_*) wins, so a closed one stays closed.
+    if (!app.restoring) {
+        if (PacketsPanel::is_capture(*t->doc)) app.show_packets = app.focus_packets = true;
+        if (t->doc->target() == SourceKind::Process) app.show_regions = app.focus_regions = true;
+    }
     app.tabs.push_back(std::move(t));
     app.active = int(app.tabs.size()) - 1;
     app.select_request = app.active;
@@ -1132,6 +1135,12 @@ void toggle_byte_class_colors(App& app) {
 
 // ---- compare ---------------------------------------------------------------------------------
 
+// A new Compare view with the user's Sync scroll / Sync caret choices (settings.ini compare_*).
+void new_diff(App& app) {
+    app.diff = std::make_unique<DiffView>();
+    app.diff->load_settings(app.settings);
+}
+
 // Compare the active document (A) with the open document `other` (B) in the Compare tab.
 void compare_with(App& app, uint64_t other) {
     Tab* a = active_tab(app);
@@ -1141,7 +1150,7 @@ void compare_with(App& app, uint64_t other) {
         set_status(app, "Pick another document to compare with");
         return;
     }
-    if (!app.diff || app.diff_a != a->doc->id() || app.diff_b != other) app.diff = std::make_unique<DiffView>();
+    if (!app.diff || app.diff_a != a->doc->id() || app.diff_b != other) new_diff(app);
     app.diff_aux.reset();  // B is an open tab now
     app.diff_aux_backup = false;
     app.diff_a = a->doc->id();
@@ -1189,7 +1198,7 @@ bool compare_with_aux(App& app, Tab& a, bool backup) {
     auto t = std::make_unique<Tab>();
     t->doc = std::move(doc);
     refresh_tab_cache(*t);
-    app.diff = std::make_unique<DiffView>();
+    new_diff(app);
     app.diff_a = d.id();
     app.diff_b = t->doc->id();
     app.diff_aux = std::move(t);
@@ -3671,6 +3680,14 @@ uint64_t session_signature(App& app) {
     mix(app.diff ? app.diff_b : 0);
     mix(app.diff ? uint64_t(app.diff->shift) : 0);
     mix(app.diff_shown ? 1 : 0);
+    // Session-level extras besides the Compare tab (save_session_extras).
+    mix(std::hash<std::string>{}(app.find.input));
+    mix(app.bitmap_panel.source == BitmapSource::Fixed ? app.bitmap_panel.fixed_offset() + 1 : 0);
+    const CStructDialog& c = app.cstruct_dlg;
+    mix(c.is_open() ? 1 : 0);
+    mix(std::hash<std::string>{}(c.source));
+    mix(std::hash<std::string>{}(c.options.name + '\x01' + c.options.root));
+    mix(uint64_t(c.options.pack) * 2 + (c.options.big_endian ? 1 : 0));
     return h;
 }
 
@@ -3708,6 +3725,10 @@ void save_tab_extras(Tab& t) {
     uint64_t top2 = t.split_restore;
     if (top2 == UINT64_MAX) top2 = t.split_bpr > 0 ? t.split_top * uint64_t(t.split_bpr) : 0;
     d.set_extra("split.top2", t.split && top2 ? u64_text(top2) : "");
+    // Insert mode per tab, always explicit ("1" / "0"): the default for new tabs may change.
+    d.set_extra("edit.insert", t.insert_mode ? "1" : "0");
+    d.set_extra("nav.back", nav_encode(t.nav.back_stack()));
+    d.set_extra("nav.fwd", nav_encode(t.nav.forward_stack()));
 }
 
 void restore_tab_extras(App& app, Tab& t) {
@@ -3728,7 +3749,12 @@ void restore_tab_extras(App& app, Tab& t) {
         t.split_restore = std::min(text_u64(d.extra("split.top2"), 0), d.size());
     }
     if (d.extra("tail.enabled") == "1") start_live_tail(app, t, false);
-    app.disasm_panel.restore_extras(d);  // "disasm.*": map choice, manual base, pinned start
+    // Unset (a session written before edit.insert existed): the default for new tabs stays.
+    if (const std::string ins = d.extra("edit.insert"); ins == "1" || ins == "0")
+        t.insert_mode = ins == "1" && !d.fixed_size();
+    t.nav.set_stacks(nav_decode(d.extra("nav.back"), d.size()), nav_decode(d.extra("nav.fwd"), d.size()));
+    app.disasm_panel.restore_extras(d);   // "disasm.*": map choice, manual base, pinned start
+    app.packets_panel.restore_extras(d);  // "packets.*": filter, Parse with
 }
 
 // The Compare tab as session extras "compare.0" = "<docidA>|<docidB>|<shift>" and "active" =
@@ -3751,11 +3777,49 @@ void save_session_extras(App& app) {
               std::to_string(app.diff->shift);
     s.set_extra("compare.0", cmp);
     s.set_extra("active", !cmp.empty() && app.diff_shown ? "compare.0" : "");
+    // Working context of this session (not preferences, so not settings.ini): the Find bar's
+    // pattern, the Bitmap panel's fixed start, the C Struct to Parser draft (hot exit keeps
+    // unsaved work). An unchanged draft (the built-in example) is not stored.
+    s.set_extra("find.pattern", app.find.input);
+    const BitmapPanel& bp = app.bitmap_panel;
+    s.set_extra("bitmap.fixed", bp.source == BitmapSource::Fixed ? u64_text(bp.fixed_offset()) : "");
+    const CStructDialog& c = app.cstruct_dlg;
+    static const CStructDialog fresh;
+    const bool draft = c.source != fresh.source || c.options.name != fresh.options.name ||
+                       c.options.root != fresh.options.root || c.options.big_endian != fresh.options.big_endian ||
+                       c.options.pack != fresh.options.pack;
+    s.set_extra("cstruct.open", c.is_open() ? "1" : "");
+    s.set_extra("cstruct.source", draft ? c.source : "");
+    s.set_extra("cstruct.name", draft ? c.options.name : "");
+    s.set_extra("cstruct.root", draft ? c.options.root : "");
+    s.set_extra("cstruct.endian", draft && c.options.big_endian ? "be" : "");
+    s.set_extra("cstruct.pack", draft ? std::to_string(c.options.pack) : "");
+}
+
+// The session-level working context of save_session_extras (Find pattern, Bitmap fixed start,
+// C Struct draft).
+void restore_context_extras(App& app) {
+    const Session& s = *app.session;
+    app.find.input = s.extra("find.pattern");
+    if (const std::string f = s.extra("bitmap.fixed"); !f.empty())
+        app.bitmap_panel.set_fixed_offset(text_u64(f, 0));
+    CStructDialog& c = app.cstruct_dlg;
+    if (const std::string src = s.extra("cstruct.source"); !src.empty()) {
+        c.source = src;
+        c.options.name = s.extra("cstruct.name");
+        c.options.root = s.extra("cstruct.root");
+        c.options.big_endian = s.extra("cstruct.endian") == "be";
+        const int pack = int(text_u64(s.extra("cstruct.pack"), 1));
+        c.options.pack = pack == 0 || pack == 1 || pack == 2 || pack == 4 || pack == 8 ? pack : 1;
+        c.mark_dirty();
+    }
+    if (s.extra("cstruct.open") == "1") c.open();
 }
 
 // After the tabs are restored: reopen the Compare tab. `ids` maps a saved Document::id() to the
 // restored document's id.
 void restore_session_extras(App& app, const std::vector<std::pair<uint64_t, uint64_t>>& ids) {
+    restore_context_extras(app);
     const std::string cmp = app.session->extra("compare.0");
     if (cmp.empty()) return;
     auto map_id = [&](uint64_t saved) -> uint64_t {
@@ -3781,7 +3845,7 @@ void restore_session_extras(App& app, const std::vector<std::pair<uint64_t, uint
     }
     const uint64_t idb = map_id(text_u64(side_b, 0));
     if (!ida || !idb || ida == idb) return;
-    app.diff = std::make_unique<DiffView>();
+    new_diff(app);
     app.diff_a = ida;
     app.diff_b = idb;
     app.diff->shift = std::strtoll(cmp.c_str() + b + 1, nullptr, 10);
@@ -3798,7 +3862,10 @@ bool save_session(App& app, bool force, std::string* err_out) {
     }
     for (auto& t : app.tabs) {
         save_tab_extras(*t);
-        if (!t->doc->busy()) app.disasm_panel.save_extras(*t->doc);
+        if (!t->doc->busy()) {
+            app.disasm_panel.save_extras(*t->doc);
+            app.packets_panel.save_extras(*t->doc);
+        }
     }
     const uint64_t sig = session_signature(app);
     if (!force && sig == app.session_sig) return true;
@@ -4059,6 +4126,7 @@ void frame(App& app) {
 
     process_quit(app);
     update_title(app);
+    store_ui_settings(app);
     autosave(app);
     if (app.layout_focus_step > 0) app.layout_focus_step--;
     if (app.save.running || app.find.job.running() || app.layout_focus_step > 0) app.wants_poll = true;
@@ -4124,7 +4192,9 @@ void restore_session(App& app) {
             const long n = std::strtol(name.c_str() + 9, nullptr, 10);
             if (n > app.untitled_counter && n < 1000000) app.untitled_counter = int(n);
         }
+        app.restoring = true;
         Tab& t = add_tab(app, std::move(d));
+        app.restoring = false;
         // top_row is a row index; with another bytes-per-row (auto-fit, window size) it would show
         // another region, so make sure the caret is on screen (no-op when it already is).
         t.view.request_scroll_to(t.doc->view().cursor, false);
@@ -4177,6 +4247,7 @@ void startup(App& app) {
     app.engine = std::make_unique<ScriptEngine>(&app);
     app.engine->set_script_dirs({paths::bundled_scripts_dir(), paths::user_scripts_dir()});
     app.engine->reload();
+    load_ui_settings(app);  // before the session's tabs: panel visibility, panel options
     if (!app.opts.no_session) app.session = std::make_unique<Session>(paths::session_dir());
     app.hot_exit = app.session && app.settings.restore_session;
     if (app.hot_exit) restore_session(app);
@@ -4191,14 +4262,6 @@ void startup(App& app) {
         }
         app.hash_panel.set_selected(names);
     }
-    {  // Bitmap panel choices (written back by draw_bitmap_panel)
-        BitmapPanel& bp = app.bitmap_panel;
-        for (int i = 0; i < kPixelFormatCount; ++i)
-            if (app.settings.bitmap_format == pixel_format_name(PixelFormat(i))) bp.format = PixelFormat(i);
-        bp.width = std::clamp(app.settings.bitmap_width, 1, BitmapPanel::kMaxWidth);
-        bp.zoom = std::clamp(app.settings.bitmap_zoom, 1, BitmapPanel::kMaxZoom);
-    }
-    load_disasm_settings(app);  // Disassembly panel options (written back by draw_disasm_panel)
     // The Inspector starts with the follow-pointer type's row selected (and its bytes outlined).
     if (InspType ft = insp_type_of_int(app.settings.pointer_width, app.settings.pointer_signed); ft != InspType::Count)
         app.insp_sel = int(ft);
@@ -4216,6 +4279,7 @@ void shutdown(App& app) {
         save_session(app, true);  // before end_compare: the Compare tab is in the session
     else if (app.session && !app.settings.restore_session)
         app.session->clear();  // hot exit disabled: don't resurrect stale edits later
+    store_ui_settings(app);  // before end_compare (its Sync options) and while the window exists
     end_compare(app);
     save_settings(app);
     app.engine.reset();  // before documents: the Lua state may still reference them
@@ -4244,7 +4308,7 @@ bool write_ppm(const std::string& path, int w, int h) {
     return true;
 }
 
-GLFWwindow* create_window() {
+GLFWwindow* create_window(const Settings& s) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
@@ -4254,7 +4318,104 @@ GLFWwindow* create_window() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 #endif
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
-    return glfwCreateWindow(1440, 900, "Hexer", nullptr, nullptr);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);  // shown by place_window once it is where it was
+    // The last size in logical pixels: GLFW_SCALE_TO_MONITOR scales it to the monitor's DPI.
+    const int w = s.window_w > 0 ? s.window_w : 1440, h = s.window_h > 0 ? s.window_h : 900;
+    return glfwCreateWindow(w, h, "Hexer", nullptr, nullptr);
+}
+
+bool has_window_positions() {
+#ifdef GLFW_PLATFORM_WAYLAND
+    return glfwGetPlatform() != GLFW_PLATFORM_WAYLAND;  // Wayland: no window positions at all
+#else
+    return true;
+#endif
+}
+
+// Puts the hidden window where it was last time (Settings::window_*) and shows it. The saved place
+// is used when it overlaps a connected monitor's work area (moved / shrunk to fit inside it),
+// else the window is centered on the primary monitor; without a saved place the OS picks one.
+void place_window(GLFWwindow* w, const Settings& s) {
+    int count = 0;
+    GLFWmonitor** mons = glfwGetMonitors(&count);  // [0] = the primary monitor
+    if (s.window_pos && has_window_positions() && mons && count > 0) {
+        std::vector<WindowRect> areas;
+        for (int i = 0; i < count; ++i) {
+            WindowRect a;
+            glfwGetMonitorWorkarea(mons[i], &a.x, &a.y, &a.w, &a.h);
+            areas.push_back(a);
+        }
+        int fl = 0, ft = 0, fr = 0, fb = 0;  // frame (title bar, borders) around the client area
+        glfwGetWindowFrameSize(w, &fl, &ft, &fr, &fb);
+        int cw = 0, ch = 0, fw = 0, fh = 0;
+        glfwGetWindowSize(w, &cw, &ch);
+        glfwGetFramebufferSize(w, &fw, &fh);
+        WindowRect outer{s.window_x - fl, s.window_y - ft, cw + fl + fr, ch + ft + fb};
+        // Which monitor: the one the window overlaps most at a size no bigger than a work area (a
+        // corrupt huge size must not pull a window that starts on one monitor onto another).
+        WindowRect probe = outer;
+        int max_w = 1, max_h = 1;
+        for (const WindowRect& a : areas) {
+            max_w = std::max(max_w, a.w);
+            max_h = std::max(max_h, a.h);
+        }
+        probe.w = std::min(probe.w, max_w);
+        probe.h = std::min(probe.h, max_h);
+        const int found = window_area(probe, areas);
+        const int ai = found >= 0 ? found : 0;
+        if (s.window_w > 0 && s.window_h > 0) {  // logical size at the DPI of the monitor it goes to
+            float sx = 1.0f, sy = 1.0f;
+            glfwGetMonitorContentScale(mons[ai], &sx, &sy);
+            const float density = cw > 0 && fw > 0 ? float(fw) / float(cw) : 1.0f;
+            const float f = sx > 0.0f ? std::max(0.25f, sx / density) : 1.0f;
+            outer.w = int(std::lround(float(s.window_w) * f)) + fl + fr;
+            outer.h = int(std::lround(float(s.window_h) * f)) + ft + fb;
+        }
+        outer = fit_window(outer, areas[size_t(ai)], found < 0);
+        glfwSetWindowPos(w, outer.x + fl, outer.y + ft);
+        glfwSetWindowSize(w, std::max(1, outer.w - fl - fr), std::max(1, outer.h - ft - fb));
+    }
+    glfwShowWindow(w);
+    if (s.window_maximized) glfwMaximizeWindow(w);
+}
+
+// Remembers the window's last normal (not maximized / minimized) place and logical size and its
+// maximized state in Settings::window_*. While minimized nothing changes (a window minimized
+// from maximized comes back maximized).
+bool track_window(App& app) {
+    GLFWwindow* w = app.window;
+    if (!w || glfwGetWindowAttrib(w, GLFW_ICONIFIED) || !glfwGetWindowAttrib(w, GLFW_VISIBLE)) return false;
+    Settings& s = app.settings;
+    bool changed = false;
+    const bool maximized = glfwGetWindowAttrib(w, GLFW_MAXIMIZED) != 0;
+    if (maximized != s.window_maximized) {
+        s.window_maximized = maximized;
+        changed = true;
+    }
+    if (maximized) return changed;
+    int cw = 0, ch = 0;
+    glfwGetWindowSize(w, &cw, &ch);
+    if (cw > 0 && ch > 0) {
+        const float f = app.dpi_scale > 0.0f ? app.dpi_scale : 1.0f;
+        const int lw = std::clamp(int(std::lround(float(cw) / f)), 200, 32768);
+        const int lh = std::clamp(int(std::lround(float(ch) / f)), 200, 32768);
+        if (lw != s.window_w || lh != s.window_h) {
+            s.window_w = lw;
+            s.window_h = lh;
+            changed = true;
+        }
+    }
+    if (has_window_positions()) {
+        int x = 0, y = 0;
+        glfwGetWindowPos(w, &x, &y);
+        if (!s.window_pos || x != s.window_x || y != s.window_y) {
+            s.window_pos = true;
+            s.window_x = x;
+            s.window_y = y;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 // Window/taskbar icon. Windows: GLFW picks up the exe's GLFW_ICON resource (src/hexer.rc) by itself.
@@ -4278,6 +4439,76 @@ void set_window_icon(GLFWwindow* w) {
 }  // namespace
 
 // =============================================================================================
+// UI state <-> settings.ini (see CLAUDE.md "Persistence")
+// =============================================================================================
+
+void load_ui_settings(App& app) {
+    const Settings& s = app.settings;
+    app.show_inspector = s.panel_inspector;
+    app.show_structure = s.panel_structure;
+    app.show_console = s.panel_console;
+    app.show_results = s.panel_results;
+    app.show_bookmarks = s.panel_bookmarks;
+    app.show_strings = s.panel_strings;
+    app.show_hashes = s.panel_hashes;
+    app.show_bitmap = s.panel_bitmap;
+    app.show_packets = s.panel_packets;
+    app.show_history = s.panel_history;
+    app.show_xor = s.panel_xor;
+    app.show_disasm = s.panel_disasm;
+    app.show_regions = s.panel_regions;
+    app.find.kind = std::clamp(s.find_kind, 0, 2);
+    app.find.icase = s.find_ignore_case;
+    app.console_wrap = s.console_wrap;
+    app.console_history = load_history(paths::console_history_file());
+    if (app.console_history.size() > 100)
+        app.console_history.erase(app.console_history.begin(), app.console_history.end() - 100);
+    app.strings_panel.load_settings(s);
+    app.xor_panel.load_settings(s);
+    app.bitmap_panel.load_settings(s);
+    app.packets_panel.load_settings(s);
+    app.disasm_panel.load_settings(s);
+    // Hashes: hash_algorithms is applied in startup() and written back by draw_hash_panel; the
+    // Compare tab's options when a DiffView is made (new_diff).
+}
+
+void store_ui_settings(App& app) {
+    Settings& s = app.settings;
+    bool changed = track_window(app);
+    auto put = [&](bool& dst, bool v) {
+        if (dst == v) return;
+        dst = v;
+        changed = true;
+    };
+    put(s.panel_inspector, app.show_inspector);
+    put(s.panel_structure, app.show_structure);
+    put(s.panel_console, app.show_console);
+    put(s.panel_results, app.show_results);
+    put(s.panel_bookmarks, app.show_bookmarks);
+    put(s.panel_strings, app.show_strings);
+    put(s.panel_hashes, app.show_hashes);
+    put(s.panel_bitmap, app.show_bitmap);
+    put(s.panel_packets, app.show_packets);
+    put(s.panel_history, app.show_history);
+    put(s.panel_xor, app.show_xor);
+    put(s.panel_disasm, app.show_disasm);
+    put(s.panel_regions, app.show_regions);
+    put(s.find_ignore_case, app.find.icase);
+    put(s.console_wrap, app.console_wrap);
+    if (s.find_kind != app.find.kind) {
+        s.find_kind = app.find.kind;
+        changed = true;
+    }
+    changed |= app.strings_panel.save_settings(s);
+    changed |= app.xor_panel.save_settings(s);
+    changed |= app.bitmap_panel.save_settings(s);
+    changed |= app.packets_panel.save_settings(s);
+    changed |= app.disasm_panel.save_settings(s);
+    if (app.diff) changed |= app.diff->save_settings(s);
+    if (changed) mark_settings_dirty(app);
+}
+
+// =============================================================================================
 // Entry
 // =============================================================================================
 
@@ -4295,13 +4526,14 @@ int run_app(const AppOptions& opts) {
         std::fprintf(stderr, "hexer: cannot initialise GLFW\n");
         return 1;
     }
-    app.window = create_window();
+    app.window = create_window(app.settings);
     if (!app.window) {
         std::fprintf(stderr, "hexer: cannot create an OpenGL 3.0 window\n");
         glfwTerminate();
         return 1;
     }
     set_window_icon(app.window);
+    place_window(app.window, app.settings);
     glfwMakeContextCurrent(app.window);
     glfwSwapInterval(1);
     glfwSetWindowUserPointer(app.window, &app);

@@ -17,6 +17,7 @@ struct ImFont;
 namespace hx {
 
 class Document;
+struct Settings;
 
 struct StringsPanelCallbacks {
     std::function<void(uint64_t offset, uint64_t len)> jump;  // select [offset, offset+len) and reveal it
@@ -34,6 +35,11 @@ struct StringsPanel {
     bool selection_only = false;  // scan the selection instead of the whole file
     ImFont* mono = nullptr;       // font for offsets and texts (nullptr = current font)
     float ui_scale = 1.0f;        // column widths
+
+    // Options <-> settings.ini (Settings::strings_*): load_settings at startup; save_settings writes
+    // them back and returns true when one changed (the host then saves settings.ini).
+    void load_settings(const Settings& s);
+    bool save_settings(Settings& s) const;
 
     // Draws the panel contents into the current window (the caller owns Begin/End). `doc` may be
     // null (no document open). Never mutates the document; a document being saved (busy) is shown

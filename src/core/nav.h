@@ -40,10 +40,17 @@ public:
 
     const std::vector<NavEntry>& back_stack() const { return back_; }    // top = back()
     const std::vector<NavEntry>& forward_stack() const { return fwd_; }  // top = back()
+    // Replaces both stacks (session restore); each keeps its newest kMax entries.
+    void set_stacks(std::vector<NavEntry> back, std::vector<NavEntry> forward);
 
 private:
     std::vector<NavEntry> back_, fwd_;
 };
+
+// A stack as text for the session ("<offset>:<length>" decimal, space-separated, bottom first) and
+// back. decode skips malformed entries and clamps offsets / lengths to a document of `size` bytes.
+std::string nav_encode(const std::vector<NavEntry>& stack);
+std::vector<NavEntry> nav_decode(const std::string& text, uint64_t size);
 
 // How a pointer is read: a `width`-byte integer (1, 2, 3, 4 or 8) in the given byte order,
 // optionally sign-extended (is_signed).
