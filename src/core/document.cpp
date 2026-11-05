@@ -235,6 +235,9 @@ bool copy_backup(const std::string& real, Progress* progress, std::string* err) 
 
 std::string mib(uint64_t n) { return std::to_string((n + (1u << 20) - 1) >> 20) + " MiB"; }
 
+const char* const kDeviceHint =
+    " (raw disk access needs administrator rights on Windows, root or the disk group on Linux)";
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -300,6 +303,31 @@ uint64_t Snapshot::next_readable(uint64_t offset) const {
     return size_;
 }
 
+uint64_t Snapshot::readable_end(uint64_t lo, uint64_t hi) const {
+    hi = std::min(hi, size_);
+    if (lo >= hi) return lo;
+    if (next_readable(hi - 1) == hi - 1) return hi;  // no hole at the top (always without holes)
+    uint64_t a = next_readable(lo);                  // readable
+    if (a >= hi) return lo;
+    uint64_t b = hi - 1;                             // nothing readable in [b, hi)
+    // Gallop down from the top (probes inside a hole are cheap region-map lookups), then bisect.
+    for (uint64_t step = 4096; b - a > step; step <<= 1) {
+        const uint64_t r = next_readable(b - step);
+        if (r < hi) {
+            a = r;
+            break;
+        }
+        b -= step;
+    }
+    while (b - a > 1) {
+        const uint64_t x = a + (b - a) / 2;
+        const uint64_t r = next_readable(x);
+        if (r < hi) a = r;  // r < b: readable data in [x, b)
+        else b = x;
+    }
+    return a + 1;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------------------------
@@ -311,7 +339,13 @@ std::unique_ptr<Document> Document::open_file(const std::string& path, std::stri
     if (parse_process_url(path, &pid)) return open_process(pid, false, err);
     std::string abs = os_absolute_path(path);
     auto src = FileSource::open(abs, err);
-    if (!src) return nullptr;
+    if (!src) {
+        // Raw disks from the command line / recent files get the same hint as the Open Disk picker.
+        if (err && err->find("denied") != std::string::npos && err->find(kDeviceHint) == std::string::npos &&
+            os_stat(abs).is_device)
+            *err += kDeviceHint;
+        return nullptr;
+    }
     std::unique_ptr<Document> d(new Document());
     d->path_ = abs;
     d->sources_.push_back(src);
@@ -327,10 +361,8 @@ std::unique_ptr<Document> Document::open_device(const std::string& path, bool wr
         return nullptr;
     }
     std::string e;
-    auto d = open_file(path, &e);
+    auto d = open_file(path, &e);  // adds the administrator / root hint on "access denied"
     if (!d) {
-        if (e.find("denied") != std::string::npos)
-            e += " (raw disk access needs administrator rights on Windows, root or the disk group on Linux)";
         fail(err, e);
         return nullptr;
     }
@@ -528,6 +560,10 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_end) {
 void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, uint64_t edit_end) {
     persist_gen_++;
     bool dropped_redo = !redo_.empty();
+    if (dropped_redo && group_depth_ > 0 && !group_pushed_) {
+        group_redo_ = std::move(redo_);  // set aside until the group closes (abort_group restores it)
+        dropped_redo = false;
+    }
     redo_.clear();
     // Discarded redo states may have been the last users of an older file version (rewrite save);
     // release it so its disk space is freed. Rare (undo followed by a new edit), so the O(history)
@@ -617,7 +653,7 @@ void Document::reclaim_add() {
             if (p.src == Piece::Add && p.chunk < used.size()) used[p.chunk] = true;
     };
     mark(table_.pieces());
-    for (const auto* stack : {&undo_, &redo_, &pend_undo_, &pend_redo_})
+    for (const auto* stack : {&undo_, &redo_, &pend_undo_, &pend_redo_, &group_redo_})
         for (const UndoEntry& e : *stack) mark(e.pieces);
     for (uint32_t c = 0; c < uint32_t(used.size()); ++c)
         if (!used[c]) add_.release(c);
@@ -633,6 +669,7 @@ void Document::prune_sources() {
     mark(table_.pieces());
     for (const UndoEntry& e : eff_undo()) mark(e.pieces);
     for (const UndoEntry& e : eff_redo()) mark(e.pieces);
+    for (const UndoEntry& e : group_redo_) mark(e.pieces);
     for (uint32_t i = 0; i < cur; ++i)
         if (!used[i]) sources_[i].reset();
 }
@@ -777,9 +814,32 @@ void Document::end_group() {
     std::lock_guard<std::mutex> lk(mu_);
     if (group_depth_ == 0) return;
     if (--group_depth_ == 0) {
+        if (group_abort_ && group_pushed_ && !undo_.empty()) {
+            // Roll back to the state captured by the group's first edit; the history is as before.
+            UndoEntry before = std::move(undo_.back());
+            undo_.pop_back();
+            apply_entry(before);
+            redo_ = std::move(group_redo_);
+            reclaim_add();  // the bytes the aborted edits appended (e.g. a big transform) are unused now
+        } else if (!group_redo_.empty()) {  // the group's edit discarded these redo states for good
+            group_redo_.clear();
+            if (sources_.size() > 1) prune_sources();
+            reclaim_add();
+        }
+        group_redo_.clear();
+        group_abort_ = false;
         group_pushed_ = false;
         coalesce_open_ = false;
     }
+}
+
+void Document::abort_group() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (group_depth_ == 0) return;
+        group_abort_ = true;
+    }
+    end_group();
 }
 
 bool Document::add_bookmark(const Bookmark& b) {
@@ -1319,6 +1379,8 @@ bool Document::reload(std::string* err) {
     redo_.clear();
     group_depth_ = 0;
     group_pushed_ = false;
+    group_abort_ = false;
+    group_redo_.clear();
     coalesce_open_ = false;
     base_chunks_ = 0;
     disk_stat_ = src->stat_at_open();

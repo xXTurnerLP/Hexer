@@ -1090,8 +1090,10 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         ImGui::EndTooltip();
         ImGui::PopFont();
     } else if (tooltip_hover && ev.has_hover && !dragging_select_ && !dragging_scrollbar_ && !ImGui::IsAnyMouseDown()) {
-        uint8_t q[4] = {0, 0, 0, 0};
-        size_t n = doc.read(ev.hover_offset, q, 4);
+        uint8_t q[4] = {0, 0, 0, 0}, qbad[4] = {0, 0, 0, 0};
+        size_t n = doc.read(ev.hover_offset, q, 4, qbad);
+        size_t valid = 0;  // quick values decode only readable bytes (the zeros standing in are no data)
+        while (valid < n && !qbad[valid]) ++valid;
         ImGui::PushFont(ui_font, ui_font_size);
         ImGui::BeginTooltip();
         ImGui::Text(cfg.uppercase ? "Offset 0x%llX  (%llu)" : "Offset 0x%llx  (%llu)",
@@ -1101,12 +1103,13 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         if (v.has_selection() && ev.hover_offset >= v.sel_begin() && ev.hover_offset < v.sel_end())
             ImGui::TextDisabled("Selection: %llu bytes", (unsigned long long)v.sel_len());
         ImGui::Separator();
-        if (n >= 1) ImGui::Text("u8   %-11u i8   %d", unsigned(q[0]), int(int8_t(q[0])));
-        if (n >= 2) {
+        if (n >= 1 && valid == 0) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(C.unreadable_text), "?? unreadable");
+        if (valid >= 1) ImGui::Text("u8   %-11u i8   %d", unsigned(q[0]), int(int8_t(q[0])));
+        if (valid >= 2) {
             uint16_t u16 = uint16_t(q[0] | (q[1] << 8));
             ImGui::Text("u16  %-11u i16  %d", unsigned(u16), int(int16_t(u16)));
         }
-        if (n >= 4) {
+        if (valid >= 4) {
             uint32_t u32 = uint32_t(q[0]) | (uint32_t(q[1]) << 8) | (uint32_t(q[2]) << 16) | (uint32_t(q[3]) << 24);
             ImGui::Text("u32  %-11u i32  %d", unsigned(u32), int(int32_t(u32)));
         }

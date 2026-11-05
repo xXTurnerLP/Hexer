@@ -9,7 +9,9 @@
 //   UTF-16BE  (0x0041 = 'A'); runs are found at even and at odd offsets.
 // A run is reported when it has at least min_length characters. The scan is streaming (runs are
 // carried across the 4 MiB read blocks), so a string crossing a block edge is reported once, whole.
-// Strings are clipped to the scanned range [begin, end).
+// Strings are clipped to the scanned range [begin, end). Holes of a sparse source (unmapped
+// process memory) are skipped cheaply (Snapshot::next_readable) and end a string; a genuine I/O
+// error stops the scan.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +52,7 @@ struct StringsScanResult {
     bool cancelled = false;       // hits found before the cancel are kept
     bool io_error = false;        // stopped at an unreadable byte (strings before it are kept)
     uint64_t io_error_offset = 0;
+    uint64_t skipped = 0;         // bytes in holes of a sparse source passed over (not errors)
 };
 
 constexpr size_t kStringsBlock = size_t(4) << 20;  // bytes per read

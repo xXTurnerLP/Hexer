@@ -17,6 +17,9 @@
 // some key, all keys at once. The first byte determines the candidate key (k = d[o] ^ p[0],
 // d[o] - p[0], ...), the rest verifies it - key-independent, O(1) per offset on average. Streaming
 // in 4 MiB blocks with an n-1 byte overlap, so a match across a block edge is reported once.
+// Holes of a sparse source (unmapped process memory) are skipped cheaply via
+// Snapshot::next_readable (no match spans one; XorScanResult::skipped counts them); a genuine I/O
+// error stops the scan.
 // Not reported: the identity (key 0, a ROL that leaves this plaintext unchanged), multi-byte keys
 // that are constant (a 1-byte XOR hit) or repeat a shorter key (reported at the shorter length).
 // A multi-byte key of length L needs n >= 2*L and n >= L+4 plaintext bytes (the bytes past the
@@ -67,6 +70,7 @@ struct XorScanResult {
     bool cancelled = false;      // hits found before the cancel are kept
     bool io_error = false;       // stopped at an unreadable byte (hits before it are kept)
     uint64_t io_error_offset = 0;
+    uint64_t skipped = 0;        // bytes in holes of a sparse source passed over (not errors)
 };
 
 // "XOR 0x5A", "ADD 0x03 (SUB 0xFD)", "ROL 3 (ROR 5)", "XOR key 53 45 43 52 45 54 \"SECRET\"".
@@ -83,7 +87,8 @@ std::vector<uint8_t> apply_transform(std::vector<uint8_t> data, XorTransform t,
 // (default "<transform> selection"), in 1 MiB chunks; key index of `begin` = `phase`. Runs on the
 // caller's (UI) thread, so it refuses ranges above `max_len` (default 256 MiB, like the
 // "Selection: XOR with key" script command). False + *err when rejected (busy, read-only, empty
-// key, too large, read error).
+// key, too large, an unreadable byte in the range); a failure partway leaves the document and its
+// history (undo AND redo stack) as they were (Document::abort_group).
 constexpr uint64_t kXorApplyMax = uint64_t(256) << 20;
 bool apply_transform(Document& doc, uint64_t begin, uint64_t len, XorTransform t,
                      const std::vector<uint8_t>& key, uint64_t phase, bool decode,

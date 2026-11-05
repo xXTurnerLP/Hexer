@@ -32,11 +32,14 @@ bool compile_pattern(SearchKind kind, const std::string& input, bool icase, Patt
 // Blocking primitive. Searches forward from `from` (inclusive) or backward from `from` (match must
 // start at < from). No wrap-around. Updates `progress` (bytes scanned) if non-null; returns
 // nullopt if not found or cancelled. Reads in large blocks with overlap; never loads the file.
-// The scan stops at the first unreadable byte (I/O error; *io_error is set) instead of matching
-// the zeros that stand in for it.
+// Holes of a sparse source (unmapped process memory, see Snapshot::next_readable) are skipped
+// cheaply, in both directions: no match spans one, and *skipped gets the hole bytes passed over.
+// A genuine I/O error stops the scan at the first unreadable byte (*io_error is set) instead of
+// matching the zeros that stand in for it.
 std::optional<uint64_t> find_in(const Snapshot& snap, const Pattern& pat, uint64_t from, bool forward,
                                 const std::atomic<bool>* cancel = nullptr,
-                                std::atomic<uint64_t>* progress = nullptr, bool* io_error = nullptr);
+                                std::atomic<uint64_t>* progress = nullptr, bool* io_error = nullptr,
+                                uint64_t* skipped = nullptr);
 
 // Background search job. One job at a time; start() cancels any previous run without waiting for
 // it (that run finishes in the background and its result is discarded).
@@ -62,6 +65,7 @@ public:
         bool cancelled = false;
         bool io_error = false;       // part of the data could not be read; the scan stopped there
         uint64_t io_error_offset = 0;  // with io_error: the first unreadable byte the scan met
+        uint64_t skipped = 0;        // bytes in holes of a sparse source passed over (not errors)
     };
     Result result() const;         // copy of the last finished run
 

@@ -126,38 +126,71 @@ std::atomic<void (*)(uint32_t)> g_bucket_hook{nullptr};
 bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions& opts,
                     const std::atomic<bool>& cancel, std::vector<uint8_t>& buf, uint64_t& io_at) {
     uint64_t counts[256] = {};
-    // Reads [off, off + len); false (and marks the bucket) at the first unreadable byte.
+    const uint64_t end = b.offset + b.length;
+    // Reads the readable bytes of [off, off + len), skipping holes of a sparse source (they mark
+    // the bucket unreadable). False (and marks the bucket) at a genuine I/O error.
     auto take = [&](uint64_t off, size_t len) {
         if (buf.size() < len) buf.resize(len);
-        const size_t got = snap.read_valid(off, buf.data(), len);
-        const uint8_t* p = buf.data();
-        for (size_t i = 0; i < got; ++i) ++counts[p[i]];
-        b.bytes_read += got;
-        if (got < len) {
+        const uint64_t stop = off + len;
+        while (off < stop) {
+            const size_t want = size_t(stop - off);
+            const size_t got = snap.read_valid(off, buf.data(), want);
+            const uint8_t* p = buf.data();
+            for (size_t i = 0; i < got; ++i) ++counts[p[i]];
+            b.bytes_read += got;
+            if (got == want) break;
             b.unreadable = true;
-            io_at = std::min(io_at, off + got);
-            return false;
+            const uint64_t at = off + got;
+            const uint64_t resume = snap.next_readable(at);
+            if (resume <= at) {
+                io_at = std::min(io_at, at);
+                return false;
+            }
+            off = resume;
         }
         return true;
     };
 
+    // Fully inside a hole (unmapped process memory): unreadable, nothing to read.
+    if (snap.next_readable(b.offset) >= end) {
+        b.unreadable = true;
+        b.done = true;
+        return true;
+    }
+
     const uint64_t sample = opts.sample_per_bucket;
     if (sample && b.length > sample) {
-        // Evenly spaced chunks; the first starts at the bucket start, the last ends at its end.
+        // Evenly spaced chunks; the first starts at the bucket start, the last ends at its end. A
+        // chunk that starts in a hole moves to the next readable byte (unless that is past the
+        // next chunk's position), so sparse buckets sample their mapped parts.
         b.sampled = true;
         const uint64_t chunk = std::min<uint64_t>(kSampleChunk, sample);
         const uint64_t n = std::max<uint64_t>(1, sample / chunk);
         const uint64_t stride = n > 1 ? (b.length - chunk) / (n - 1) : 0;
         for (uint64_t k = 0; k < n; ++k) {
             if (cancel.load(std::memory_order_relaxed)) return false;
-            if (!take(b.offset + k * stride, size_t(chunk))) break;
+            const uint64_t at = b.offset + k * stride;
+            const uint64_t limit = k + 1 < n && stride ? at + stride : end;
+            const uint64_t s = snap.next_readable(at);
+            if (s >= limit) {
+                b.unreadable = true;
+                continue;
+            }
+            if (s > at) b.unreadable = true;
+            if (!take(s, size_t(std::min<uint64_t>(chunk, end - s)))) break;
         }
     } else {
-        for (uint64_t pos = 0; pos < b.length;) {
+        for (uint64_t pos = b.offset; pos < end;) {
             if (cancel.load(std::memory_order_relaxed)) return false;
-            const size_t len = size_t(std::min<uint64_t>(kReadBlock, b.length - pos));
-            if (!take(b.offset + pos, len)) break;
-            pos += len;
+            const uint64_t s = snap.next_readable(pos);
+            if (s >= end) {
+                b.unreadable = true;
+                break;
+            }
+            if (s > pos) b.unreadable = true;
+            const size_t len = size_t(std::min<uint64_t>(kReadBlock, end - s));
+            if (!take(s, len)) break;
+            pos = s + len;
         }
     }
 

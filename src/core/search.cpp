@@ -4,6 +4,8 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <utility>
+#include <vector>
 
 #include "core/hex_tokens.h"
 
@@ -187,9 +189,19 @@ private:
 
 bool cancelled(const std::atomic<bool>* c) { return c && c->load(std::memory_order_relaxed); }
 
-// First unreadable byte seen by a scan (UINT64_MAX = none).
-void note_io(uint64_t* io_at, uint64_t at) {
-    if (io_at && at < *io_at) *io_at = at;
+// What a scan met besides data: the first unreadable byte that stopped it (a genuine I/O error;
+// UINT64_MAX = none) and the bytes it skipped over in holes of a sparse source (process memory).
+struct ScanIo {
+    uint64_t io_at = UINT64_MAX;
+    uint64_t skipped = 0;
+};
+
+void note_io(ScanIo* io, uint64_t at) {
+    if (io && at < io->io_at) io->io_at = at;
+}
+
+void note_skip(ScanIo* io, uint64_t n) {
+    if (io) io->skipped += n;
 }
 
 // Reads match starts [lo, lo+count) plus the m-1 byte tail into buf. Returns how many starts are
@@ -205,9 +217,11 @@ size_t read_window(const Snapshot& snap, uint64_t lo, size_t count, size_t m, st
 }
 
 // Forward scan over match starts in [lo, hi). `on_hit(offset)` returns the next allowed start
-// (> offset) to continue, or UINT64_MAX to stop. Returns false if cancelled.
+// (> offset) to continue, or UINT64_MAX to stop. Returns false if cancelled. A hole of a sparse
+// source is skipped (no match spans it; its bytes inside [lo, hi) count as skipped); a genuine
+// I/O error ends the scan there.
 bool scan_forward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t hi,
-                  const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress, uint64_t* io_at,
+                  const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress, ScanIo* io,
                   const std::function<uint64_t(uint64_t)>& on_hit) {
     std::vector<uint8_t> buf;
     uint64_t pos = lo;
@@ -216,7 +230,7 @@ bool scan_forward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t
         size_t count = size_t(std::min<uint64_t>(kBlock, hi - pos));
         uint64_t bad_at = UINT64_MAX;
         size_t n = read_window(snap, pos, count, mt.size(), buf, &bad_at);
-        uint64_t next_pos = pos + count;
+        uint64_t hit_next = 0;  // next allowed start, when a hit put it past this window's data
         size_t i = 0;
         while (i < n) {
             size_t k = mt.first(buf.data(), i, n);
@@ -227,37 +241,83 @@ bool scan_forward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t
                 return true;
             }
             if (next >= pos + n) {  // next allowed start lies in a later block
-                next_pos = std::max(next_pos, next);
+                hit_next = next;
                 break;
             }
             i = size_t(next - pos);
         }
-        if (progress) progress->fetch_add(count, std::memory_order_relaxed);
-        if (n < count) {  // read error: treat as end of data
-            note_io(io_at, bad_at);
-            return true;
+        uint64_t next_pos = pos + count;
+        if (n < count) {
+            const uint64_t resume = snap.next_readable(bad_at);
+            if (resume <= bad_at) {  // read error: treat as end of data
+                if (progress) progress->fetch_add(count, std::memory_order_relaxed);
+                note_io(io, bad_at);
+                return true;
+            }
+            // A hole: every start in [pos + n, resume) spans it. Continue behind it.
+            if (bad_at < hi) note_skip(io, std::min(resume, hi) - bad_at);
+            next_pos = resume;
         }
+        next_pos = std::max(next_pos, hit_next);
+        if (progress) progress->fetch_add(std::min(next_pos, hi) - pos, std::memory_order_relaxed);
         pos = next_pos;
     }
     return true;
 }
 
-// Backward scan for the last match with start in [lo, hi).
+// Backward scan for the last match with start in [lo, hi). Holes of a sparse source are skipped
+// like in scan_forward (one at the top of the range without reading: Snapshot::readable_end).
 std::optional<uint64_t> scan_backward(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t hi,
                                       const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
-                                      uint64_t* io_at) {
+                                      ScanIo* io) {
+    const size_t m = mt.size();
     std::vector<uint8_t> buf;
+    std::vector<std::pair<size_t, size_t>> runs;  // readable [a, b) of buf
     while (hi > lo) {
         if (cancelled(cancel)) return std::nullopt;
-        size_t count = size_t(std::min<uint64_t>(kBlock, hi - lo));
-        uint64_t start = hi - count;
-        uint64_t bad_at = UINT64_MAX;
-        size_t n = read_window(snap, start, count, mt.size(), buf, &bad_at);
-        if (n < count) note_io(io_at, bad_at);  // later matches in this window may be hidden
-        size_t k = mt.last(buf.data(), 0, n);
+        // A start s needs the bytes [s, s + m): no start >= (end of the readable data) - m + 1 can
+        // match. Skip those at once when the top of the range is a hole.
+        const uint64_t top = hi + m - 1;
+        const uint64_t e = snap.readable_end(lo, top);
+        if (e < top) {
+            const uint64_t new_hi = e >= lo + m ? e - m + 1 : lo;
+            if (new_hi < hi) {
+                note_skip(io, hi - new_hi);
+                if (progress) progress->fetch_add(hi - new_hi, std::memory_order_relaxed);
+                hi = new_hi;
+                continue;
+            }
+        }
+        const size_t count = size_t(std::min<uint64_t>(kBlock, hi - lo));
+        const uint64_t start = hi - count;
+        const size_t want = count + m - 1;
+        if (buf.size() < want) buf.resize(want);
+        // The window's readable runs: holes inside it are skipped, an I/O error ends the reading.
+        runs.clear();
+        bool io_stop = false;
+        for (size_t p = 0; p < want;) {
+            const size_t got = snap.read_valid(start + p, buf.data() + p, want - p);
+            if (got) runs.emplace_back(p, p + got);
+            p += got;
+            if (p >= want) break;
+            const uint64_t at = start + p;
+            const uint64_t resume = snap.next_readable(at);
+            if (resume <= at) {
+                note_io(io, at);  // later matches in this window may be hidden
+                io_stop = true;
+                break;
+            }
+            if (at < hi) note_skip(io, std::min(resume, hi) - at);
+            p = size_t(std::min<uint64_t>(resume - start, want));
+        }
         if (progress) progress->fetch_add(count, std::memory_order_relaxed);
-        if (k != SIZE_MAX) return start + k;
-        if (n < count) return std::nullopt;  // read error: stop
+        for (size_t r = runs.size(); r-- > 0;) {
+            const size_t a = runs[r].first, b = runs[r].second;
+            if (b - a < m || a >= count) continue;
+            const size_t k = mt.last(buf.data(), a, std::min(b - m + 1, count));
+            if (k != SIZE_MAX) return start + k;
+        }
+        if (io_stop) return std::nullopt;  // read error: stop
         hi = start;
     }
     return std::nullopt;
@@ -270,12 +330,12 @@ uint64_t start_limit(const Snapshot& snap, size_t m) {
 
 std::optional<uint64_t> find_range(const Snapshot& snap, const Matcher& mt, uint64_t lo, uint64_t hi, bool forward,
                                    const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
-                                   uint64_t* io_at) {
+                                   ScanIo* io) {
     hi = std::min(hi, start_limit(snap, mt.size()));
     if (lo >= hi) return std::nullopt;
-    if (!forward) return scan_backward(snap, mt, lo, hi, cancel, progress, io_at);
+    if (!forward) return scan_backward(snap, mt, lo, hi, cancel, progress, io);
     std::optional<uint64_t> found;
-    scan_forward(snap, mt, lo, hi, cancel, progress, io_at, [&](uint64_t off) {
+    scan_forward(snap, mt, lo, hi, cancel, progress, io, [&](uint64_t off) {
         found = off;
         return UINT64_MAX;
     });
@@ -286,14 +346,16 @@ std::optional<uint64_t> find_range(const Snapshot& snap, const Matcher& mt, uint
 
 std::optional<uint64_t> find_in(const Snapshot& snap, const Pattern& pat, uint64_t from, bool forward,
                                 const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress,
-                                bool* io_error) {
+                                bool* io_error, uint64_t* skipped) {
     if (io_error) *io_error = false;
+    if (skipped) *skipped = 0;
     if (pat.size() == 0 || pat.mask.size() != pat.bytes.size()) return std::nullopt;
     Matcher mt(pat);
-    uint64_t io_at = UINT64_MAX;
-    auto r = forward ? find_range(snap, mt, from, UINT64_MAX, true, cancel, progress, &io_at)
-                     : find_range(snap, mt, 0, from, false, cancel, progress, &io_at);
-    if (io_error) *io_error = io_at != UINT64_MAX;
+    ScanIo io;
+    auto r = forward ? find_range(snap, mt, from, UINT64_MAX, true, cancel, progress, &io)
+                     : find_range(snap, mt, 0, from, false, cancel, progress, &io);
+    if (io_error) *io_error = io.io_at != UINT64_MAX;
+    if (skipped) *skipped = io.skipped;
     return r;
 }
 
@@ -359,7 +421,7 @@ void SearchJob::start(std::shared_ptr<const Snapshot> snap, Pattern pat, uint64_
     std::thread th([this, run, snap = std::move(snap), pat = std::move(pat), from, mode, max_results]() {
         std::atomic<bool>& cancel_ = run->cancel;
         std::atomic<uint64_t>& done_ = run->done;
-        uint64_t io = UINT64_MAX;
+        ScanIo io;
         Result r;
         r.mode = mode;
         r.pattern_len = pat.size();
@@ -397,8 +459,9 @@ void SearchJob::start(std::shared_ptr<const Snapshot> snap, Pattern pat, uint64_
             if (hit) r.hits.push_back(*hit);
         }
         r.cancelled = cancel_.load();
-        r.io_error = io != UINT64_MAX;
-        r.io_error_offset = r.io_error ? io : 0;
+        r.io_error = io.io_at != UINT64_MAX;
+        r.io_error_offset = r.io_error ? io.io_at : 0;
+        r.skipped = io.skipped;
         if (r.cancelled && mode != Mode::All) r.hits.clear();
         {
             std::lock_guard<std::mutex> lock(mu_);

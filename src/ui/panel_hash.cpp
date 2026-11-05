@@ -256,7 +256,9 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
                                   fmt_range(result_key_.offset, result_key_.length).c_str());
         }
     }
-    if (have_result_ && result_.io_error)
+    if (have_result_ && result_.io_error && result_.hole)  // a sparse address space: refused
+        ImGui::TextWrapped("No values: %s.", hash_hole_message(result_.io_error_offset).c_str());
+    else if (have_result_ && result_.io_error)
         ImGui::TextColored(kErrColor, "Read error at 0x%llX: no values.",
                            static_cast<unsigned long long>(result_.io_error_offset));
     if (have_result_ && !normalize_hex(expected).empty() && !result_.values.empty()) {

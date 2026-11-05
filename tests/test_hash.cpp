@@ -16,6 +16,7 @@
 
 #include "core/document.h"
 #include "core/hash.h"
+#include "holey_mem.h"
 
 using namespace hx;
 
@@ -299,4 +300,51 @@ TEST_CASE("hash: HashJob cancel and supersede") {
     CHECK(r.values[0].algo == std::string("CRC-32"));
     CHECK(r.values[0].hex == hash_hex("CRC-32", pat, sizeof pat));
     // The destructor cancels and joins the superseded run.
+}
+
+TEST_CASE("hash: ranges with holes of process memory are refused, readable ranges hash") {
+    hx_test::HoleyMem hm;  // readable page | hole page | readable page
+    const uint64_t a = hm.addr(), pg = hm.pg;
+    for (size_t i = 0; i < pg; ++i) hm.base[i] = uint8_t(i * 13 + 1);
+    auto doc = hx_test::open_self();
+    auto snap = doc->snapshot();
+    std::string out, err;
+    REQUIRE(hash_snapshot_hex(*snap, "sha256", a, pg, out, &err));
+    CHECK(out == hash_hex("sha256", hm.base, pg));
+
+    auto h = make_hasher("crc32");
+    uint64_t bad = 0;
+    bool hole = false;
+    CHECK_FALSE(hash_range(*snap, a, 3 * pg, {h.get()}, nullptr, nullptr, &bad, &hole));  // hole in the middle
+    CHECK(hole);
+    CHECK(bad == a + pg);
+    h->init();
+    CHECK_FALSE(hash_range(*snap, a + pg + 10, 50, {h.get()}, nullptr, nullptr, &bad, &hole));  // starts in it
+    CHECK(hole);
+    CHECK(bad == a + pg + 10);
+    h->init();
+    std::atomic<uint64_t> fed{0};
+    CHECK_FALSE(hash_range(*snap, a + pg - 10, 20, {h.get()}, nullptr, &fed, &bad, &hole));  // ends in it
+    CHECK(hole);
+    CHECK(bad == a + pg);
+    CHECK(fed == 0);  // refused before reading anything
+    CHECK_FALSE(hash_snapshot_hex(*snap, "md5", a, 3 * pg, out, &err));
+    CHECK(err.find("holes") != std::string::npos);
+
+    HashJob job;
+    uint64_t gen = job.generation();
+    job.start(snap, a, 3 * pg, {"CRC-32", "SHA-1"});
+    wait_for(job, gen);
+    HashJob::Result r = job.result();
+    CHECK(r.io_error);
+    CHECK(r.hole);
+    CHECK(r.values.empty());
+    gen = job.generation();
+    job.start(snap, a + 2 * pg, pg, {"CRC-32"});
+    wait_for(job, gen);
+    r = job.result();
+    CHECK_FALSE(r.io_error);
+    CHECK_FALSE(r.hole);
+    REQUIRE(r.values.size() == 1);
+    CHECK(r.values[0].hex == hash_hex("crc32", hm.after_ptr(), pg));
 }

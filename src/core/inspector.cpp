@@ -519,7 +519,7 @@ bool int_info(InspType t, IntInfo& info) {
 }
 
 InspRow inspect_one(InspType t, const uint8_t* p, size_t avail, bool be) {
-    InspRow r{t, type_name(t), "", 0, true};
+    InspRow r{t, type_name(t), "", 0, true, false};
     auto need = [&](size_t n) { return avail >= n; };
     IntInfo ii;
     if (int_info(t, ii)) {
@@ -668,11 +668,25 @@ InspRow inspect_one(InspType t, const uint8_t* p, size_t avail, bool be) {
 
 }  // namespace
 
-std::vector<InspRow> inspect(const uint8_t* data, size_t avail, bool big_endian) {
+std::vector<InspRow> inspect(const uint8_t* data, size_t avail, bool big_endian, const uint8_t* unreadable) {
     std::vector<InspRow> rows;
     rows.reserve(size_t(InspType::Count));
     if (!data) avail = 0;
-    for (int i = 0; i < int(InspType::Count); ++i) rows.push_back(inspect_one(InspType(i), data, avail, big_endian));
+    for (int i = 0; i < int(InspType::Count); ++i) {
+        InspRow r = inspect_one(InspType(i), data, avail, big_endian);
+        // The zeros standing in for unreadable bytes are not data: no value, no edit.
+        bool bad = false;
+        if (unreadable && avail) {
+            bad = unreadable[0] != 0;  // nothing decodes from an unreadable first byte
+            for (size_t k = 1; !bad && k < std::min(r.size, avail); ++k) bad = unreadable[k] != 0;
+        }
+        if (bad) {
+            r.value = "??";
+            r.editable = false;
+            r.unreadable = true;
+        }
+        rows.push_back(std::move(r));
+    }
     return rows;
 }
 

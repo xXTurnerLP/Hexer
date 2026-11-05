@@ -85,6 +85,7 @@ void StringsPanel::draw(Document* doc, const StringsPanelCallbacks& cb) {
             std::string msg = "Strings: " + fmt_count(sc.hits.size()) + (sc.truncated ? "+" : "") + " found";
             if (sc.cancelled) msg += " (cancelled)";
             if (sc.io_error) msg += " (read error at " + fmt_off(sc.io_error_offset) + ")";
+            if (sc.skipped) msg += " (" + fmt_size(sc.skipped) + " unreadable skipped)";
             cb.notify(msg);
         }
     }
@@ -181,6 +182,10 @@ void StringsPanel::draw(Document* doc, const StringsPanelCallbacks& cb) {
     if (sc.io_error) {
         ImGui::SameLine();
         ImGui::TextColored(kErrColor, "(read error at %s)", fmt_off(sc.io_error_offset).c_str());
+    }
+    if (sc.skipped) {  // holes of process memory: not errors
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s unreadable skipped)", fmt_size(sc.skipped).c_str());
     }
     if (st.res_doc_gen != doc->generation()) {
         ImGui::SameLine();

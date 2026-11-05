@@ -62,6 +62,11 @@ public:
     // short at `at`, next_readable(at) > at means "a hole, continue there"; == at means a real
     // I/O error (stop and report as today).
     uint64_t next_readable(uint64_t offset) const;
+    // One past the last byte in [lo, hi) that may be readable (lo if none): where the data before
+    // a hole at the top of the range ends, so backward scans skip holes too. hi is clamped to
+    // size(). Without sparse sources (or when hi - 1 is readable) simply hi. O(log(hi - lo))
+    // next_readable() calls, never a scan of the bytes.
+    uint64_t readable_end(uint64_t lo, uint64_t hi) const;
 
     // Implementation detail, public for Document/Session code.
     std::vector<std::shared_ptr<FileSource>> sources;      // file versions (Original piece .chunk)
@@ -181,7 +186,8 @@ struct TailState {
 
 class Document {
 public:
-    // Opens a file for streaming access. Fails only if the file cannot be opened for reading.
+    // Opens a file for streaming access. Fails only if the file cannot be opened for reading
+    // (access denied on a device path: the error carries the administrator / root hint).
     // Also accepts "process://<pid>" (= open_process(pid, false): read-only), so a process target
     // from the recent-files list or the command line reopens. Device paths ("\\.\PhysicalDrive0",
     // "/dev/sda") open like files here (writable unless set_read_only, as before); the Open Disk
@@ -257,6 +263,12 @@ public:
     // any, the label of the first edit ("Paste", "Fill", ...).
     void begin_group(const std::string& label = {});
     void end_group();
+    // Closes the innermost group like end_group(), but marks the whole group as failed: when the
+    // outermost group closes (end_group() or abort_group()), every edit made since its
+    // begin_group() is rolled back (content, cursor/selection, bookmarks) and its undo step is
+    // dropped: the undo AND redo stacks are exactly as before the group (its first edit only sets
+    // the redo stack aside; a group that ends normally discards it, as any edit does).
+    void abort_group();
     bool in_group() const;             // a group is open
 
     // Bookmarks go through the document so they are part of undo/redo history.
@@ -451,6 +463,8 @@ private:
     std::vector<UndoEntry> undo_, redo_;
     int group_depth_ = 0;
     bool group_pushed_ = false;
+    bool group_abort_ = false;            // abort_group() was called: roll back when the group closes
+    std::vector<UndoEntry> group_redo_;   // redo stack the open group's first edit set aside
     uint64_t generation_ = 0;
     uint64_t state_id_ = 0;
     uint64_t saved_state_id_ = 0;

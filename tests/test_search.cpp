@@ -14,6 +14,7 @@
 #include "core/os_file.h"
 #include "core/search.h"
 #include "core/settings.h"
+#include "holey_mem.h"
 
 using namespace hx;
 
@@ -949,4 +950,77 @@ TEST_CASE("settings: minimap, byte-class colors and bitmap panel fields round tr
         REQUIRE(w.load(f));
         CHECK(w.minimap == 1);
     }
+}
+
+TEST_CASE("search: holes of process memory are skipped in both directions, never matched across") {
+    hx_test::HoleyMem hm;  // readable page | hole page | readable page
+    const uint64_t a = hm.addr(), pg = hm.pg;
+    const Bytes needle = {0xC3, 0x5A, 0x17, 0xE8, 0x9B, 0x42, 0x6D, 0xF1, 0x08, 0xA4, 0x3E, 0x77};
+    std::memcpy(hm.base + 20, needle.data(), needle.size());
+    std::memcpy(hm.after_ptr() + 10, needle.data(), needle.size());
+    auto doc = hx_test::open_self();
+    auto snap = doc->snapshot();
+    std::string hex;
+    for (uint8_t b : needle) hex += "0123456789ABCDEF"[b >> 4], hex += "0123456789ABCDEF"[b & 15], hex += ' ';
+    const Pattern p = pat(SearchKind::Hex, hex);
+
+    bool io = true;
+    uint64_t skipped = 0;
+    CHECK(find_in(*snap, p, a, true, nullptr, nullptr, &io, &skipped) == a + 20);
+    CHECK_FALSE(io);
+    CHECK(find_in(*snap, p, a + 21, true, nullptr, nullptr, &io, &skipped) == a + 2 * pg + 10);  // across the hole
+    CHECK_FALSE(io);
+    CHECK(skipped == pg);
+    CHECK(find_in(*snap, p, a + 2 * pg + 5, false, nullptr, nullptr, &io, &skipped) == a + 20);
+    CHECK_FALSE(io);
+    CHECK(skipped >= pg);
+    CHECK(find_in(*snap, p, a + pg + 100, false, nullptr, nullptr, &io, &skipped) == a + 20);  // from inside the hole
+    CHECK_FALSE(io);
+    CHECK(skipped > 0);
+    // From address 0 (the unmapped null page) on: found somewhere, not "unreadable at 0".
+    auto first = find_in(*snap, p, 0, true, nullptr, nullptr, &io, &skipped);
+    REQUIRE(first.has_value());
+    CHECK(*first <= a + 20);
+    CHECK_FALSE(io);
+    CHECK(skipped > 0);
+
+    // A match never spans a hole (the zeros standing in for it are no data).
+    const Pattern any2 = pat(SearchKind::Hex, "?? ??");
+    CHECK(find_in(*snap, any2, a + pg - 1, true) == a + 2 * pg);
+    CHECK(find_in(*snap, any2, a + 2 * pg, false) == a + pg - 2);
+    CHECK(find_in(*snap, any2, a + pg + 7, false) == a + pg - 2);
+
+    SearchJob job;
+    auto r = run_job(job, snap, p, a, SearchJob::Mode::All);
+    CHECK_FALSE(r.io_error);
+    CHECK(r.skipped >= pg);
+    CHECK(std::find(r.hits.begin(), r.hits.end(), a + 20) != r.hits.end());
+    CHECK(std::find(r.hits.begin(), r.hits.end(), a + 2 * pg + 10) != r.hits.end());
+    r = run_job(job, snap, p, a + 21, SearchJob::Mode::Next);
+    CHECK(r.hits == std::vector<uint64_t>{a + 2 * pg + 10});
+    CHECK_FALSE(r.io_error);
+    r = run_job(job, snap, p, a + 2 * pg + 5, SearchJob::Mode::Prev);
+    CHECK(r.hits == std::vector<uint64_t>{a + 20});
+    CHECK_FALSE(r.io_error);
+    CHECK(r.skipped > 0);
+}
+
+TEST_CASE("search: Snapshot::readable_end finds the data before a hole") {
+    hx_test::HoleyMem hm(2, 3, 1);
+    const uint64_t a = hm.addr(), pg = hm.pg;
+    auto doc = hx_test::open_self();
+    auto snap = doc->snapshot();
+    CHECK(snap->readable_end(a, hm.hole_begin() + 5) == hm.hole_begin());
+    CHECK(snap->readable_end(a, hm.hole_end()) == hm.hole_begin());
+    CHECK(snap->readable_end(a, hm.hole_end() + 1) == hm.hole_end() + 1);
+    CHECK(snap->readable_end(hm.hole_begin(), hm.hole_end()) == hm.hole_begin());  // none: lo
+    CHECK(snap->readable_end(a + pg, a + pg) == a + pg);
+    CHECK(snap->readable_end(0, 4096) == 0);  // the null page
+    const uint64_t e0 = snap->readable_end(0, a + 1);
+    CHECK(e0 == a + 1);
+    // Without holes: simply hi (clamped to the size).
+    auto plain = snap_of(Bytes(100, 1));
+    CHECK(plain->readable_end(10, 50) == 50);
+    CHECK(plain->readable_end(10, 500) == 100);
+    CHECK(plain->readable_end(60, 50) == 60);
 }

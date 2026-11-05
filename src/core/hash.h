@@ -60,12 +60,16 @@ bool hex_matches(const std::string& expected, const std::string& digest_hex);
 // Blocking primitive: feeds [offset, offset + length) of `snap` (clamped to its size) to every
 // hasher in 4 MiB blocks (hashers are not init()ed or finished here). Returns false if cancelled or
 // if a byte could not be read (then *io_error_offset = the first unreadable byte, else UINT64_MAX).
-// `progress` (bytes fed) may be null.
+// A range with a hole of a sparse source (unmapped process memory) is refused, *hole = true: at
+// once when it starts or ends in one (Snapshot::next_readable / readable_end), else at the first
+// hole met. `progress` (bytes fed) may be null.
 bool hash_range(const Snapshot& snap, uint64_t offset, uint64_t length, const std::vector<Hasher*>& hashers,
                 const std::atomic<bool>* cancel = nullptr, std::atomic<uint64_t>* progress = nullptr,
-                uint64_t* io_error_offset = nullptr);
+                uint64_t* io_error_offset = nullptr, bool* hole = nullptr);
+// The message for a refused range with a hole at `at` (hash_range *hole).
+std::string hash_hole_message(uint64_t at);
 // One algorithm over a snapshot range (scripts: doc:hash(algo, off, len)); lowercase hex in `out`.
-// False with *err on an unknown algorithm or an I/O error.
+// False with *err on an unknown algorithm, an I/O error or a range with holes.
 bool hash_snapshot_hex(const Snapshot& snap, const std::string& algo, uint64_t offset, uint64_t length,
                        std::string& out, std::string* err = nullptr);
 
@@ -94,6 +98,8 @@ public:
         bool cancelled = false;
         bool io_error = false;            // a byte could not be read; no values
         uint64_t io_error_offset = 0;
+        bool hole = false;                // with io_error: it is a hole of a sparse source (the
+                                          // range is refused: hash_hole_message), not an I/O error
     };
     Result result() const;         // copy of the last finished run
 

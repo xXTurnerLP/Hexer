@@ -55,7 +55,10 @@ struct EntropyBucket {
     uint64_t bytes_read = 0;                   // < length when sampled or unreadable
     bool done = false;                         // computed (false = pending: draw neutral)
     bool sampled = false;                      // only part of the bucket was read
-    bool unreadable = false;                   // an I/O error stopped reading this bucket
+    bool unreadable = false;                   // an I/O error stopped reading this bucket, or it
+                                               // has holes (sparse source: unmapped process
+                                               // memory; skipped via Snapshot::next_readable, a
+                                               // bucket fully inside one is done with nothing read)
 };
 
 struct EntropyResult {
@@ -65,8 +68,9 @@ struct EntropyResult {
     uint32_t done = 0;                         // buckets[0, done) are computed
     bool finished = false;                     // the run ended (completed or cancelled)
     bool cancelled = false;
-    bool io_error = false;                     // at least one bucket is unreadable
+    bool io_error = false;                     // an I/O error made at least one bucket unreadable
     uint64_t io_error_offset = 0;              // with io_error: the first unreadable byte met
+                                               // (holes of a sparse source are not I/O errors)
     uint64_t bytes_read = 0;                   // total bytes read so far (bounded by sampling)
 
     // Index of the bucket holding `offset` (clamped to the last bucket; 0 if there are none).

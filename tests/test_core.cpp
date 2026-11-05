@@ -2291,3 +2291,100 @@ TEST_CASE("session: version 1 files (bookmarks without notes) still load") {
     auto r9 = Session(sdir).load();
     CHECK(r9.docs.empty());
 }
+
+TEST_CASE("document: abort_group rolls the group back and keeps the history as it was") {
+    const Bytes orig = {1, 2, 3, 4, 5, 6, 7, 8};
+    auto d = Document::create_from_bytes("t", orig.data(), orig.size());
+    auto content = [&] {
+        Bytes b(size_t(d->size()));
+        d->read(0, b.data(), b.size());
+        return b;
+    };
+    const uint8_t x = 0xAA, y = 0xBB;
+    REQUIRE(d->overwrite(0, &x, 1));
+    REQUIRE(d->overwrite(1, &x, 1));
+    REQUIRE(d->undo());
+    const Bytes before = content();
+    REQUIRE(d->undo_stack().size() == 1);
+    REQUIRE(d->redo_stack().size() == 1);
+    d->view().cursor = d->view().anchor = 3;
+    Bookmark bm;
+    bm.offset = 2;
+
+    // Several edits (and a bookmark) in one group, aborted: nothing happened.
+    d->begin_group("Batch");
+    REQUIRE(d->overwrite(4, &y, 1));
+    REQUIRE(d->insert(0, &y, 1));
+    REQUIRE(d->add_bookmark(bm));
+    d->view().cursor = 7;
+    CHECK(d->redo_stack().empty());  // set aside while the group is open
+    d->abort_group();
+    CHECK_FALSE(d->in_group());
+    CHECK(content() == before);
+    CHECK(d->undo_stack().size() == 1);
+    REQUIRE(d->redo_stack().size() == 1);
+    CHECK(d->view().bookmarks.empty());
+    CHECK(d->view().cursor == 3);
+    REQUIRE(d->redo());  // the earlier redo step still applies
+    CHECK(content()[1] == 0xAA);
+    REQUIRE(d->undo());
+
+    // Nested: an inner abort fails the whole outer group (rolled back when it closes).
+    d->begin_group("outer");
+    REQUIRE(d->overwrite(5, &y, 1));
+    d->begin_group("inner");
+    REQUIRE(d->overwrite(6, &y, 1));
+    d->abort_group();
+    CHECK(d->in_group());
+    REQUIRE(d->overwrite(7, &y, 1));
+    d->end_group();
+    CHECK(content() == before);
+    CHECK(d->undo_stack().size() == 1);
+    CHECK(d->redo_stack().size() == 1);
+
+    // The bytes an aborted group appended are released at once (not kept until a later edit).
+    {
+        const Bytes big(size_t(3) << 20, 0x33);
+        d->begin_group("big");
+        REQUIRE(d->insert(0, big.data(), big.size()));
+        d->abort_group();
+        uint64_t live = 0;
+        for (const auto& c : d->add_buffer().chunks()) live += c->capacity;
+        CHECK(live < big.size());
+        CHECK(content() == before);
+        CHECK(d->redo_stack().size() == 1);
+    }
+
+    // Aborting a group without edits changes nothing; abort_group outside a group is a no-op.
+    d->begin_group("empty");
+    d->abort_group();
+    d->abort_group();
+    CHECK(d->redo_stack().size() == 1);
+
+    // A group that ends normally is one step and discards the redo stack like any edit.
+    d->begin_group("ok");
+    REQUIRE(d->overwrite(5, &y, 1));
+    REQUIRE(d->overwrite(6, &y, 1));
+    d->end_group();
+    CHECK(d->undo_stack().size() == 2);
+    CHECK(d->redo_stack().empty());
+    CHECK(d->undo_stack().back().label == "ok");
+    REQUIRE(d->undo());
+    CHECK(content() == before);
+}
+
+TEST_CASE("document: a device path denied access carries the administrator / root hint") {
+#ifdef _WIN32
+    const std::string dev = "\\\\.\\PhysicalDrive0";
+#else
+    const std::string dev = "/dev/sda";
+#endif
+    std::string err;
+    auto d = Document::open_file(dev, &err);
+    if (d || err.find("denied") == std::string::npos) return;  // elevated, or no such device here
+    CHECK(err.find("administrator") != std::string::npos);
+    std::string err2;
+    CHECK_FALSE(Document::open_device(dev, false, &err2));
+    CHECK(err2.find("administrator") != std::string::npos);
+    CHECK(err2.find("administrator") == err2.rfind("administrator"));  // once, not twice
+}

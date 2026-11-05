@@ -774,3 +774,35 @@ TEST_CASE("inspector: float16 exhaustive round trip") {
         CHECK(out == b);
     }
 }
+
+TEST_CASE("inspector: unreadable bytes show ?? and are not editable") {
+    std::vector<uint8_t> b(16, 0), bad(16, 0);
+    b[0] = 0x2A;
+    bad[2] = 1;  // the third byte is unreadable (read as 0)
+    auto rows = inspect(b.data(), b.size(), false, bad.data());
+    auto row = [&](InspType t) -> const InspRow& { return rows[size_t(t)]; };
+    CHECK(row(InspType::U8).value == "42");
+    CHECK(row(InspType::U8).editable);
+    CHECK_FALSE(row(InspType::U8).unreadable);
+    CHECK(row(InspType::U16).value == "42");
+    CHECK(row(InspType::U24).value == "??");
+    CHECK(row(InspType::U24).unreadable);
+    CHECK_FALSE(row(InspType::U24).editable);
+    CHECK(row(InspType::U24).size == 3);  // kept: the hex view outlines the bytes it covers
+    CHECK(row(InspType::U32).value == "??");
+    CHECK(row(InspType::F64).value == "??");
+    CHECK(row(InspType::Guid).value == "??");
+    // An unreadable first byte: nothing decodes.
+    bad.assign(16, 0);
+    bad[0] = 1;
+    rows = inspect(b.data(), b.size(), false, bad.data());
+    for (const InspRow& r : rows) {
+        CHECK(r.value == "??");
+        CHECK(r.unreadable);
+        CHECK_FALSE(r.editable);
+    }
+    // No flags = all readable (the old behaviour).
+    rows = inspect(b.data(), b.size(), false);
+    CHECK(row(InspType::U32).value == "42");
+    CHECK_FALSE(row(InspType::U32).unreadable);
+}

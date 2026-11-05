@@ -215,23 +215,23 @@ bool apply_transform(Document& doc, uint64_t begin, uint64_t len, XorTransform t
     while (done < len) {
         const size_t n = size_t(std::min<uint64_t>(kChunk, len - done));
         const size_t got = doc.read(begin + done, buf.data(), n, bad.data());
-        if (got != n || std::find(bad.begin(), bad.begin() + ptrdiff_t(n), uint8_t(1)) != bad.begin() + ptrdiff_t(n)) {
-            why = "read error near 0x" + fmt_hex(begin + done);
+        const auto first_bad = std::find(bad.begin(), bad.begin() + ptrdiff_t(got), uint8_t(1));
+        if (got != n || first_bad != bad.begin() + ptrdiff_t(got)) {
+            why = "unreadable byte at 0x" + fmt_hex(begin + done + uint64_t(first_bad - bad.begin())) +
+                  "; nothing was changed";
             break;
         }
         apply_transform(buf.data(), n, t, key, phase + done, decode);
         if (!doc.overwrite(begin + done, buf.data(), n)) {
-            why = "the edit was rejected";
+            why = "the edit was rejected; nothing was changed";
             break;
         }
         done += n;
     }
-    doc.end_group();
-    if (!why.empty()) {
-        if (done) doc.undo();  // roll back the chunks already written (one group = one step)
-        return fail(why);
-    }
-    return true;
+    // A failure partway rolls the chunks already written back: no undo step, no redo step.
+    if (why.empty()) doc.end_group();
+    else doc.abort_group();
+    return why.empty() ? true : fail(why);
 }
 
 bool parse_plaintext(const std::string& text, bool hex, std::vector<uint8_t>& out, std::string* err) {
@@ -299,13 +299,24 @@ void scan_xor(const Snapshot& snap, uint64_t begin, uint64_t end, const std::vec
         const size_t got = snap.read_valid(pos, buf.data(), want);
         const size_t starts = got >= n ? std::min(blk, got - n + 1) : 0;
         const bool more = m.scan(buf.data(), starts, pos);
-        if (progress) progress->fetch_add(blk, std::memory_order_relaxed);
         if (!more) break;  // truncated
-        if (got < want) {  // unreadable byte: the data ends here
-            out.io_error = true;
-            out.io_error_offset = pos + got;
-            break;
+        if (got < want) {
+            const uint64_t at = pos + got;
+            const uint64_t resume = snap.next_readable(at);
+            if (resume <= at) {  // unreadable byte (I/O error): the data ends here
+                if (progress) progress->fetch_add(blk, std::memory_order_relaxed);
+                out.io_error = true;
+                out.io_error_offset = at;
+                break;
+            }
+            // A hole of a sparse source: every start in [pos + starts, resume) spans it.
+            const uint64_t to = std::min(resume, end);
+            out.skipped += to - at;
+            if (progress) progress->fetch_add(to - pos, std::memory_order_relaxed);
+            pos = to;
+            continue;
         }
+        if (progress) progress->fetch_add(blk, std::memory_order_relaxed);
         pos += blk;
     }
 }

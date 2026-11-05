@@ -15,6 +15,7 @@
 
 #include "core/document.h"
 #include "core/strings_scan.h"
+#include "holey_mem.h"
 
 using namespace hx;
 
@@ -400,4 +401,49 @@ TEST_CASE("StringsFilter: incremental case-insensitive substring") {
     while (!f.step(*s, r.hits, 0)) ++calls;  // 0 still makes progress: one hit per call
     CHECK(calls == 4);
     CHECK(f.matches() == std::vector<size_t>{0, 1, 3});
+}
+
+TEST_CASE("strings: holes of process memory end strings and are skipped, not errors") {
+    hx_test::HoleyMem hm;  // readable page | hole page | readable page (zero-filled)
+    const uint64_t a = hm.addr(), pg = hm.pg;
+    std::memcpy(hm.base + pg - 11, "HELLO_WORLD", 11);  // touches the hole
+    std::memcpy(hm.after_ptr(), "ABCDEFGH", 8);          // starts right after it
+    std::memcpy(hm.base + 100, "inside page one", 15);
+    auto doc = hx_test::open_self();
+    auto snap = doc->snapshot();
+    StringsOptions o;
+    o.utf16le = false;
+    o.min_length = 4;
+    StringsScanResult r;
+    scan_strings(*snap, a, hm.end(), o, r);
+    CHECK_FALSE(r.io_error);
+    CHECK(r.skipped == pg);
+    REQUIRE(r.hits.size() == 3);
+    CHECK(r.hits[0].offset == a + 100);
+    CHECK(r.hits[1].offset == a + pg - 11);
+    CHECK(r.hits[1].char_count == 11);  // ends at the hole
+    CHECK(r.hits[2].offset == a + 2 * pg);
+    CHECK(r.hits[2].char_count == 8);
+    CHECK(string_hit_text(*snap, r.hits[2]) == "ABCDEFGH");
+
+    // Starting inside the hole; and the job reports the same.
+    scan_strings(*snap, a + pg + 5, hm.end(), o, r);
+    CHECK_FALSE(r.io_error);
+    CHECK(r.skipped == pg - 5);
+    REQUIRE(r.hits.size() == 1);
+    CHECK(r.hits[0].offset == a + 2 * pg);
+
+    StringsJob job;
+    const uint64_t gen = job.generation();
+    job.start(snap, a, hm.end(), o);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == gen) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto jr = job.result();
+    REQUIRE(jr);
+    CHECK(jr->scan.hits.size() == 3);
+    CHECK(jr->scan.skipped == pg);
+    CHECK_FALSE(jr->scan.io_error);
 }

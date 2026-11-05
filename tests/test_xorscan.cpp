@@ -14,7 +14,9 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/util.h"
 #include "core/xorscan.h"
+#include "holey_mem.h"
 
 using namespace hx;
 
@@ -345,4 +347,66 @@ TEST_CASE("XorScanJob: results, restart, cancel") {
     job.cancel();
     r = wait_for(job, g);
     CHECK((r->scan.cancelled || r->scan.hits.size() == d.size() >> 20));
+}
+
+TEST_CASE("xorscan: holes of process memory are skipped by the scan") {
+    hx_test::HoleyMem hm;  // readable page | hole page | readable page
+    const uint64_t a = hm.addr(), pg = hm.pg;
+    const Bytes plain = bytes_of("SECRET!!");
+    Bytes enc = apply_transform(plain, XorTransform::Xor, {0x5A}, 0, false);
+    std::memcpy(hm.after_ptr() + 100, enc.data(), enc.size());
+    std::memcpy(hm.base + pg - 4, enc.data(), 4);       // a copy cut by the hole: never a match
+    std::memcpy(hm.after_ptr(), enc.data() + 4, 4);
+    auto doc = hx_test::open_self();
+    auto snap = doc->snapshot();
+    XorScanOptions o;
+    o.add8 = o.rol = false;
+    XorScanResult r;
+    scan_xor(*snap, a, hm.end(), plain, o, r);
+    CHECK_FALSE(r.io_error);
+    CHECK(r.skipped == pg);
+    check_hits(r.hits, {hit(a + 2 * pg + 100, XorTransform::Xor, {0x5A})});
+    scan_xor(*snap, hm.hole_begin() + 1, hm.end(), plain, o, r);  // starting inside the hole
+    CHECK_FALSE(r.io_error);
+    CHECK(r.skipped == pg - 1);
+    check_hits(r.hits, {hit(a + 2 * pg + 100, XorTransform::Xor, {0x5A})});
+}
+
+TEST_CASE("xorscan: apply failing partway leaves the document and its undo / redo stacks as they were") {
+    // More than one 1 MiB chunk of readable memory, then a hole: the first chunk is written before
+    // the second one hits the hole.
+    const size_t pg = hx_test::page_size();
+    hx_test::HoleyMem hm((size_t(1) << 20) / pg + 1, 1, 1);
+    const uint64_t a = hm.addr();
+    auto doc = hx_test::open_self(true);
+    REQUIRE_FALSE(doc->read_only());
+    const uint8_t x = 0x42;
+    REQUIRE(doc->overwrite(a + 10, &x, 1));
+    REQUIRE(doc->overwrite(a + 11, &x, 1));
+    REQUIRE(doc->undo());  // one undo step, one redo step
+    REQUIRE(doc->undo_stack().size() == 1);
+    REQUIRE(doc->redo_stack().size() == 1);
+    const uint64_t gen = doc->generation();
+
+    std::string err;
+    CHECK_FALSE(apply_transform(*doc, a, hm.hole_begin() - a + 100, XorTransform::Xor, {0xFF}, 0, true, &err));
+    CHECK(err.find("unreadable") != std::string::npos);
+    CHECK(err.find(fmt_hex(hm.hole_begin())) != std::string::npos);
+    CHECK(doc->undo_stack().size() == 1);
+    CHECK(doc->redo_stack().size() == 1);  // the earlier redo step survives, no new one
+    CHECK_FALSE(doc->in_group());
+    CHECK(doc->generation() != gen);  // content changed and was rolled back
+    uint8_t b[16] = {};
+    doc->read(a, b, sizeof b);
+    for (int i = 0; i < 16; ++i) CHECK(b[i] == (i == 10 ? 0x42 : 0));
+    CHECK(doc->is_modified_range(a + 10, 1));
+    CHECK_FALSE(doc->is_modified_range(a + 100, (size_t(1) << 20) - 200));
+    REQUIRE(doc->redo());  // the redo stack still works
+    doc->read(a, b, sizeof b);
+    CHECK(b[11] == 0x42);
+
+    // Failing on the very first chunk (nothing written yet) is just as clean.
+    CHECK_FALSE(apply_transform(*doc, hm.hole_begin() - 10, 20, XorTransform::Xor, {1}, 0, true, &err));
+    CHECK(doc->undo_stack().size() == 2);
+    CHECK(doc->redo_stack().empty());
 }

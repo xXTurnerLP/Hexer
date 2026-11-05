@@ -71,6 +71,12 @@ struct Scanner {
         for (Run& r : be) emit(r, StringEncoding::Utf16BE, 2);
     }
 
+    // A hole (unreadable bytes) follows: end every run; no code unit spans it either.
+    void cut() {
+        flush();
+        have_prev = false;
+    }
+
     const StringsOptions& opt;
     StringsScanResult& out;
     uint64_t min_chars = 1;
@@ -126,12 +132,24 @@ void scan_strings(const Snapshot& snap, uint64_t begin, uint64_t end, const Stri
         if (buf.size() < n) buf.resize(n);
         const size_t got = snap.read_valid(pos, buf.data(), n);
         for (size_t i = 0; i < got; ++i) sc.feed(pos + i, buf[i]);
-        if (progress) progress->fetch_add(n, std::memory_order_relaxed);
-        if (got < n) {  // unreadable byte: the data ends here
-            out.io_error = true;
-            out.io_error_offset = pos + got;
-            break;
+        if (got < n) {
+            const uint64_t at = pos + got;
+            const uint64_t resume = snap.next_readable(at);
+            if (resume <= at) {  // unreadable byte (I/O error): the data ends here
+                if (progress) progress->fetch_add(n, std::memory_order_relaxed);
+                out.io_error = true;
+                out.io_error_offset = at;
+                break;
+            }
+            // A hole of a sparse source (unmapped memory): strings end at it; continue behind it.
+            sc.cut();
+            const uint64_t to = std::min(resume, end);
+            out.skipped += to - at;
+            if (progress) progress->fetch_add(to - pos, std::memory_order_relaxed);
+            pos = to;
+            continue;
         }
+        if (progress) progress->fetch_add(n, std::memory_order_relaxed);
         pos += n;
     }
     if (!out.cancelled) sc.flush();  // a cancelled scan does not report its cut-off runs

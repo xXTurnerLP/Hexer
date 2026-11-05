@@ -22,6 +22,7 @@
 #include "core/document.h"
 #include "core/entropy.h"
 #include "core/os_file.h"
+#include "holey_mem.h"
 
 using namespace hx;
 
@@ -463,4 +464,33 @@ TEST_CASE("entropy: cancel and restart") {
         EntropyJob other;  // destroyed while running: cancels + joins
         other.start(snap_of(Bytes(size_t(8) << 20, 0x5A)), o);
     }
+}
+
+TEST_CASE("entropy: a process address space skips holes; fully unmapped buckets stay unreadable") {
+    hx_test::HoleyMem hm;
+    for (size_t i = 0; i < hm.pg; ++i) hm.base[i] = uint8_t(i * 31 + 7);
+    auto doc = hx_test::open_self();
+    auto snap = doc->snapshot();
+    EntropyJob job;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = run(job, snap);  // 1024 sampled buckets over the whole address space
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+    REQUIRE(r->finished);
+    CHECK(r->done == r->buckets.size());
+    CHECK_FALSE(r->io_error);  // holes are not I/O errors
+    CHECK(r->bytes_read <= uint64_t(r->buckets.size()) * EntropyOptions{}.sample_per_bucket);
+    // The bucket holding our page samples its mapped part (it is not "unreadable from byte 0").
+    const EntropyBucket& mine = r->buckets[r->bucket_of(hm.addr())];
+    CHECK(mine.done);
+    CHECK(mine.bytes_read > 0);
+    CHECK(mine.unreadable);  // and it has holes
+    // Bucket 0 holds the null page; some bucket of a 47-bit space is entirely unmapped.
+    size_t empty = 0;
+    for (const EntropyBucket& b : r->buckets)
+        if (b.done && b.bytes_read == 0) {
+            CHECK(b.unreadable);
+            ++empty;
+        }
+    CHECK(empty > 0);
+    CHECK(r->buckets[0].unreadable);
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 
 namespace hx {
@@ -624,14 +625,27 @@ bool hex_matches(const std::string& expected, const std::string& digest_hex) {
 }
 
 bool hash_range(const Snapshot& snap, uint64_t offset, uint64_t length, const std::vector<Hasher*>& hashers,
-                const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress, uint64_t* io_error_offset) {
+                const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress, uint64_t* io_error_offset,
+                bool* hole) {
     if (io_error_offset) *io_error_offset = UINT64_MAX;
+    if (hole) *hole = false;
     const uint64_t size = snap.size();
     if (offset > size) offset = size;
     length = std::min(length, size - offset);
+    const uint64_t end = offset + length;
+    // A hole of a sparse source (unmapped process memory): refuse at once when the range starts or
+    // ends in one (cheap region-map lookups), else at the first one met.
+    auto refuse_hole = [&](uint64_t at) {
+        if (io_error_offset) *io_error_offset = at;
+        if (hole) *hole = true;
+        return false;
+    };
+    if (length) {
+        if (const uint64_t r = snap.next_readable(offset); r > offset) return refuse_hole(offset);
+        if (const uint64_t e = snap.readable_end(offset, end); e < end) return refuse_hole(e);
+    }
     std::vector<uint8_t> buf(size_t(std::min<uint64_t>(kBlock, length)));
     uint64_t pos = offset;
-    const uint64_t end = offset + length;
     while (pos < end) {
         if (cancel && cancel->load(std::memory_order_relaxed)) return false;
         const size_t want = size_t(std::min<uint64_t>(kBlock, end - pos));
@@ -639,12 +653,21 @@ bool hash_range(const Snapshot& snap, uint64_t offset, uint64_t length, const st
         for (Hasher* h : hashers) h->update(buf.data(), got);
         if (progress) progress->fetch_add(got, std::memory_order_relaxed);
         if (got < want) {
-            if (io_error_offset) *io_error_offset = pos + got;
+            const uint64_t at = pos + got;
+            if (snap.next_readable(at) > at) return refuse_hole(at);
+            if (io_error_offset) *io_error_offset = at;
             return false;
         }
         pos += want;
     }
     return !(cancel && cancel->load(std::memory_order_relaxed));
+}
+
+std::string hash_hole_message(uint64_t at) {
+    char hex[32];
+    std::snprintf(hex, sizeof hex, "0x%llX", static_cast<unsigned long long>(at));
+    return std::string("the range has unreadable holes (unmapped / inaccessible memory at ") + hex +
+           "); hashing a sparse address space is meaningless: select a readable region";
 }
 
 bool hash_snapshot_hex(const Snapshot& snap, const std::string& algo, uint64_t offset, uint64_t length,
@@ -656,8 +679,9 @@ bool hash_snapshot_hex(const Snapshot& snap, const std::string& algo, uint64_t o
         return false;
     }
     uint64_t bad = UINT64_MAX;
-    if (!hash_range(snap, offset, length, {h.get()}, nullptr, nullptr, &bad)) {
-        if (err) *err = "read error at offset " + std::to_string(bad);
+    bool hole = false;
+    if (!hash_range(snap, offset, length, {h.get()}, nullptr, nullptr, &bad, &hole)) {
+        if (err) *err = hole ? hash_hole_message(bad) : "read error at offset " + std::to_string(bad);
         return false;
     }
     out = to_hex(h->finish());
@@ -739,10 +763,12 @@ void HashJob::start(std::shared_ptr<const Snapshot> snap, uint64_t offset, uint6
             }
         }
         uint64_t bad = UINT64_MAX;
-        const bool ok = !snap || hash_range(*snap, offset, length, hs, &run->cancel, &run->done, &bad);
+        bool hole = false;
+        const bool ok = !snap || hash_range(*snap, offset, length, hs, &run->cancel, &run->done, &bad, &hole);
         r.cancelled = run->cancel.load();
         r.io_error = bad != UINT64_MAX;
         r.io_error_offset = r.io_error ? bad : 0;
+        r.hole = r.io_error && hole;
         if (ok && !r.cancelled)
             for (size_t i = 0; i < hs.size(); ++i) r.values.push_back({infos[i]->name, to_hex(hs[i]->finish())});
         {

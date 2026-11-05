@@ -132,6 +132,7 @@ void XorPanel::draw(Document* doc, const XorPanelCallbacks& cb) {
                               (sc.hits.size() == 1 ? " match" : " matches");
             if (sc.cancelled) msg += " (cancelled)";
             if (sc.io_error) msg += " (read error at " + fmt_off(sc.io_error_offset) + ")";
+            if (sc.skipped) msg += " (" + fmt_size(sc.skipped) + " unreadable skipped)";
             cb.notify(msg);
         }
     }
@@ -313,6 +314,10 @@ void XorPanel::draw_scan_tab(Document& doc, DocState& st, const XorPanelCallback
     if (sc.io_error) {
         ImGui::SameLine();
         ImGui::TextColored(kErrColor, "(read error at %s)", fmt_off(sc.io_error_offset).c_str());
+    }
+    if (sc.skipped) {  // holes of process memory: not errors
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s unreadable skipped)", fmt_size(sc.skipped).c_str());
     }
     if (st.res_doc_gen != doc.generation()) {
         ImGui::SameLine();

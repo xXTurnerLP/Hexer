@@ -26,11 +26,16 @@ struct InspRow {
     std::string value;     // formatted; "" / "-" when not enough bytes or invalid
     size_t size = 0;       // bytes consumed (0 = not decodable here)
     bool editable = false;
+    bool unreadable = false;  // its bytes include an unreadable one: value "??", not editable
 };
 
 // `avail` = bytes available at the cursor (pass up to 16+). `big_endian` affects multi-byte ints,
 // floats, UTF-16, Unix/FileTime/DosDateTime. Rows are returned in InspType order.
-std::vector<InspRow> inspect(const uint8_t* data, size_t avail, bool big_endian);
+// `unreadable` (optional, avail flags as from Document::read(..., unreadable)): a row whose bytes
+// include an unreadable one - every row when the first byte is - gets value "??", editable =
+// false and unreadable = true (its size is kept, so the bytes it would decode can be outlined).
+std::vector<InspRow> inspect(const uint8_t* data, size_t avail, bool big_endian,
+                             const uint8_t* unreadable = nullptr);
 
 // Parse `text` for `type` and produce the bytes to overwrite at the cursor. Accepts decimal or
 // 0x-hex for ints (range-checked), floats, single char for Ascii/Utf8/Utf16, ISO dates for time
