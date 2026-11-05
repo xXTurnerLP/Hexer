@@ -28,6 +28,11 @@ uint64_t focus_offset(const ViewState& v);
 // a single byte is "0x00000010 (1 byte)", an empty range "0x00000010 (0 bytes)".
 std::string fmt_range(uint64_t begin, uint64_t len);
 
+// Color of byte `b` in the hex column (text = false) or the text column. Precedence: unreadable
+// (I/O error) > modified (only pass true when highlighting is on) > byte class (class_colors) >
+// the plain scheme (hex: zero dim, others bright; text: printable vs non-printable).
+uint32_t byte_text_color(uint8_t b, bool text, bool unreadable, bool modified, bool class_colors);
+
 struct HexViewConfig {
     int bytes_per_row = 16;     // 0 = auto-fit to available width (multiple of 8, min 8)
     int group_size = 8;         // visual gap every N bytes (0 = none)
@@ -35,6 +40,12 @@ struct HexViewConfig {
     bool show_ascii = true;
     bool insert_mode = false;   // typing inserts instead of overwriting
     bool highlight_modified = true;
+    // Hex digits and text glyphs take their color from the byte's class (core/entropy.h ByteClass,
+    // theme HexColors::byte_class) instead of the plain zero / text colors. Layout is unchanged.
+    bool byte_class_colors = false;
+    // Pixels left free right of the view (e.g. for a Minimap strip drawn with SameLine(0, 0)
+    // right after draw()); bytes-per-row auto-fit uses the narrower width. 0 = fill the region.
+    float reserve_right = 0.0f;
     ImFont* mono = nullptr;     // font to use (nullptr = current)
     float font_size = 0.0f;     // 0 = font's default size
     // Extra scrollbar tick marks (e.g. Find All hits): sorted offsets, drawn at most one per pixel.
@@ -99,6 +110,9 @@ public:
               const HexViewConfig& cfg, HexViewEvents& ev);
     // Scroll so `offset` is visible (centered if `center`); applied during the next draw().
     void request_scroll_to(uint64_t offset, bool center = true);
+    // Takes a pending request_scroll_to() back (it is not applied then), e.g. to hand it to another
+    // view of the same document that is drawn instead of this one (the Compare tab). False if none.
+    bool take_scroll_request(uint64_t& offset, bool& center);
     void request_focus() { want_focus_ = true; }
     const HexViewGeometry& geometry() const { return geo_; }
     // Screen position inside byte `off`'s cell (hex digits, or the text column) as laid out by the

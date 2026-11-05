@@ -309,9 +309,19 @@ const HexColors& hex_colors() {
         /* search_hit      */ rgba(0xf2, 0xc9, 0x3b, 110),
         /* bookmark        */ rgba(0xef, 0x5f, 0x6b),
         /* unreadable_text */ rgba(0xff, 0x6b, 0x6b),
+        /* byte_class      */ {
+            /* Zero       */ rgba(0x5a, 0x5e, 0x65),
+            /* Whitespace */ rgba(0x5f, 0x9a, 0xa6),
+            /* Printable  */ rgba(0x9d, 0xd6, 0x7f),
+            /* Control    */ rgba(0xc6, 0x8c, 0xe6),
+            /* High       */ rgba(0x6f, 0xa6, 0xf2),
+            /* Full       */ rgba(0xf2, 0x7c, 0x9c),
+        },
     };
     return c;
 }
+
+uint32_t byte_class_color(ByteClass c) { return hex_colors().byte_class[int(c)]; }
 
 uint32_t palette_color(int index) { return field_palette(index); }
 

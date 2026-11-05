@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "core/entropy.h"  // ByteClass
+
 struct ImFont;
 
 namespace hx {
@@ -32,8 +34,13 @@ struct HexColors {
     uint32_t background, row_alt, offset_text, header_text, hex_text, zero_text, ascii_text,
         nonprint_text, cursor, cursor_inactive, selection, modified_text, hover, separator,
         search_hit, bookmark, unreadable_text;
+    // Byte-class coloring (HexViewConfig::byte_class_colors, minimap), indexed by ByteClass:
+    // zero dim, whitespace subtle, printable clear, control / high / 0xFF distinct. Orange stays
+    // reserved for modified bytes and red for unreadable ones.
+    uint32_t byte_class[kByteClassCount];
 };
 const HexColors& hex_colors();
+uint32_t byte_class_color(ByteClass c);  // hex_colors().byte_class[c]
 
 // Distinct, dark-mode friendly colors for auto-coloring parser fields (index wraps).
 uint32_t palette_color(int index);

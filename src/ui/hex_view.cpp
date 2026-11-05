@@ -34,6 +34,15 @@ std::string fmt_range(uint64_t begin, uint64_t len) {
     return s;
 }
 
+uint32_t byte_text_color(uint8_t b, bool text, bool unreadable, bool modified, bool class_colors) {
+    const HexColors& C = hex_colors();
+    if (unreadable) return C.unreadable_text;
+    if (modified) return C.modified_text;
+    if (class_colors) return byte_class_color(byte_class(b));
+    if (text) return b >= 0x20 && b < 0x7F ? C.ascii_text : C.nonprint_text;
+    return b == 0 ? C.zero_text : C.hex_text;
+}
+
 namespace {
 
 constexpr int kMaxBytesPerRow = 256;
@@ -419,6 +428,14 @@ void HexView::request_scroll_to(uint64_t offset, bool center) {
     scroll_center_ = center;
 }
 
+bool HexView::take_scroll_request(uint64_t& offset, bool& center) {
+    if (!has_scroll_request_) return false;
+    has_scroll_request_ = false;
+    offset = scroll_target_;
+    center = scroll_center_;
+    return true;
+}
+
 void HexView::draw(const char* id, Document& doc, const std::vector<const HighlightSet*>& layers,
                    const HexViewConfig& cfg, HexViewEvents& ev) {
     ev = HexViewEvents{};
@@ -447,7 +464,9 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
 
     uint64_t size = doc.size();
     L.off_digits = std::max(8, hex_digits(size));
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float reserve = std::max(0.0f, cfg.reserve_right);
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    avail.x -= reserve;
     L.bpr = std::max(1, choose_bytes_per_row(cfg, avail.x - L.sb_w, L.adv, L.off_digits));
     L.group = effective_group(cfg.group_size, L.bpr);
     const float content_w = L.adv * float(total_cells(L.bpr, L.group, L.off_digits, L.ascii));
@@ -456,7 +475,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     // wide); content height is 1 so ImGui never shows a vertical scrollbar - we draw our own.
     ImGui::SetNextWindowContentSize(ImVec2(content_w + L.sb_w, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, C.background);
-    const bool visible = ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_None,
+    const bool visible = ImGui::BeginChild(id, ImVec2(reserve > 0.0f ? -reserve : 0.0f, 0), ImGuiChildFlags_None,
                                            ImGuiWindowFlags_HorizontalScrollbar |
                                                ImGuiWindowFlags_NoScrollWithMouse |
                                                ImGuiWindowFlags_NoNavInputs);
@@ -917,17 +936,13 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             const bool unreadable = bad[i] != 0;  // I/O error: not a real zero
             char t[2] = {hexchars[b >> 4], hexchars[b & 0xF]};
             if (unreadable) t[0] = t[1] = '?';
-            uint32_t hc = unreadable ? C.unreadable_text
-                          : modified ? C.modified_text
-                                     : (b == 0 ? C.zero_text : C.hex_text);
+            uint32_t hc = byte_text_color(b, false, unreadable, modified, cfg.byte_class_colors);
             if (is_caret && caret_solid_hex) hc = on_caret;
             hex_run.put(L.cell(i), t, 2, hc);
             if (L.ascii) {
                 const bool printable = !unreadable && b >= 0x20 && b < 0x7F;
                 char ch = unreadable ? '?' : printable ? char(b) : '.';
-                uint32_t tc = unreadable ? C.unreadable_text
-                              : modified ? C.modified_text
-                                         : (printable ? C.ascii_text : C.nonprint_text);
+                uint32_t tc = byte_text_color(b, true, unreadable, modified, cfg.byte_class_colors);
                 if (is_caret && caret_solid_txt) tc = on_caret;
                 txt_run.put(i, &ch, 1, tc);
             }

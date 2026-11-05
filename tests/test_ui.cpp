@@ -18,8 +18,11 @@
 #include "imgui.h"
 
 #include "core/document.h"
+#include "core/entropy.h"
 #include "core/highlight.h"
 #include "ui/hex_view.h"
+#include "ui/minimap.h"
+#include "ui/theme.h"
 
 using namespace hx;
 
@@ -680,4 +683,305 @@ TEST_CASE("ui: mouse X1/X2 report back/forward while hovered") {
 
     ev = press_events(ui, ImVec2(ui.w + 50.0f, ui.h + 50.0f), 0, 3);  // outside the view
     CHECK(!ev.nav_back);
+}
+
+// ================================================================================================
+// byte-class coloring
+// ================================================================================================
+
+TEST_CASE("ui: byte text color precedence and classes") {
+    const HexColors& C = hex_colors();
+    // Plain scheme (unchanged behaviour).
+    CHECK(byte_text_color(0x00, false, false, false, false) == C.zero_text);
+    CHECK(byte_text_color(0x41, false, false, false, false) == C.hex_text);
+    CHECK(byte_text_color(0x41, true, false, false, false) == C.ascii_text);
+    CHECK(byte_text_color(0x01, true, false, false, false) == C.nonprint_text);
+    CHECK(byte_text_color(0xFF, true, false, false, false) == C.nonprint_text);
+    // Class scheme: same color in both columns, one per class.
+    for (int v = 0; v < 256; ++v) {
+        const uint8_t b = uint8_t(v);
+        const uint32_t want = byte_class_color(byte_class(b));
+        CHECK(byte_text_color(b, false, false, false, true) == want);
+        CHECK(byte_text_color(b, true, false, false, true) == want);
+    }
+    CHECK(byte_class_color(ByteClass::Zero) == C.byte_class[0]);
+    for (int a = 0; a < kByteClassCount; ++a)
+        for (int b = a + 1; b < kByteClassCount; ++b) CHECK(C.byte_class[a] != C.byte_class[b]);
+    for (int a = 0; a < kByteClassCount; ++a) {
+        CHECK(C.byte_class[a] != C.modified_text);
+        CHECK(C.byte_class[a] != C.unreadable_text);
+    }
+    // Precedence: unreadable > modified > class.
+    for (bool cls : {false, true})
+        for (bool text : {false, true}) {
+            CHECK(byte_text_color(0x41, text, true, true, cls) == C.unreadable_text);
+            CHECK(byte_text_color(0x41, text, false, true, cls) == C.modified_text);
+        }
+}
+
+TEST_CASE("ui: byte-class coloring does not change layout or hit testing") {
+    Ui ui(iota_bytes(300));
+    const HexViewGeometry g0 = ui.view.geometry();
+    const ImVec2 h0 = ui.hex(37), t0 = ui.txt(37);
+    ui.cfg.byte_class_colors = true;
+    ui.frame();
+    ui.frame();
+    const HexViewGeometry& g1 = ui.view.geometry();
+    CHECK(g1.hex_x == g0.hex_x);
+    CHECK(g1.text_x == g0.text_x);
+    CHECK(g1.adv == g0.adv);
+    CHECK(g1.rows_y == g0.rows_y);
+    CHECK(g1.bpr == g0.bpr);
+    CHECK(g1.full_rows == g0.full_rows);
+    CHECK(ui.hex(37).x == h0.x);
+    CHECK(ui.txt(37).x == t0.x);
+    ui.click(ui.hex(37));
+    CHECK(ui.v().cursor == 37);
+    ui.drag(ui.hex(40), ui.txt(43));
+    CHECK(ui.sel() == Range{40, 44});
+    ui.click(ui.hex(5, true));
+    CHECK(ui.v().cursor == 5);
+    CHECK(ui.v().low_nibble);
+}
+
+// ================================================================================================
+// minimap
+// ================================================================================================
+
+namespace {
+
+// ImGui context drawing one Minimap strip (sh px tall) in a host window.
+struct MapUi {
+    ImGuiContext* ctx = nullptr;
+    Minimap map;
+    MinimapEvents ev;
+    const EntropyResult* r = nullptr;
+    uint64_t size = 1000, vb = 0, ve = 0;
+    MinimapMode mode = MinimapMode::Entropy;
+    float sw = 16.0f, sh = 400.0f;
+    ImVec2 p0;                         // strip origin of the last frame
+    std::vector<MinimapEvents> jumps;  // every frame that requested a jump
+
+    MapUi() {
+        ctx = ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.LogFilename = nullptr;
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+        io.Fonts->AddFontDefault();
+        frame();
+        frame();
+    }
+    ~MapUi() { ImGui::DestroyContext(ctx); }
+    void frame(float dt = 1.0f / 60.0f) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(600, 600);
+        io.DeltaTime = dt;
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(600, 600));
+        ImGui::Begin("host", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        p0 = ImGui::GetCursorScreenPos();
+        map.draw("##map", sw, sh, r, size, vb, ve, mode, ev);
+        if (ev.jump_requested) jumps.push_back(ev);
+        ImGui::End();
+        ImGui::Render();
+    }
+    ImVec2 at(float fy) const { return ImVec2(p0.x + sw * 0.5f, p0.y + sh * fy); }
+    void move(ImVec2 p) {
+        ImGui::GetIO().AddMousePosEvent(p.x, p.y);
+        frame();
+    }
+    void button(bool down) {
+        ImGui::GetIO().AddMouseButtonEvent(0, down);
+        frame();
+    }
+};
+
+}  // namespace
+
+TEST_CASE("ui: minimap row geometry") {
+    CHECK(minimap_row_offset(0, 400, 1000) == 0);
+    CHECK(minimap_row_offset(1, 400, 1000) == 2);  // floor(2.5)
+    CHECK(minimap_row_offset(200, 400, 1000) == 500);
+    CHECK(minimap_row_offset(400, 400, 1000) == 1000);
+    CHECK(minimap_row_offset(999, 400, 1000) == 1000);
+    CHECK(minimap_row_offset(5, 0, 1000) == 0);
+    const uint64_t big = 3ull << 40;
+    CHECK(minimap_row_offset(399, 400, big) == big * 399 / 400);  // fits: exact reference
+    CHECK(minimap_row_offset(1, 3, UINT64_MAX) == UINT64_MAX / 3);  // no overflow
+    CHECK(minimap_offset_row(0, 400, 1000) == 0);
+    CHECK(minimap_offset_row(500, 400, 1000) == 200);
+    CHECK(minimap_offset_row(1000, 400, 1000) == 399);  // clamped to the last row
+    CHECK(minimap_offset_row(5, 400, 0) == 0);
+    CHECK(minimap_offset_row(big - 1, 400, big) == 399);
+    CHECK(minimap_offset_row(UINT64_MAX / 2, 400, UINT64_MAX) == 200);
+    CHECK(minimap_offset_row(501, 400, 1000) == 200);  // row 200 is [500, 502)
+    CHECK(minimap_offset_row(502, 400, 1000) == 201);
+    CHECK(minimap_offset_row(2, 400, 3) == 399);       // tiny: the last row holding byte 2
+    for (uint64_t y = 0; y < 400; ++y) CHECK(minimap_offset_row(minimap_row_offset(y, 400, big), 400, big) == y);
+}
+
+TEST_CASE("ui: minimap click and drag request jumps") {
+    MapUi ui;
+    ui.size = 1000;
+    ui.vb = 0;
+    ui.ve = 100;
+    ui.move(ui.at(0.5f));
+    CHECK(ui.ev.hovered);
+    CHECK(ui.ev.hover_offset == 500);
+    CHECK(ui.jumps.empty());
+    ui.button(true);
+    REQUIRE(ui.jumps.size() == 1);
+    CHECK(ui.jumps[0].jump_offset == 501);  // centre of the row [500, 502)
+    ui.button(false);
+    CHECK(ui.jumps.size() == 1);
+
+    // Drag down past the end: offsets grow, clamped to the last row.
+    ui.jumps.clear();
+    ui.move(ui.at(0.1f));
+    ui.button(true);
+    for (float f : {0.3f, 0.6f, 0.9f, 1.5f}) ui.move(ui.at(f));
+    ui.button(false);
+    REQUIRE(ui.jumps.size() >= 4);
+    for (size_t i = 1; i < ui.jumps.size(); ++i) CHECK(ui.jumps[i].jump_offset > ui.jumps[i - 1].jump_offset);
+    CHECK(ui.jumps.back().jump_offset == 998);  // centre of the last row [997, 1000)
+    CHECK(ui.jumps.front().jump_offset == 101);
+    // Holding still does not repeat the jump.
+    ui.jumps.clear();
+    ui.move(ui.at(0.2f));
+    ui.button(true);
+    ui.frame();
+    ui.frame();
+    CHECK(ui.jumps.size() == 1);
+    ui.button(false);
+
+    // Outside the strip: nothing.
+    ui.jumps.clear();
+    ui.move(ImVec2(ui.p0.x + ui.sw + 40.0f, ui.p0.y + 10.0f));
+    CHECK_FALSE(ui.ev.hovered);
+    ui.button(true);
+    ui.button(false);
+    CHECK(ui.jumps.empty());
+}
+
+TEST_CASE("ui: minimap draws pending, partial and tiny results without trouble") {
+    EntropyResult r = entropy_layout(1000, 64);
+    for (size_t i = 0; i < r.buckets.size() / 2; ++i) {
+        r.buckets[i].done = true;
+        r.buckets[i].bytes_read = r.buckets[i].length;
+        r.buckets[i].entropy = float(i % 9);
+        r.buckets[i].class_frac[int(ByteClass::Printable)] = 0.75f;
+        r.buckets[i].class_frac[int(ByteClass::Zero)] = 0.25f;
+    }
+    r.buckets[3].unreadable = true;
+    r.buckets[4].unreadable = true;
+    r.buckets[4].bytes_read = 0;
+    r.done = uint32_t(r.buckets.size() / 2);
+    MapUi ui;
+    ui.r = &r;
+    for (MinimapMode m : {MinimapMode::Entropy, MinimapMode::ByteClass}) {
+        ui.mode = m;
+        for (float f : {0.01f, 0.2f, 0.9f}) {
+            ui.move(ui.at(f));
+            ui.frame(1.0f);  // past the tooltip delay
+            CHECK(ui.ev.hovered);
+        }
+    }
+    // Tiny document stretched over many rows, empty document, no result.
+    EntropyResult tiny = entropy_layout(3, 1024);
+    ui.r = &tiny;
+    ui.size = 3;
+    ui.ve = 3;
+    ui.move(ui.at(0.9f));
+    CHECK(ui.ev.hover_offset == 2);
+    ui.button(true);
+    CHECK(ui.ev.jump_requested);
+    CHECK(ui.ev.jump_offset == 2);
+    ui.button(false);
+    ui.size = 0;
+    ui.frame();
+    CHECK_FALSE(ui.ev.hovered);
+    ui.r = nullptr;
+    ui.size = 50;
+    ui.frame();
+    CHECK(ui.ev.hovered);
+}
+
+TEST_CASE("ui: minimap strips shorter than the viewport box and the extremes") {
+    MapUi ui;
+    ui.size = 1000;
+    ui.vb = 990;
+    ui.ve = 1000;
+    for (float h : {1.0f, 2.0f, 3.0f}) {  // the 3 px viewport box does not fit: no bad clamp
+        ui.sh = h;
+        ui.move(ui.at(0.5f));
+        CHECK(ui.ev.hovered);
+    }
+    // Offset 0 / last byte: pressing on the first and the last pixel row of a 400 px strip.
+    ui.sh = 400.0f;
+    ui.move(ImVec2(ui.p0.x + 2.0f, ui.p0.y + 0.2f));
+    ui.button(true);
+    REQUIRE(ui.ev.jump_requested);
+    CHECK(ui.ev.jump_offset == 1);  // centre of row 0 = [0, 2)
+    ui.button(false);
+    ui.move(ImVec2(ui.p0.x + 2.0f, ui.p0.y + 399.5f));
+    ui.button(true);
+    REQUIRE(ui.ev.jump_requested);
+    CHECK(ui.ev.jump_offset == 998);  // centre of the last row [997, 1000)
+    ui.button(false);
+    // 1-byte document: every row shows byte 0, a press anywhere jumps there.
+    ui.size = 1;
+    ui.vb = 0;
+    ui.ve = 1;
+    for (float f : {0.0f, 0.5f, 0.999f}) {
+        ui.move(ui.at(f));
+        CHECK(ui.ev.hover_offset == 0);
+        ui.button(true);
+        REQUIRE(ui.ev.jump_requested);
+        CHECK(ui.ev.jump_offset == 0);
+        ui.button(false);
+    }
+    // Empty document: no hover, no jump.
+    ui.size = 0;
+    ui.vb = ui.ve = 0;
+    ui.move(ui.at(0.5f));
+    CHECK_FALSE(ui.ev.hovered);
+    ui.button(true);
+    CHECK_FALSE(ui.ev.jump_requested);
+    ui.button(false);
+}
+
+TEST_CASE("ui: reserve_right leaves room beside the view") {
+    Ui ui(iota_bytes(4000), 0);  // auto-fit bytes per row
+    const int full = ui.ev.bytes_per_row;
+    ui.cfg.reserve_right = 500.0f;
+    ui.frame();
+    ui.frame();
+    CHECK(ui.ev.bytes_per_row < full);
+    CHECK(ui.ev.bytes_per_row >= 8);
+    ui.click(ui.hex(9));
+    CHECK(ui.v().cursor == 9);
+    // A click in the reserved strip does not reach the view.
+    ui.click(ImVec2(ui.w - 100.0f, ui.hex(20).y));
+    CHECK(ui.v().cursor == 9);
+}
+
+TEST_CASE("ui: take_scroll_request hands a pending scroll over instead of applying it") {
+    Ui ui(iota_bytes(64 * 1024));
+    uint64_t off = 0;
+    bool center = false;
+    CHECK_FALSE(ui.view.take_scroll_request(off, center));  // nothing pending
+    ui.view.request_scroll_to(0x8000, true);
+    REQUIRE(ui.view.take_scroll_request(off, center));
+    CHECK(off == 0x8000);
+    CHECK(center);
+    CHECK_FALSE(ui.view.take_scroll_request(off, center));  // taken once
+    ui.frame();
+    CHECK(ui.v().top_row == 0);  // the taken request is not applied by the next draw
+    ui.view.request_scroll_to(0x8000, false);
+    ui.frame();
+    CHECK(ui.v().top_row > 0);  // an untaken one still is
+    CHECK_FALSE(ui.view.take_scroll_request(off, center));
 }
