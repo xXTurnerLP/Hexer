@@ -1,5 +1,6 @@
 // Application shell: window + GL + ImGui setup, main loop, tabs, menus, shortcuts, popups,
-// saving (worker thread), search, hot-exit session, and the ScriptHost implementation.
+// saving (worker thread), search, hot-exit session, live tail, the Compare tab, the minimap, and
+// the ScriptHost implementation.
 // Panels live in ui/panels.cpp; shared state is the App struct in ui/app_internal.h.
 #include "ui/app.h"
 
@@ -294,6 +295,8 @@ Tab& add_tab(App& app, std::unique_ptr<Document> doc) {
     t->doc = std::move(doc);
     t->insert_mode = app.settings.insert_mode;
     refresh_tab_cache(*t);
+    // A pcap / pcapng capture: show the Packets panel (it indexes the capture when first drawn).
+    if (PacketsPanel::is_capture(*t->doc)) app.show_packets = app.focus_packets = true;
     app.tabs.push_back(std::move(t));
     app.active = int(app.tabs.size()) - 1;
     app.select_request = app.active;
@@ -316,12 +319,25 @@ void new_document(App& app) {
     add_tab(app, Document::create_empty(name));
 }
 
+void end_compare(App& app) {
+    app.diff.reset();  // cancels and joins its compare job
+    app.diff_a = app.diff_b = 0;
+    app.diff_select = false;
+}
+
 void close_tab_now(App& app, int index) {
     if (index < 0 || index >= int(app.tabs.size())) return;
     std::unique_ptr<Tab> t = std::move(app.tabs[size_t(index)]);
     app.tabs.erase(app.tabs.begin() + index);
     t->ev = HexViewEvents{};
-    app.strings_panel.forget(t->doc->id());  // results are cheap to rescan; free the memory now
+    const uint64_t id = t->doc->id();
+    app.strings_panel.forget(id);  // results are cheap to rescan; free the memory now
+    app.packets_panel.forget(id);
+    if (app.diff && (app.diff_a == id || app.diff_b == id)) end_compare(app);
+    t->entropy.cancel();  // rescanned if the tab is reopened
+    t->entropy_gen = t->entropy_pending_gen = UINT64_MAX;
+    t->entropy_shown.reset();
+    t->tail.enabled = false;
     app.closed.push_back(std::move(t));  // keeps the Document: edits + history come back on reopen
     if (app.closed.size() > kMaxClosedTabs) app.closed.erase(app.closed.begin());
     app.insp_edit.end();
@@ -512,6 +528,7 @@ void open_with_dialog(App& app) {
 namespace {
 
 bool save_session(App& app, bool force, std::string* err_out = nullptr);  // per-frame section
+void tail_poll_once(App& app, Tab& t);                                     // live tail section
 
 // The on-disk version is one the user chose to ignore (banner "Ignore").
 bool ignored_version(const Tab& t) {
@@ -538,6 +555,9 @@ bool start_save(App& app, Tab& tab, bool save_as, AfterSave after, bool confirme
     Document& d = *tab.doc;
     if (d.busy()) return false;
     std::string target;
+    // A tailed file that grew since the last poll would look "modified on disk" (and Overwrite
+    // would drop the new bytes): take the growth in first.
+    if (tab.tail.enabled && !save_as) tail_poll_once(app, tab);
     if (save_as || !d.has_path()) {
         if (!save_dialog(app, d, target)) return false;
     } else if (!d.dirty() && after == AfterSave::None) {
@@ -984,6 +1004,152 @@ void force_reparse(App& app) {
     set_status(app, "Re-parsing structure", 1.5);
 }
 
+// ---- live tail -----------------------------------------------------------------------------
+
+// The file stopped being an append-only log (rewritten, truncated, replaced, deleted): stop
+// tailing and fall back to the usual "changed on disk" banner.
+void stop_tail_rewritten(App& app, Tab& t) {
+    t.tail.enabled = false;
+    t.disk_changed = t.doc->changed_on_disk() && !ignored_version(t);
+    t.next_disk_check = 0.0;
+    const std::string msg = t.label + ": the file was rewritten, live tail stopped";
+    log_console(app, ConsoleLine::Warn, msg);
+    set_status(app, msg, 8.0);
+}
+
+// Follow-at-end: with the caret at EOF (no selection) the caret stays at the new end and the view
+// scrolls along. Plain scrolling, not a big jump (no NavHistory entry).
+void tail_grown(Tab& t, uint64_t added, bool at_end) {
+    t.tail.added += added;
+    if (!at_end) return;
+    ViewState& v = t.doc->view();
+    v.cursor = v.anchor = t.doc->size();
+    v.low_nibble = false;
+    t.doc->view_generation++;
+    t.view.request_scroll_to(t.doc->size(), false);
+}
+
+// One poll (one stat; about 8 KiB of reads only when the file grew).
+void tail_poll_once(App& app, Tab& t) {
+    Document& d = *t.doc;
+    const ViewState& v = d.view();
+    const bool at_end = v.cursor >= d.size() && !v.has_selection();
+    uint64_t added = 0;
+    std::string err;
+    t.tail.last_poll = now_s();
+    switch (d.refresh_appended(&added, &err)) {
+        case GrowResult::Grown: tail_grown(t, added, at_end); break;
+        case GrowResult::NotAppend: stop_tail_rewritten(app, t); break;
+        case GrowResult::Error:  // keep tailing; retry on the next poll
+            if (!err.empty()) set_status(app, t.label + ": live tail: " + err, 4.0);
+            break;
+        case GrowResult::Unchanged: break;
+    }
+}
+
+void toggle_live_tail(App& app) {
+    Tab* t = active_tab(app);
+    Document* d = usable_doc(app);
+    if (!d || !d->has_path()) return;
+    if (t->tail.enabled) {
+        t->tail.enabled = false;
+        set_status(app, "Live tail off");
+        return;
+    }
+    t->tail = TailState{};
+    t->tail.enabled = true;
+    // Start at the end so new data is followed right away (Ctrl+End resumes after looking around).
+    ViewState& v = d->view();
+    v.cursor = v.anchor = d->size();
+    v.low_nibble = false;
+    d->view_generation++;
+    t->view.request_scroll_to(d->size(), false);
+    // The first call records the bytes before the end that later appends are checked against.
+    tail_poll_once(app, *t);
+    if (t->tail.enabled) set_status(app, "Live tail on: " + t->label + " is followed while the caret is at the end", 6.0);
+}
+
+// Every tailed tab, every 0.5 s. Before poll_disk_change, which skips tailed tabs.
+void poll_tail(App& app) {
+    const double n = now_s();
+    for (auto& t : app.tabs)
+        if (t->tail.enabled && !t->doc->busy() && n - t->tail.last_poll >= 0.5) tail_poll_once(app, *t);
+}
+
+// ---- minimap / byte classes ------------------------------------------------------------------
+
+void set_minimap(App& app, int mode) {
+    app.settings.minimap = mode;
+    mark_settings_dirty(app);
+    set_status(app, mode == 0 ? "Minimap off" : mode == 1 ? "Minimap: entropy" : "Minimap: byte classes", 2.0);
+}
+
+void toggle_byte_class_colors(App& app) {
+    app.settings.byte_class_colors = !app.settings.byte_class_colors;
+    mark_settings_dirty(app);
+    set_status(app, app.settings.byte_class_colors ? "Bytes colored by class (zero, whitespace, printable, control, high, 0xFF)"
+                                                   : "Plain byte colors", 3.0);
+}
+
+// ---- compare ---------------------------------------------------------------------------------
+
+// Compare the active document (A) with the open document `other` (B) in the Compare tab.
+void compare_with(App& app, uint64_t other) {
+    Tab* a = active_tab(app);
+    Tab* b = find_tab(app, other);
+    if (!a || !b) return;
+    if (a == b) {
+        set_status(app, "Pick another document to compare with");
+        return;
+    }
+    if (!app.diff || app.diff_a != a->doc->id() || app.diff_b != other) app.diff = std::make_unique<DiffView>();
+    app.diff_a = a->doc->id();
+    app.diff_b = other;
+    app.diff_select = true;
+    set_status(app, "Comparing " + a->label + " with " + b->label + "  (F7 / Shift+F7: next / previous difference)", 6.0);
+}
+
+// Compare With > File...: open the file as a normal tab, then compare the previous one with it.
+void compare_with_file(App& app) {
+    Tab* a = active_tab(app);
+    if (!a || a->doc->busy()) return;
+    const uint64_t a_id = a->doc->id();
+    const std::vector<std::string> picked = open_dialog(app);
+    if (picked.empty() || !open_path(app, picked.front())) return;
+    Tab* b = active_tab(app);  // the opened (or already open) file
+    Tab* ta = find_tab(app, a_id);
+    if (!b || !ta || b == ta) {
+        set_status(app, "That is the same document; pick another file to compare with");
+        return;
+    }
+    const uint64_t b_id = b->doc->id();
+    app.active = tab_index(app, ta);
+    compare_with(app, b_id);
+}
+
+bool has_compare(App& a) { return a.diff != nullptr; }
+
+void compare_step(App& a, bool next) {
+    if (!a.diff) return;
+    if (next) a.diff->request_next();
+    else a.diff->request_prev();
+    a.diff_select = true;
+}
+
+// Shift = B's cursor - A's cursor: put the caret on the same content in both (e.g. after an
+// inserted header) and the compare lines them up.
+void compare_align(App& a) {
+    Tab* ta = a.diff ? find_tab(a, a.diff_a) : nullptr;
+    Tab* tb = a.diff ? find_tab(a, a.diff_b) : nullptr;
+    if (!ta || !tb || ta->doc->busy() || tb->doc->busy()) return;
+    const uint64_t ca = focus_offset(ta->doc->view()), cb = focus_offset(tb->doc->view());
+    const uint64_t d = cb >= ca ? cb - ca : ca - cb;
+    const int64_t mag = d > uint64_t(INT64_MAX) ? INT64_MAX : int64_t(d);
+    a.diff->shift = cb >= ca ? mag : -mag;
+    a.diff_select = true;
+    set_status(a, "Compare shift " + std::to_string(a.diff->shift) + " (B offset = A offset + shift)", 6.0);
+}
+
 // ---- search --------------------------------------------------------------------------------
 
 void open_find_bar(App& app) {
@@ -1145,12 +1311,39 @@ void follow_at_cursor(App& a) {
 void show_strings(App& a) { a.show_strings = a.focus_strings = true; }
 void show_hashes(App& a) { a.show_hashes = a.focus_hashes = true; }
 
+void toggle_panel(bool& show, bool& focus) {
+    show = !show;
+    focus = show;
+}
+
+// Bitmap panel at a fixed offset: the cursor / selection start.
+void bitmap_at_cursor(App& a) {
+    Document* d = usable_doc(a);
+    if (!d) return;
+    a.show_bitmap = a.focus_bitmap = true;
+    a.bitmap_panel.set_fixed_offset(focus_offset(d->view()));
+}
+
+bool has_capture(App& a) {
+    Document* d = usable_doc(a);
+    return d && PacketsPanel::is_capture(*d);
+}
+
 // Structure panel: parse from the cursor (with the chosen / detected parser).
 void parse_at_cursor(App& a) {
     Tab* t = active_tab(a);
     Document* d = usable_doc(a);
     if (!d) return;
     set_parse_base(a, *t, focus_offset(d->view()));
+    a.show_structure = a.focus_structure = true;
+}
+
+// Structure panel: parse just the selected bytes (e.g. one packet's payload).
+void parse_selection(App& a) {
+    Tab* t = active_tab(a);
+    Document* d = usable_doc(a);
+    if (!d || !d->view().has_selection()) return;
+    set_parse_base(a, *t, d->view().sel_begin(), d->view().sel_len());
     a.show_structure = a.focus_structure = true;
 }
 
@@ -1171,6 +1364,12 @@ const Action kActions[] = {
     {"Reopen Closed Tab", {CS(ImGuiKey_T), 0}, [](App& a) { reopen_closed_tab(a); },
      [](App& a) { return !a.closed.empty(); }, true, false},
     {"Reload from Disk", {0, 0}, [](App& a) { if (Tab* t = active_tab(a)) request_reload(a, *t); }, has_file, true, false},
+    {"Compare With...", {0, 0}, [](App& a) { a.req_compare = true; }, has_doc, true, false},
+    {"Compare: Next Difference", {0, 0}, [](App& a) { compare_step(a, true); }, has_compare, true, false},
+    {"Compare: Previous Difference", {0, 0}, [](App& a) { compare_step(a, false); }, has_compare, true, false},
+    {"Compare: Recompare", {0, 0}, [](App& a) { a.diff->request_recompare(); a.diff_select = true; }, has_compare, true, false},
+    {"Compare: Align at Cursors", {0, 0}, compare_align, has_compare, true, false},
+    {"Close Compare", {0, 0}, [](App& a) { end_compare(a); }, has_compare, true, false},
     {"Exit", {0, 0}, [](App& a) { a.quit_requested = true; }, nullptr, true, false},
     // Edit
     {"Undo", {C(ImGuiKey_Z), 0}, [](App& a) { do_undo(a, false); }, can_undo, false, true},
@@ -1216,6 +1415,13 @@ const Action kActions[] = {
     {"Toggle Bookmarks", {0, 0}, [](App& a) { a.show_bookmarks = !a.show_bookmarks; }, nullptr, true, false},
     {"Toggle Strings", {0, 0}, [](App& a) { a.show_strings = !a.show_strings; }, nullptr, true, false},
     {"Toggle Hashes", {0, 0}, [](App& a) { a.show_hashes = !a.show_hashes; }, nullptr, true, false},
+    {"Toggle Bitmap", {0, 0}, [](App& a) { toggle_panel(a.show_bitmap, a.focus_bitmap); }, nullptr, true, false},
+    {"Toggle Packets", {0, 0}, [](App& a) { toggle_panel(a.show_packets, a.focus_packets); }, nullptr, true, false},
+    {"Minimap: Off", {0, 0}, [](App& a) { set_minimap(a, 0); }, nullptr, true, false},
+    {"Minimap: Entropy", {0, 0}, [](App& a) { set_minimap(a, 1); }, nullptr, true, false},
+    {"Minimap: Byte Classes", {0, 0}, [](App& a) { set_minimap(a, 2); }, nullptr, true, false},
+    {"Color Bytes by Class", {0, 0}, toggle_byte_class_colors, nullptr, true, false},
+    {"Toggle Live Tail", {0, 0}, toggle_live_tail, has_file, true, false},
     {"Reset Layout", {0, 0}, [](App& a) {
          a.build_layout = true;
          a.show_inspector = a.show_structure = a.show_console = a.show_results = a.show_bookmarks = true;
@@ -1234,12 +1440,18 @@ const Action kActions[] = {
          a.hash_panel.whole_file = true;
          a.hash_panel.request_compute();
      }, has_doc, true, false},
+    {"Bitmap: Show at Cursor", {0, 0}, bitmap_at_cursor, has_doc, true, false},
+    {"Packets: Index Capture", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_index();
+     }, has_capture, true, false},
     // Scripts
     {"Reparse Structure", {ImGuiKey_F5, 0}, [](App& a) { force_reparse(a); }, has_doc, true, false},
     {"Structure: Parse at Cursor", {0, 0}, parse_at_cursor, has_doc, true, false},
+    {"Structure: Parse Selection", {0, 0}, parse_selection, has_selection, true, false},
     {"Structure: Parse from File Start", {0, 0}, [](App& a) {
          if (Tab* t = active_tab(a); t && usable_doc(a)) set_parse_base(a, *t, 0);
-     }, [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && t->st.base != 0; }, true, false},
+     }, [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && (t->st.base != 0 || t->st.length != UINT64_MAX); }, true, false},
     {"New Parser from C Struct...", {0, 0}, [](App& a) { a.cstruct_dlg.open(); }, nullptr, true, false},
     {"C Struct: Apply at Cursor", {0, 0}, apply_cstruct_at_cursor, has_doc, true, false},
     {"Reload Scripts", {0, 0}, [](App& a) { a.engine->reload(); set_status(a, "Scripts reloaded"); }, idle, true, false},
@@ -1440,6 +1652,20 @@ void draw_view_menu(App& app) {
     ImGui::MenuItem(kWinBookmarks, nullptr, &app.show_bookmarks);
     ImGui::MenuItem(kWinStrings, nullptr, &app.show_strings);
     ImGui::MenuItem(kWinHashes, nullptr, &app.show_hashes);
+    if (ImGui::MenuItem(kWinBitmap, nullptr, &app.show_bitmap)) app.focus_bitmap = app.show_bitmap;
+    if (ImGui::MenuItem(kWinPackets, nullptr, &app.show_packets)) app.focus_packets = app.show_packets;
+    ImGui::Separator();
+    if (ImGui::BeginMenu("Minimap")) {
+        menu_action(app, "Minimap: Off", "Off", app.settings.minimap == 0);
+        menu_action(app, "Minimap: Entropy", "Entropy", app.settings.minimap == 1);
+        menu_action(app, "Minimap: Byte Classes", "Byte Classes", app.settings.minimap == 2);
+        ImGui::EndMenu();
+    }
+    menu_action(app, "Color Bytes by Class", nullptr, app.settings.byte_class_colors);
+    {
+        Tab* t = active_tab(app);
+        menu_action(app, "Toggle Live Tail", "Live Tail", t && t->tail.enabled);
+    }
     ImGui::Separator();
     menu_action(app, "Command Palette");
     ImGui::Separator();
@@ -1485,6 +1711,7 @@ void draw_view_menu(App& app) {
 void draw_scripts_menu(App& app) {
     menu_action(app, "Reparse Structure");
     menu_action(app, "Structure: Parse at Cursor", "Parse at Cursor");
+    menu_action(app, "Structure: Parse Selection", "Parse Selection");
     menu_action(app, "Structure: Parse from File Start", "Parse from File Start");
     ImGui::Separator();
     menu_action(app, "New Parser from C Struct...");
@@ -1516,6 +1743,33 @@ void draw_navigate_items(App& app) {
     }
 }
 
+// File > Compare With: every other open document, or a file to open.
+void draw_compare_menu(App& app) {
+    Tab* a = active_tab(app);
+    uint64_t pick = 0;
+    bool any = false;
+    for (auto& t : app.tabs) {
+        if (t.get() == a) continue;
+        any = true;
+        ImGui::PushID(t.get());
+        if (ImGui::MenuItem(t->label.c_str(), nullptr, false, !t->doc->busy())) pick = t->doc->id();
+        if (!t->path.empty()) ImGui::SetItemTooltip("%s", t->path.c_str());
+        ImGui::PopID();
+    }
+    if (!any) ImGui::TextDisabled("No other open document");
+    ImGui::Separator();
+    const bool file = ImGui::MenuItem("File...");
+    if (app.diff) {
+        ImGui::Separator();
+        menu_action(app, "Compare: Next Difference", "Next Difference");
+        menu_action(app, "Compare: Previous Difference", "Previous Difference");
+        menu_action(app, "Compare: Align at Cursors", "Align at Cursors (Set Shift)");
+        menu_action(app, "Compare: Recompare", "Recompare");
+    }
+    if (pick) compare_with(app, pick);
+    if (file) compare_with_file(app);
+}
+
 void draw_main_menu(App& app) {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu("File")) {
@@ -1526,6 +1780,12 @@ void draw_main_menu(App& app) {
         menu_action(app, "Save");
         menu_action(app, "Save As...");
         menu_action(app, "Reload from Disk");
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Compare With", has_doc(app))) {
+            draw_compare_menu(app);
+            ImGui::EndMenu();
+        }
+        menu_action(app, "Close Compare");
         ImGui::Separator();
         menu_action(app, "Close Tab");
         menu_action(app, "Reopen Closed Tab");
@@ -1754,6 +2014,7 @@ HexViewConfig make_view_config(App& app, const Tab& t) {
     cfg.show_ascii = app.settings.show_ascii;
     cfg.insert_mode = t.insert_mode;
     cfg.highlight_modified = app.settings.highlight_modified;
+    cfg.byte_class_colors = app.settings.byte_class_colors;
     cfg.mono = app.fonts.mono;
     // Whole pixels: a fractional size (e.g. 16 px at 125 %) would rasterise blurrier glyphs.
     cfg.font_size = std::round(app.settings.font_size * app.ui_scale);
@@ -1785,8 +2046,79 @@ void draw_hex_context_menu(App& app) {
     menu_action(app, "Navigate Back", "Back");
     menu_action(app, "Navigate Forward", "Forward");
     menu_action(app, "Structure: Parse at Cursor", "Parse Structure Here");
+    menu_action(app, "Structure: Parse Selection", "Parse Selection");
+    menu_action(app, "Bitmap: Show at Cursor", "Show as Bitmap Here");
     close_popup_on_escape();
     ImGui::EndPopup();
+}
+
+// Highlight layers of a tab's hex view, bottom to top: parser fields, script, bookmarks, search hits.
+void collect_layers(App& app, Tab& t, std::vector<const HighlightSet*>& layers) {
+    if (t.st.has_result && !t.st.result.highlights.empty()) layers.push_back(&t.st.result.highlights);
+    if (const HighlightSet* s = app.engine->script_highlights(t.doc->id()); s && !s->empty()) layers.push_back(s);
+    update_bookmark_layer(t);
+    if (!t.bookmark_layer.empty()) layers.push_back(&t.bookmark_layer);
+    if (!t.hits.layer.empty()) layers.push_back(&t.hits.layer);
+}
+
+// doc.view().top_row is a row index: re-express it in rows of `bpr` bytes (what the next HexView
+// draw expects) when another view of the document (its tab / a Compare side) last wrote it with
+// another row width. bpr 0 = unknown: leave it.
+void adopt_top_units(Tab& t, int bpr) {
+    if (bpr <= 0 || t.top_bpr <= 0 || t.top_bpr == bpr) return;
+    ViewState& v = t.doc->view();
+    v.top_row = v.top_row * uint64_t(t.top_bpr) / uint64_t(bpr);
+    t.top_bpr = bpr;
+}
+
+// Starts the minimap scan of the tab's document: right away the first time, else once the
+// generation has been stable for 1 s (at most 5 s after the first change, so a growing file
+// under live tail still gets rescanned). Never while saving.
+void update_entropy(App& app, Tab& t) {
+    Document& d = *t.doc;
+    const uint64_t g = d.generation();
+    if (g == t.entropy_gen || d.busy()) return;
+    const double n = now_s();
+    if (g != t.entropy_pending_gen) {
+        if (t.entropy_pending_gen == t.entropy_gen) t.entropy_first_change = n;  // nothing was pending
+        t.entropy_pending_gen = g;
+        t.entropy_last_change = n;
+    }
+    const bool first = t.entropy_gen == UINT64_MAX;
+    if (first || n >= std::min(t.entropy_last_change + 1.0, t.entropy_first_change + 5.0)) {
+        // Buckets of at least 4 KiB (16..1024 of them): smaller samples underestimate the entropy
+        // of random data (~7.9 instead of 8 bits/byte at 1 KiB), which would show it orange.
+        EntropyOptions o;
+        o.buckets = uint32_t(std::clamp<uint64_t>(d.size() / 4096, 16, o.buckets));
+        t.entropy.start(d.snapshot(), o);
+        t.entropy_gen = t.entropy_pending_gen = g;
+    } else {
+        app.wants_poll = true;  // wake up when the debounce expires
+    }
+}
+
+// The entropy / byte-class strip right of the hex view (HexViewConfig::reserve_right). A click or
+// drag scrolls the view there, like the scrollbar: the caret stays and no history entry is made.
+void draw_minimap(App& app, Tab& t, float width) {
+    Document& d = *t.doc;
+    update_entropy(app, t);
+    std::shared_ptr<const EntropyResult> r = t.entropy.result();
+    // While a rescan runs, keep the last complete map of the same size (no flicker after an edit).
+    const auto& old = t.entropy_shown;
+    const bool keep_old = old && old->finished && !old->cancelled && old->doc_size == d.size() && (!r || !r->finished);
+    if (!keep_old) t.entropy_shown = r;
+    if (t.entropy.running()) app.wants_poll = true;  // progressive map
+
+    const uint64_t size = d.size();
+    const uint64_t bpr = uint64_t(std::max(1, t.ev.bytes_per_row));
+    const uint64_t top = d.view().top_row;
+    const uint64_t vb = top > size / bpr ? size : top * bpr;
+    const uint64_t ve = vb + std::min(size - vb, uint64_t(std::max(1, t.ev.visible_rows)) * bpr);
+    ImGui::SameLine(0.0f, 0.0f);
+    MinimapEvents mev;
+    t.minimap.draw("##minimap", width, 0.0f, t.entropy_shown.get(), size, vb, ve,
+                   app.settings.minimap == 2 ? MinimapMode::ByteClass : MinimapMode::Entropy, mev);
+    if (mev.jump_requested) t.view.request_scroll_to(mev.jump_offset, true);
 }
 
 void draw_hex_view(App& app, Tab& t) {
@@ -1797,14 +2129,16 @@ void draw_hex_view(App& app, Tab& t) {
         zoom(app, io.MouseWheel > 0.0f ? 1.0f : -1.0f);
 
     std::vector<const HighlightSet*> layers;
-    if (t.st.has_result && !t.st.result.highlights.empty()) layers.push_back(&t.st.result.highlights);
-    if (const HighlightSet* s = app.engine->script_highlights(d.id()); s && !s->empty()) layers.push_back(s);
-    update_bookmark_layer(t);
-    if (!t.bookmark_layer.empty()) layers.push_back(&t.bookmark_layer);
-    if (!t.hits.layer.empty()) layers.push_back(&t.hits.layer);
+    collect_layers(app, t, layers);
 
+    HexViewConfig cfg = make_view_config(app, t);
+    const float mm_w = app.settings.minimap ? std::round(14.0f * app.ui_scale) : 0.0f;
+    cfg.reserve_right = mm_w;
+    adopt_top_units(t, t.view.geometry().valid ? t.view.geometry().bpr : 0);
     t.ev = HexViewEvents{};
-    t.view.draw("##hex", d, layers, make_view_config(app, t), t.ev);
+    t.view.draw("##hex", d, layers, cfg, t.ev);
+    if (t.view.geometry().valid) t.top_bpr = t.view.geometry().bpr;
+    if (mm_w > 0.0f) draw_minimap(app, t, mm_w);
     if (t.ev.cursor_moved || d.view().top_row != t.last_top_row) {
         t.last_top_row = d.view().top_row;
         d.view_generation++;
@@ -1833,6 +2167,67 @@ void draw_tab_content(App& app, Tab& t) {
     draw_read_only_badge(app, t);
     if (app.find.open) draw_find_bar(app, t);
     draw_hex_view(app, t);
+}
+
+// Scrolls a Compare side to `off` (rows of ev.bytes_per_row; DiffView syncs the other side).
+void scroll_compare_side(Document& d, const HexViewEvents& ev, uint64_t off, bool center) {
+    if (ev.bytes_per_row <= 0) return;
+    ViewState& v = d.view();
+    const uint64_t row = std::min(off, d.size()) / uint64_t(ev.bytes_per_row);
+    const uint64_t rows = uint64_t(std::max(1, ev.visible_rows));
+    if (center)
+        v.top_row = row > rows / 2 ? row - rows / 2 : 0;
+    else if (row < v.top_row)
+        v.top_row = row;
+    else if (row >= v.top_row + rows)
+        v.top_row = row - rows + 1;
+}
+
+// The Compare tab: DiffView over two open documents (their own ViewStates, so caret, selection and
+// scroll carry over to their tabs). The side the user works in becomes the active tab, so the
+// panels, shortcuts and context menu act on that document.
+void draw_compare(App& app, Tab& ta, Tab& tb) {
+    DiffViewCallbacks cb;
+    cb.config = make_view_config(app, ta);
+    cb.config.tick_offsets = nullptr;
+    cb.config.bytes_per_row = 0;  // auto-fit: each half is narrow, a fixed width would scroll sideways
+    cb.config_for = [&app](const Document& d, HexViewConfig& c) {
+        if (Tab* t = find_tab(app, d.id())) c.insert_mode = t->insert_mode;
+    };
+    cb.layers = [&app](const Document& d, std::vector<const HighlightSet*>& layers) {
+        if (Tab* t = find_tab(app, d.id())) collect_layers(app, *t, layers);
+    };
+    cb.on_events = [&app](Document& d, const HexViewEvents& ev) {
+        Tab* t = find_tab(app, d.id());
+        if (!t) return;
+        t->ev = ev;
+        // First draw of this side: its view could not know which row width top_row was written
+        // in (the tab's), so it read it as its own; re-express it (later frames adopt_top_units).
+        if (t->compare_bpr == 0 && t->top_bpr > 0 && ev.bytes_per_row > 0 && t->top_bpr != ev.bytes_per_row)
+            d.view().top_row = d.view().top_row * uint64_t(t->top_bpr) / uint64_t(ev.bytes_per_row);
+        t->compare_bpr = t->top_bpr = ev.bytes_per_row;
+        const int idx = tab_index(app, t);
+        if (idx >= 0 && (ev.focused || ev.follow_requested || ev.open_context_menu || ev.nav_back || ev.nav_forward))
+            app.active = idx;
+        if (ev.cursor_moved) d.view_generation++;
+        if (ev.follow_requested) {
+            reveal_range(app, *t, ev.follow_target, 0, false);
+            set_status(app, "Followed pointer at " + fmt_offset(ev.follow_from) + " -> " + fmt_offset(ev.follow_target), 6.0);
+        }
+        if (ev.nav_back) navigate(app, *t, false);
+        if (ev.nav_forward) navigate(app, *t, true);
+        // Jumps (follow, Go to, search, bookmarks, panels) ask the tab's own view to scroll; it is
+        // not drawn while the Compare tab is, so the request moves this side instead.
+        uint64_t off = 0;
+        bool center = true;
+        if (t->view.take_scroll_request(off, center)) scroll_compare_side(d, ev, off, center);
+        if (ev.open_context_menu) ImGui::OpenPopup("##hexctx");
+        draw_hex_context_menu(app);
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m, 4.0); };
+    adopt_top_units(ta, ta.compare_bpr);
+    adopt_top_units(tb, tb.compare_bpr);
+    app.diff->draw("##diff", *ta.doc, *tb.doc, cb);
 }
 
 // Keeps app.tabs in the visual order of the (reorderable) tab bar, so Ctrl+Tab, the session and
@@ -1903,6 +2298,32 @@ void draw_editor(App& app) {
             }
             if (!open) close_id = t.doc->id();
         }
+        bool close_compare = false;
+        if (app.diff) {
+            Tab* ta = find_tab(app, app.diff_a);
+            Tab* tb = find_tab(app, app.diff_b);
+            if (ta && tb) {
+                ImGuiTabItemFlags flags = app.diff_select ? ImGuiTabItemFlags_SetSelected : 0;
+                app.diff_select = false;
+                const std::string label = "Compare: " + ta->label + " / " + tb->label + "###compare";
+                bool open = true;
+                const bool selected = ImGui::BeginTabItem(label.c_str(), &open, flags);
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                    ImGui::SetTooltip("A: %s\nB: %s", ta->path.empty() ? ta->label.c_str() : ta->path.c_str(),
+                                      tb->path.empty() ? tb->label.c_str() : tb->path.c_str());
+                if (selected) {
+                    // The panels follow a compared document (A until a side is focused).
+                    if (Tab* cur = active_tab(app); cur != ta && cur != tb && app.select_request < 0)
+                        app.active = tab_index(app, ta);
+                    draw_compare(app, *ta, *tb);
+                    ImGui::EndTabItem();
+                }
+                if (!open) close_compare = true;
+            } else {
+                close_compare = true;
+            }
+        }
+        if (close_compare) end_compare(app);
         if (app.select_request >= 0) {
             app.active = app.select_request;  // takes visual effect next frame
             app.select_request = -1;
@@ -1958,10 +2379,20 @@ void build_bookmark_palette(App& app) {
     }
 }
 
+// Compare With...: the other open documents, then a file to open.
+void build_compare_palette(App& app) {
+    for (auto& t : app.tabs) {
+        if (t.get() == active_tab(app)) continue;
+        app.palette_all.push_back({t->label, t->path, 5, 0, "", !t->doc->busy(), 0, t->doc->id()});
+    }
+    app.palette_all.push_back({"File...", "open a file to compare with", 6, 0, "", true, 0, 0});
+}
+
 void build_palette(App& app) {
     app.palette_all.clear();
-    if (app.palette_bookmarks) {
-        build_bookmark_palette(app);
+    if (app.palette_bookmarks || app.palette_compare) {
+        if (app.palette_bookmarks) build_bookmark_palette(app);
+        else build_compare_palette(app);
         app.palette_last_query = "\x01";
         return;
     }
@@ -1984,6 +2415,9 @@ void build_palette(App& app) {
         app.palette_all.push_back({"Parser: " + p.name, "", 2, 0, p.name, doc, 0, 0});
     for (const std::string& r : app.settings.recent_files)
         app.palette_all.push_back({"Open recent: " + r, "", 3, 0, r, true, 0, 0});
+    for (auto& t : app.tabs)  // also reachable as --action "Compare with: <name>"
+        if (t.get() != active_tab(app))
+            app.palette_all.push_back({"Compare with: " + t->label, t->path, 5, 0, "", doc && !t->doc->busy(), 0, t->doc->id()});
     app.palette_last_query = "\x01";  // force re-filter
 }
 
@@ -2017,6 +2451,8 @@ void run_palette_item(App& app, const PaletteItem& it) {
             }
             break;
         case 3: open_path(app, it.arg); break;
+        case 5: compare_with(app, it.doc); break;
+        case 6: compare_with_file(app); break;
         case 4:
             if (Tab* t = find_tab(app, it.doc); t && !t->doc->busy()) {
                 const auto& bms = t->doc->view().bookmarks;
@@ -2038,6 +2474,7 @@ void draw_palette(App& app) {
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(-FLT_MIN);
     const char* hint = app.palette_bookmarks ? "Jump to a bookmark in any open file (name, note or file)..."
+                       : app.palette_compare ? "Compare the active document with..."
                                              : "Type a command, script, parser or recent file...";
     const bool enter = ImGui::InputTextWithHint("##q", hint, &app.palette_query, ImGuiInputTextFlags_EnterReturnsTrue);
     filter_palette(app);
@@ -2465,9 +2902,10 @@ void open_pending_popup(App& app) {
         ImGui::OpenPopup(kPopPrompt);
         return;
     }
-    if (app.req_palette || app.req_bookmark_jump) {
-        app.palette_bookmarks = !app.req_palette;
-        app.req_palette = app.req_bookmark_jump = false;
+    if (app.req_palette || app.req_bookmark_jump || app.req_compare) {
+        app.palette_bookmarks = !app.req_palette && app.req_bookmark_jump;
+        app.palette_compare = !app.req_palette && !app.req_bookmark_jump;
+        app.req_palette = app.req_bookmark_jump = app.req_compare = false;
         app.palette_query.clear();
         build_palette(app);
         ImGui::OpenPopup(kPopPalette);
@@ -2554,6 +2992,15 @@ void draw_settings_window(App& app) {
     changed |= ImGui::Checkbox("Text column", &st.show_ascii);
     ImGui::SameLine();
     changed |= ImGui::Checkbox("Tint modified bytes", &st.highlight_modified);
+    changed |= ImGui::Checkbox("Color bytes by class", &st.byte_class_colors);
+    help_marker("Hex digits and text glyphs take the color of their class: zero, whitespace, printable,\n"
+                "control, high (0x80-0xFE) and 0xFF. Same as View > Color Bytes by Class.");
+    ImGui::SameLine();
+    static const char* kMinimap[] = {"Off", "Entropy", "Byte classes"};
+    ImGui::SetNextItemWidth(140.0f * s);
+    if (ImGui::Combo("Minimap", &st.minimap, kMinimap, 3)) changed = true;
+    help_marker("Overview strip right of the hex view: entropy heat map (dark blue = zeros, red = random /\n"
+                "compressed) or the byte-class mix per row. Click or drag it to scroll.");
     int font_px = int(st.font_size);
     if (ImGui::SliderInt("Font size", &font_px, int(kMinFont), int(kMaxFont), "%d px")) {
         st.font_size = std::clamp(float(font_px), kMinFont, kMaxFont);
@@ -2714,7 +3161,7 @@ void process_pending_opens(App& app) {
 
 void poll_disk_change(App& app) {
     Tab* t = active_tab(app);
-    if (!t || t->doc->busy() || t->path.empty()) return;
+    if (!t || t->doc->busy() || t->path.empty() || t->tail.enabled) return;  // poll_tail handles tailed tabs
     const double n = now_s();
     if (n < t->next_disk_check) return;
     t->next_disk_check = n + 2.0;
@@ -2838,10 +3285,12 @@ void build_default_layout(ImGuiID dock_id) {
     ImGui::DockBuilderDockWindow(kWinInspector, right);
     ImGui::DockBuilderDockWindow(kWinHashes, right);
     ImGui::DockBuilderDockWindow(kWinStructure, right_bottom);
+    ImGui::DockBuilderDockWindow(kWinBitmap, right_bottom);
     ImGui::DockBuilderDockWindow(kWinConsole, bottom);
     ImGui::DockBuilderDockWindow(kWinResults, bottom);
     ImGui::DockBuilderDockWindow(kWinBookmarks, bottom);
     ImGui::DockBuilderDockWindow(kWinStrings, bottom);
+    ImGui::DockBuilderDockWindow(kWinPackets, bottom);
     ImGui::DockBuilderFinish(dock_id);
 }
 
@@ -2928,6 +3377,21 @@ void draw_panels(App& app) {
         }
         draw_hash_panel(app);
     }
+    if (app.show_bitmap) {
+        if (app.focus_bitmap) {
+            ImGui::SetNextWindowFocus();
+            app.focus_bitmap = false;
+        }
+        draw_bitmap_panel(app);
+    }
+    if (app.show_packets) {
+        // Not while a fresh layout fronts its default tabs (layout_focus_step) or on frame 1.
+        if (app.focus_packets && ImGui::GetFrameCount() > 1 && app.layout_focus_step == 0) {
+            ImGui::SetNextWindowFocus();
+            app.focus_packets = false;
+        }
+        draw_packets_panel(app);
+    }
     draw_cstruct_dialog(app);
     // New windows take focus when they first appear, so on the first frame the last panel drawn
     // (Bookmarks) would steal its dock node's selected tab from the one saved in the layout.
@@ -2942,6 +3406,7 @@ void frame(App& app) {
     process_pending_opens(app);
     poll_save(app);
     poll_search(app);
+    poll_tail(app);
     poll_disk_change(app);
     poll_io_errors(app);
     poll_scripts(app);
@@ -2962,6 +3427,7 @@ void frame(App& app) {
     autosave(app);
     if (app.layout_focus_step > 0) app.layout_focus_step--;
     if (app.save.running || app.find.job.running() || app.layout_focus_step > 0) app.wants_poll = true;
+    if (app.diff && app.diff->wants_frames()) app.wants_poll = true;
 }
 
 // =============================================================================================
@@ -3085,12 +3551,20 @@ void startup(App& app) {
         }
         app.hash_panel.set_selected(names);
     }
+    {  // Bitmap panel choices (written back by draw_bitmap_panel)
+        BitmapPanel& bp = app.bitmap_panel;
+        for (int i = 0; i < kPixelFormatCount; ++i)
+            if (app.settings.bitmap_format == pixel_format_name(PixelFormat(i))) bp.format = PixelFormat(i);
+        bp.width = std::clamp(app.settings.bitmap_width, 1, BitmapPanel::kMaxWidth);
+        bp.zoom = std::clamp(app.settings.bitmap_zoom, 1, BitmapPanel::kMaxZoom);
+    }
     for (const std::string& f : app.opts.files) open_path(app, f);
     app.next_autosave = now_s() + std::max(1, app.settings.session_autosave_seconds);
 }
 
 void shutdown(App& app) {
     app.find.job.cancel();
+    end_compare(app);
     if (app.save.running) {
         app.save.thread.join();  // only reachable with --frames; normal exits wait for the save
         app.save.running = false;
@@ -3273,7 +3747,7 @@ int run_app(const AppOptions& opts) {
             for (const std::string& name : opts.actions) {
                 const Action* a = find_action(name.c_str());
                 if (!a) {  // any other palette entry by its label, e.g. "Parser: PNG image", "Script: ..."
-                    app.palette_bookmarks = false;
+                    app.palette_bookmarks = app.palette_compare = false;
                     build_palette(app);
                     auto it = std::find_if(app.palette_all.begin(), app.palette_all.end(),
                                            [&](const PaletteItem& p) { return p.label == name; });
@@ -3298,7 +3772,8 @@ int run_app(const AppOptions& opts) {
 
     shutdown(app);
     if (nfd_ok) NFD_Quit();
-    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplOpenGL3_Shutdown();  // frees the GL side of registered user textures...
+    app.bitmap_panel.shutdown();   // ...then the Bitmap panel frees its ImTextureData
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     glfwDestroyWindow(app.window);

@@ -47,7 +47,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   Bundled parsers: PNG, ZIP (including ZIP64) and an example TLV protocol ("HXP").
 - **Parse at an offset.** The Structure panel's **Parse at** field (or **Cursor**, Scripts > Parse
   at Cursor) runs a parser from any offset, e.g. a PNG embedded in a firmware dump; fields are
-  highlighted in place and the panel shows `PNG image @ 0x00001234`.
+  highlighted in place and the panel shows `PNG image @ 0x00001234`. *Structure: Parse
+  Selection* parses just the selected bytes (e.g. one packet).
 - **C struct to parser** (Scripts > New Parser from C Struct...). Paste C `struct`/`union`/`enum`
   definitions (bit fields, `#pragma pack`, arrays sized by earlier fields, `// @be`) and get a
   readable Lua parser live. Apply it at the cursor, or save it as a script.
@@ -56,11 +57,36 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   value at the cursor. Width (8/16/32/64 bit), base address and byte order (the Inspector's LE/BE)
   are in Search > Follow Pointer Settings and the Settings window. The Inspector's uint32/uint64
   rows and the Structure panel's 32/64-bit integer fields have a `→` button. Every big jump (Go
-  to, search hits, bookmarks, Structure / Strings rows, follow) is recorded: `Alt+Left` /
+  to, search hits, bookmarks, Structure / Strings / Packets rows, Bitmap clicks, follow) is recorded: `Alt+Left` /
   `Alt+Right` or the mouse back / forward buttons walk the history.
 - **Strings panel.** ASCII, UTF-16LE and UTF-16BE strings of the file or the selection, with a
   minimum length, scanned in the background (progress, Cancel), up to a million results with a
   live filter. Click a row to select the string.
+- **Minimap.** A strip right of the hex view shows the whole file top to bottom as an entropy
+  heat map (dark = zeros, blue/teal = structured data and text, orange/red = compressed or
+  random) or as the byte-class mix of each row (View > Minimap). It is scanned in the
+  background (sampled, so a 3 TiB file takes seconds), rescanned a second after edits, and a
+  click or drag scrolls there. Hover it for the range, entropy and class percentages.
+- **Byte-class colors** (View > Color Bytes by Class): hex digits and text in the color of their
+  class: zero, whitespace, printable, control, high (0x80-0xFE) and 0xFF.
+- **Bitmap panel** (View > Bitmap): the bytes as pixels (gray 1/4/8-bit, RGB/BGR 24-bit,
+  RGBA/BGRA/ARGB 32-bit, RGB565/555, byte classes) with an adjustable width, zoom and start
+  (follow the hex view, follow the cursor, or a fixed offset; right-click > Show as Bitmap Here).
+  Spot images, tables and padding at a glance; click a pixel to jump there, drag to select.
+- **Compare** (File > Compare With...): two open files side by side in a Compare tab, with the
+  differences highlighted (red = changed, blue = only in one file), synced scrolling and
+  `F7` / `Shift+F7` for the next / previous difference. A **shift** lines up files where one has
+  an extra header: put the caret on the same content in both and run *Compare: Align at Cursors*,
+  or type it (`0x200`, `-16`). Runs in the background; edits recompare automatically.
+- **Packets panel** for pcap / pcapng captures (opens by itself for a capture): every packet
+  with time, length, protocol and a summary (Ethernet, VLAN, IPv4/IPv6, TCP, UDP, ICMP, ARP, ...),
+  a live filter, and **Parse with**: pick a parser (e.g. your protocol's) and each packet you
+  click, or step through with `Up` / `Down`, is parsed in the Structure panel (optionally just
+  its payload). `python tools/make_pcap.py demo.pcapng` writes a demo capture.
+- **Live tail** (View > Live Tail) for growing files such as logs and captures: appended data
+  shows up within half a second and the view follows it while the caret is at the end
+  (`Ctrl+End`). Edits and undo keep working; a file that is rewritten instead of appended to
+  turns tailing off and shows the usual "changed on disk" banner.
 - **Hashes panel.** CRC-8/16/32/32C, Adler-32, Fletcher-16, FNV-1a, Sum-8, XOR-8, MD5, SHA-1,
   SHA-256 and SHA-512 of the selection (or the whole file), computed in the background and
   automatically up to 64 MiB. Paste an expected value to highlight the matching row. Scripts get
@@ -188,6 +214,7 @@ hexer [options] [files...]
 | `Ctrl+,` | Settings |
 | `Ctrl+Shift+P` | Command palette |
 | `F5` | Re-parse structure |
+| `F7` / `Shift+F7` (Compare tab) | Next / previous difference |
 | `Ctrl+=` or `Ctrl++` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Zoom in / out / reset |
 | `Ctrl+L` (in the console) | Clear console |
 
@@ -257,8 +284,8 @@ See **[docs/scripting.md](docs/scripting.md)** for the full guide and API refere
 ## Project layout
 
 `src/core` holds documents, streaming I/O, the piece table, undo, saving, the session, search,
-the inspector, strings extraction, hashes, the C struct converter, the jump history and
-utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
+the inspector, strings extraction, hashes, the C struct converter, the jump history, entropy,
+bitmap decoding, the compare engine, the pcap reader and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
 live in `tests/`, one executable per module; `tests/test_ui.cpp` drives the hex view headlessly
 (simulated mouse and keyboard, no window). See `CLAUDE.md` for contributor notes and `TODO.md`
 for the roadmap.

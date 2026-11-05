@@ -1,7 +1,8 @@
 #pragma once
 // Private to the UI module: the one App struct shared by app.cpp (main loop, menus, shortcuts,
 // tabs, popups, ScriptHost) and panels.cpp (Inspector, Structure, Console, Search Results,
-// Bookmarks, Strings, Hashes, status bar). Plain data + a few helper functions; no class hierarchy.
+// Bookmarks, Strings, Hashes, Bitmap, Packets, status bar). Plain data + a few helper functions;
+// no class hierarchy.
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/entropy.h"
 #include "core/nav.h"
 #include "core/search.h"
 #include "core/session.h"
@@ -18,9 +20,13 @@
 #include "ui/app.h"
 #include "ui/dialog_cstruct.h"
 #include "ui/hex_view.h"
+#include "ui/minimap.h"
+#include "ui/panel_bitmap.h"
 #include "ui/panel_hash.h"
+#include "ui/panel_packets.h"
 #include "ui/panel_strings.h"
 #include "ui/theme.h"
+#include "ui/view_diff.h"
 
 struct GLFWwindow;
 
@@ -36,6 +42,8 @@ inline constexpr const char* kWinBookmarks = "Bookmarks";
 inline constexpr const char* kWinStrings = "Strings";
 inline constexpr const char* kWinHashes = "Hashes";
 inline constexpr const char* kWinCStruct = "C Struct to Parser";
+inline constexpr const char* kWinBitmap = "Bitmap";
+inline constexpr const char* kWinPackets = "Packets";
 
 // ---- per-tab state -------------------------------------------------------------------------
 
@@ -62,10 +70,13 @@ struct StructureState {
     // click put it, although the caret byte belongs to one of its children.
     int clicked_field = -1;
     uint64_t clicked_cursor = 0;
-    // Parse at offset: the parser runs over [base, EOF) (0 = the whole file). Needs a chosen
-    // parser (detect() looks at the file start). Kept per tab, not in the session.
+    // Parse at offset: the parser runs over [base, base + length) (base 0 + UINT64_MAX = the whole
+    // file; UINT64_MAX = to EOF). Needs a chosen parser (detect() looks at the file start). Kept
+    // per tab, not in the session. A length comes from the Packets panel (one packet's bytes).
     uint64_t base = 0;
-    uint64_t parsed_base = 0;         // base of `result`
+    uint64_t length = UINT64_MAX;
+    uint64_t parsed_base = 0;         // base / length of `result`
+    uint64_t parsed_length = UINT64_MAX;
     std::string base_input;           // the panel's "@" field
     // Wall time of the last detect + parse. A slow (or truncated) parse is not re-run on every
     // edit; the panel shows it as stale until F5 / Reparse.
@@ -105,6 +116,21 @@ struct Tab {
     SearchHits hits;
     StructureState st;
     NavHistory nav;                   // Back / Forward over big jumps (Alt+Left / Alt+Right)
+
+    // Entropy / byte-class minimap (scanned while the tab is shown; rescanned after edits, debounced).
+    EntropyJob entropy;
+    Minimap minimap;
+    uint64_t entropy_gen = UINT64_MAX;          // document generation of the last started scan
+    uint64_t entropy_pending_gen = UINT64_MAX;  // generation waiting for the debounce
+    double entropy_first_change = 0.0, entropy_last_change = 0.0;
+    std::shared_ptr<const EntropyResult> entropy_shown;  // what the minimap draws (old map while rescanning)
+
+    TailState tail;                   // View > Live Tail (not persisted)
+
+    // doc.view().top_row is a row index; the tab's HexView and a Compare side may use different
+    // bytes per row. top_bpr = the row width top_row is currently expressed in (0 = unknown).
+    int top_bpr = 0;
+    int compare_bpr = 0;              // bytes per row of this document's side in the Compare tab
 };
 
 // ---- app-level state -----------------------------------------------------------------------
@@ -167,7 +193,8 @@ struct MsgBox {
 struct PaletteItem {
     std::string label;
     std::string hint;                 // shortcut text shown right-aligned
-    int kind = 0;                     // 0 action, 1 script command, 2 parser, 3 recent file, 4 bookmark
+    int kind = 0;                     // 0 action, 1 script command, 2 parser, 3 recent file, 4 bookmark,
+                                      // 5 compare with document `doc`, 6 compare with a file (dialog)
     int index = 0;                    // action index / bookmark index
     std::string arg;                  // command / parser name / path
     bool enabled = true;
@@ -203,6 +230,7 @@ struct App final : ScriptHost {
     // Panels / layout.
     bool show_inspector = true, show_structure = true, show_console = true, show_results = true,
          show_bookmarks = true, show_strings = true, show_hashes = true;
+    bool show_bitmap = false, show_packets = false;  // opened on demand (Packets: for captures)
     bool show_settings = false;       // Settings window (Edit > Settings..., Ctrl+,)
     bool bm_all_files = false;        // Bookmarks panel lists every open file
     bool focus_bookmarks = false;     // bring the Bookmarks panel to the front next frame
@@ -211,18 +239,27 @@ struct App final : ScriptHost {
     bool focus_results = false;
     bool focus_console_input = false;
     bool focus_structure = false, focus_strings = false, focus_hashes = false;
+    bool focus_bitmap = false, focus_packets = false;
 
     // Feature panels (self-contained; App members so their worker threads are joined before exit).
     StringsPanel strings_panel;
     HashPanel hash_panel;
     CStructDialog cstruct_dlg;
+    BitmapPanel bitmap_panel;
+    PacketsPanel packets_panel;
+
+    // Compare (File > Compare With...): a "Compare" tab in the editor's tab bar showing two open
+    // documents side by side. Closing either document ends it.
+    std::unique_ptr<DiffView> diff;
+    uint64_t diff_a = 0, diff_b = 0;  // Document::id() of the two sides
+    bool diff_select = false;         // select the Compare tab next frame
 
     FindState find;
     SaveTask save;
 
     // Popup requests (opened at the root ID stack in draw_popups()).
     bool req_goto = false, req_palette = false, req_fill = false, req_copy_as = false,
-         req_about = false, req_bookmark_jump = false;
+         req_about = false, req_bookmark_jump = false, req_compare = false;
     uint64_t close_prompt_doc = 0;    // doc id awaiting Save/Discard/Cancel
     bool close_prompt_pending = false;
     uint64_t reload_prompt_doc = 0;   // doc id awaiting "Reload from disk and discard edits?"
@@ -246,6 +283,7 @@ struct App final : ScriptHost {
     int palette_sel = 0;
     bool palette_scroll = false;
     bool palette_bookmarks = false;   // the palette lists bookmarks of all open files (Ctrl+Shift+B)
+    bool palette_compare = false;     // the palette picks the document to compare with (Compare With...)
     // hx.prompt modal (a script command waits for an answer).
     std::string prompt_buf;
 

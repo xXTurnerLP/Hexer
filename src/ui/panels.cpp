@@ -1,5 +1,5 @@
-// Dockable panels: Inspector, Structure, Console, Search Results, Bookmarks, Strings, Hashes + the
-// status bar.
+// Dockable panels: Inspector, Structure, Console, Search Results, Bookmarks, Strings, Hashes,
+// Bitmap, Packets + the status bar.
 // Each panel reads the active tab through App helpers and never touches a busy (saving) document.
 #include "ui/panels.h"
 
@@ -289,10 +289,12 @@ void run_parse(App& app, Tab& t) {
         st.result = ParseResult{};
         st.has_result = false;
     } else {
-        st.result = st.base ? app.engine->parse(d, name, st.base, UINT64_MAX) : app.engine->parse(d, name);
+        st.result = (st.base || st.length != UINT64_MAX) ? app.engine->parse(d, name, st.base, st.length)
+                                                         : app.engine->parse(d, name);
         st.has_result = true;
     }
     st.parsed_base = st.base;
+    st.parsed_length = st.length;
     st.used_parser = name;
     st.last_parse_ms = (now_s() - t0) * 1000.0;
     st.slow = st.has_result && (st.last_parse_ms > kAutoParseBudgetMs || st.result.truncated);
@@ -410,9 +412,15 @@ void draw_parse_base(App& app, Tab& t, Document& d) {
     if (ImGui::Button("Cursor")) set_parse_base(app, t, focus_offset(d.view()));
     ImGui::SetItemTooltip("Parse from the cursor / selection start");
     ImGui::SameLine();
-    ImGui::BeginDisabled(st.base == 0);
+    ImGui::BeginDisabled(st.base == 0 && st.length == UINT64_MAX);
     if (ImGui::Button("File start")) set_parse_base(app, t, 0);
     ImGui::EndDisabled();
+}
+
+// Length of a parse over a range (StructureState::parsed_length), clamped to the document.
+uint64_t parsed_len(const StructureState& st, const Document& d) {
+    const uint64_t room = d.size() - std::min(st.parsed_base, d.size());
+    return std::min(st.parsed_length, room);
 }
 
 void draw_parse_info(App& app, StructureState& st, const Document& d) {
@@ -425,7 +433,10 @@ void draw_parse_info(App& app, StructureState& st, const Document& d) {
         return;
     }
     const ParseResult& r = st.result;
-    if (st.parsed_base)
+    if (st.parsed_length != UINT64_MAX)  // one packet / range (Packets panel)
+        ImGui::TextDisabled("%s @ %s  \xC2\xB7  %zu fields  \xC2\xB7  %.1f ms", r.parser.c_str(),
+                            fmt_range(st.parsed_base, parsed_len(st, d)).c_str(), r.fields.size(), r.ms);
+    else if (st.parsed_base)
         ImGui::TextDisabled("%s @ %s  \xC2\xB7  %zu fields  \xC2\xB7  %.1f ms", r.parser.c_str(),
                             fmt_offset(st.parsed_base).c_str(), r.fields.size(), r.ms);
     else
@@ -650,7 +661,8 @@ void update_structure(App& app, Tab& t) {
     const uint64_t gen = d.generation();
     const uint64_t rel = app.engine->reload_count();
     const std::string& want = d.view().parser;
-    if (gen == st.gen && rel == st.reload && want == st.requested && st.base == st.parsed_base) {
+    if (gen == st.gen && rel == st.reload && want == st.requested && st.base == st.parsed_base &&
+        st.length == st.parsed_length) {
         st.due = 0.0;
         return;
     }
@@ -672,12 +684,13 @@ void update_structure(App& app, Tab& t) {
     if (now >= st.due) run_parse(app, t);
 }
 
-void set_parse_base(App& app, Tab& t, uint64_t base) {
+void set_parse_base(App& app, Tab& t, uint64_t base, uint64_t length) {
     StructureState& st = t.st;
     Document& d = *t.doc;
     if (d.busy()) return;
     base = std::min(base, d.size());
     st.base = base;
+    st.length = length;  // UINT64_MAX = up to the end (the engine clamps a longer one)
     st.base_input = base ? fmt_offset(base) : std::string();
     // detect() looks at the file start: keep the parser that is shown now.
     if (base && d.view().parser.empty() && !st.used_parser.empty()) {
@@ -688,6 +701,8 @@ void set_parse_base(App& app, Tab& t, uint64_t base) {
     st.pending_gen = UINT64_MAX - 1;
     if (base && d.view().parser.empty())
         set_status(app, "Parse at " + fmt_offset(base) + ": pick a parser in the Structure panel");
+    else if (length != UINT64_MAX)
+        set_status(app, "Parsing " + fmt_range(base, std::min(length, d.size() - base)), 3.0);
     else
         set_status(app, base ? "Parsing from " + fmt_offset(base) : std::string("Parsing from the file start"), 3.0);
 }
@@ -1175,6 +1190,77 @@ void draw_hash_panel(App& app) {
 }
 
 // =============================================================================================
+// Bitmap / Packets (self-contained panels, ui/panel_bitmap.h / ui/panel_packets.h)
+// =============================================================================================
+
+void draw_bitmap_panel(App& app) {
+    dock_like(kWinStructure);  // the right column: a tall panel suits images
+    if (!begin_panel(kWinBitmap, &app.show_bitmap)) return;
+    Tab* t = active_tab(app);
+    BitmapPanel& bp = app.bitmap_panel;
+    bp.mono = app.fonts.mono;
+    bp.ui_scale = app.ui_scale;
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    BitmapPanelCallbacks cb;
+    cb.jump = [&app, doc_id](uint64_t off) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, 0, false);
+    };
+    cb.select = [&app, doc_id](uint64_t off, uint64_t len) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, len, false);
+    };
+    uint64_t cursor = 0, top = 0;
+    if (t && !t->doc->busy()) {
+        const ViewState& v = t->doc->view();
+        cursor = focus_offset(v);
+        const uint64_t bpr = uint64_t(t->top_bpr > 0 ? t->top_bpr : std::max(1, t->ev.bytes_per_row));
+        top = v.top_row > t->doc->size() / bpr ? t->doc->size() : v.top_row * bpr;
+    }
+    bp.draw(t ? t->doc.get() : nullptr, cursor, top, cb);  // a busy document is not read
+    if (bp.wants_frames()) app.wants_poll = true;
+    // Remember format / width / zoom ("" = the default format, Gray 8-bit).
+    Settings& s = app.settings;
+    const std::string fmt = bp.format == PixelFormat::Gray8 ? std::string() : std::string(pixel_format_name(bp.format));
+    if (fmt != s.bitmap_format || bp.width != s.bitmap_width || bp.zoom != s.bitmap_zoom) {
+        s.bitmap_format = fmt;
+        s.bitmap_width = bp.width;
+        s.bitmap_zoom = bp.zoom;
+        mark_settings_dirty(app);
+    }
+    ImGui::End();
+}
+
+void draw_packets_panel(App& app) {
+    dock_like(kWinConsole);  // with Console / Strings, below the hex view
+    if (!begin_panel(kWinPackets, &app.show_packets)) return;
+    Tab* t = active_tab(app);
+    PacketsPanel& pp = app.packets_panel;
+    pp.mono = app.fonts.mono;
+    pp.ui_scale = app.ui_scale;
+    std::vector<std::string> names;
+    for (const ParserInfo& p : app.engine->parsers()) names.push_back(p.name);
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    PacketsPanelCallbacks cb;
+    cb.select = [&app, doc_id](uint64_t off, uint64_t len) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, len, false);
+    };
+    // The protocol-analysis loop: each selected packet (or its payload) is parsed on its own.
+    cb.parse = [&app, doc_id](const std::string& parser, uint64_t off, uint64_t len) {
+        Tab* tab = find_tab(app, doc_id);
+        if (!tab || tab->doc->busy()) return;
+        if (tab->doc->view().parser != parser) {
+            tab->doc->view().parser = parser;  // sticky per document; Structure > Auto-detect undoes it
+            tab->doc->view_generation++;
+        }
+        set_parse_base(app, *tab, off, len);
+        app.show_structure = true;
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    pp.draw(t ? t->doc.get() : nullptr, names, cb);
+    if (pp.wants_frames()) app.wants_poll = true;
+    ImGui::End();
+}
+
+// =============================================================================================
 // Status bar
 // =============================================================================================
 
@@ -1234,9 +1320,21 @@ void draw_doc_status(App& app, Tab& t) {
                               "another program). Unreadable bytes are shown as ??. Searches stop at them and\n"
                               "saves that rewrite the file refuse; copies and scripts read them as 0.");
     }
+    if (t.tail.enabled) {
+        status_sep();
+        const bool following = v.cursor >= d.size() && !v.has_selection();
+        ImGui::TextColored(kResultColor, "TAIL +%s%s", fmt_size(t.tail.added).c_str(), following ? " (following)" : "");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Live tail: the file is checked for appended data every 0.5 s.\n"
+                              "%llu bytes appended since it was turned on. With the caret at the end of\n"
+                              "the file (Ctrl+End) the view follows new data. View > Live Tail turns it off.",
+                              ull(t.tail.added));
+    }
     if (!t.st.used_parser.empty()) {
         status_sep();
-        if (t.st.parsed_base)
+        if (t.st.parsed_length != UINT64_MAX)
+            ImGui::Text("Parser: %s @ %s", t.st.used_parser.c_str(), fmt_range(t.st.parsed_base, parsed_len(t.st, d)).c_str());
+        else if (t.st.parsed_base)
             ImGui::Text("Parser: %s @ %s", t.st.used_parser.c_str(), fmt_offset(t.st.parsed_base).c_str());
         else
             ImGui::Text("Parser: %s", t.st.used_parser.c_str());

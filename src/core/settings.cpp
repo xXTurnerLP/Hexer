@@ -118,6 +118,16 @@ bool Settings::load(const std::string& path) {
         else if (key == "session_autosave_seconds") parse_int(v, 1, 3600, session_autosave_seconds);
         else if (key == "goto_default_hex") parse_bool(v, goto_default_hex);
         else if (key == "highlight_modified") parse_bool(v, highlight_modified);
+        else if (key == "byte_class_colors") parse_bool(v, byte_class_colors);
+        else if (key == "minimap") {
+            const std::string m = lower(v);
+            if (m == "off") minimap = 0;
+            else if (m == "entropy") minimap = 1;
+            else if (m == "classes") minimap = 2;
+        }
+        else if (key == "bitmap_format") bitmap_format = v;
+        else if (key == "bitmap_width") parse_int(v, 1, 8192, bitmap_width);
+        else if (key == "bitmap_zoom") parse_int(v, 1, 16, bitmap_zoom);
         else if (key == "undo_merge_ms") parse_int(v, 0, 600000, undo_merge_ms);
         else if (key == "undo_merge_max_bytes") parse_int(v, 0, 1 << 30, undo_merge_max_bytes);
         else if (key == "backup_on_save") parse_bool(v, backup_on_save);
@@ -169,6 +179,11 @@ bool Settings::save(const std::string& path) const {
     put("session_autosave_seconds", std::to_string(session_autosave_seconds));
     put("goto_default_hex", b(goto_default_hex));
     put("highlight_modified", b(highlight_modified));
+    put("byte_class_colors", b(byte_class_colors));
+    put("minimap", minimap == 0 ? "off" : minimap == 2 ? "classes" : "entropy");
+    put("bitmap_format", bitmap_format);
+    put("bitmap_width", std::to_string(bitmap_width));
+    put("bitmap_zoom", std::to_string(bitmap_zoom));
     put("undo_merge_ms", std::to_string(undo_merge_ms));
     put("undo_merge_max_bytes", std::to_string(undo_merge_max_bytes));
     put("backup_on_save", b(backup_on_save));

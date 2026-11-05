@@ -898,3 +898,55 @@ TEST_CASE("settings: follow pointer and hash algorithm fields round trip, bad wi
         CHECK(u.pointer_width == 4);
     }
 }
+
+TEST_CASE("settings: minimap, byte-class colors and bitmap panel fields round trip, bad values ignored") {
+    TempDir tmp;
+    std::string f = path_join(tmp.path, "settings.ini");
+    Settings def;
+    CHECK(def.minimap == 1);  // entropy
+    CHECK_FALSE(def.byte_class_colors);
+    for (int mode : {0, 1, 2}) {
+        Settings s;
+        s.minimap = mode;
+        s.byte_class_colors = mode != 1;
+        REQUIRE(s.save(f));
+        Settings t;
+        REQUIRE(t.load(f));
+        CHECK(t.minimap == mode);
+        CHECK(t.byte_class_colors == (mode != 1));
+        CHECK(t.unknown_keys.empty());
+    }
+    const std::string text = "minimap = Classes\nbyte_class_colors = yes\n";
+    REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
+    Settings u;
+    REQUIRE(u.load(f));
+    CHECK(u.minimap == 2);  // case-insensitive
+    CHECK(u.bitmap_width == 256);
+    CHECK(u.bitmap_zoom == 2);
+    CHECK(u.bitmap_format.empty());
+    {
+        Settings b;
+        b.bitmap_format = "RGB 24-bit";
+        b.bitmap_width = 640;
+        b.bitmap_zoom = 3;
+        REQUIRE(b.save(f));
+        Settings c;
+        REQUIRE(c.load(f));
+        CHECK(c.bitmap_format == "RGB 24-bit");
+        CHECK(c.bitmap_width == 640);
+        CHECK(c.bitmap_zoom == 3);
+        const std::string bad = "bitmap_width = 0\nbitmap_zoom = 17\n";
+        REQUIRE(os_write_whole_atomic(f, bad.data(), bad.size()));
+        Settings e;
+        REQUIRE(e.load(f));
+        CHECK(e.bitmap_width == 1);  // out-of-range numbers are clamped, like every int setting
+        CHECK(e.bitmap_zoom == 16);
+    }
+    for (const char* bad : {"2", "heat", ""}) {
+        const std::string t2 = std::string("minimap = ") + bad + "\n";
+        REQUIRE(os_write_whole_atomic(f, t2.data(), t2.size()));
+        Settings w;
+        REQUIRE(w.load(f));
+        CHECK(w.minimap == 1);
+    }
+}

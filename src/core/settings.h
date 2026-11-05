@@ -29,6 +29,15 @@ struct Settings {
     int session_autosave_seconds = 3;  // crash-safety interval while dirty
     bool goto_default_hex = true;
     bool highlight_modified = true;    // tint bytes that differ from disk
+    // Hex digits / text glyphs colored by byte class (zero, whitespace, printable, control, high, 0xFF).
+    bool byte_class_colors = false;
+    // Strip right of the hex view: 0 = off, 1 = entropy heat map, 2 = byte classes (settings.ini:
+    // minimap = off | entropy | classes).
+    int minimap = 1;
+    // Bitmap panel: pixel format (its display name, e.g. "RGB 24-bit"; "" = Gray 8-bit), width, zoom.
+    std::string bitmap_format;
+    int bitmap_width = 256;
+    int bitmap_zoom = 2;
     // Typing-run undo coalescing: a pause longer than undo_merge_ms, or a run already covering
     // undo_merge_max_bytes bytes, starts a new undo step (0 = no limit). See Document::set_undo_merge.
     int undo_merge_ms = 500;

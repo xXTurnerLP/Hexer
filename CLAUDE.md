@@ -22,20 +22,27 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
 src/core/    no UI, no Lua — os_file, file_source, piece_table, highlight, document (edits, undo,
              save), session (hot exit), search, inspector, util (goto exprs, copy-as, paste parse),
              settings (+ paths), nav (follow pointer + jump history), strings_scan (StringsJob),
-             hash (16 algorithms + HashJob), cstruct (C struct definitions -> Lua parser source)
+             hash (16 algorithms + HashJob), cstruct (C struct definitions -> Lua parser source),
+             entropy (ByteClass + EntropyJob: sampled per-bucket entropy for the minimap), bitmap
+             (bytes -> pixels), diff (DiffJob: compare two Snapshots with a shift), pcap (pcap/pcapng
+             PcapIndexJob + packet dissector); document also has refresh_appended() (live tail)
 src/script/  script_engine.h (Lua API contract — the header comment is the API spec),
              script_engine.cpp, lua_api.cpp
 src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
-             menus, shortcuts, tabs, ScriptHost impl); self-contained feature UIs without App
-             dependency: panel_strings, panel_hash, dialog_cstruct (App owns one of each)
+             menus, shortcuts, tabs, Compare tab, live tail, minimap wiring, ScriptHost impl);
+             self-contained feature UIs without App dependency: panel_strings, panel_hash,
+             dialog_cstruct, panel_bitmap, panel_packets (App owns one of each), minimap (one per
+             tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare)
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
 tests/       doctest; one exe per module: test_core, test_util, test_script, test_search,
-             test_ui (headless ImGui: drives HexView with simulated mouse/keyboard), test_nav,
-             test_strings, test_hash, test_cstruct
+             test_ui (headless ImGui: drives HexView + Minimap with simulated mouse/keyboard),
+             test_nav, test_strings, test_hash, test_cstruct, test_entropy, test_bitmap,
+             test_diff, test_pcap, test_tail (growing files)
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
-             make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there)
+             make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
+             make_pcap.py (demo pcapng with HXP packets for the Packets panel)
 assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file
 ```
 Headers are the module contracts. Changing a public signature means updating every caller —
@@ -64,8 +71,16 @@ python tools\ppm2png.py shot.ppm shot.png      # then view the PNG
 Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`,
 `--action "<name>"` (run a menu/palette action once the layout settled, e.g. `"Settings..."`,
 `"Show All Bookmarks"`, `"Jump to Bookmark..."`, `"Strings: Scan File"`, `"Hash Selection"`,
-`"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`; any palette
-label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable).
+`"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`, `"Minimap: Byte Classes"`,
+`"Color Bytes by Class"`, `"Toggle Bitmap"`, `"Bitmap: Show at Cursor"`, `"Toggle Packets"`,
+`"Structure: Parse Selection"`, `"Toggle Live Tail"`, `"Compare with: <tab name>"`,
+`"Compare: Align at Cursors"`; any palette
+label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable; all
+actions of one run execute in the same frame, so e.g. "Compare: Next Difference" right after
+"Compare with: ..." finds no result yet).
+Settings drive what actions cannot: put e.g. `bitmap_format = RGB 24-bit` or `minimap = classes`
+in `<config-dir>/settings.ini` before a screenshot run. The real mouse cursor is not hidden: if it
+sits over the window, its hover tooltip shows up in the screenshot.
 Script commands can be driven from `--exec` with `hx.run("<command name>")`; a command that calls
 `hx.prompt` leaves its modal open in the screenshot.
 
@@ -79,6 +94,13 @@ Use `Document::set_clock_for_tests` for undo-merge timing.
 
 Jump history: `reveal_range()` (app_internal.h) is the one "big jump" helper: it pushes the
 position it leaves onto the tab's `NavHistory`. Use it for new jump sources (not for caret moves).
+Scroll-only sources (minimap click/drag, live tail follow) call `HexView::request_scroll_to`.
+
+Compare tab: the DiffView sides draw the documents' own ViewState (caret, selection, top_row are
+shared with their tabs; only one of them is drawn per frame). `top_row` is a row index, so
+`Tab::top_bpr` records the row width it is expressed in and `adopt_top_units()` converts before a
+view with another width draws. Jumps aimed at a tab's HexView while the Compare tab is shown are
+handed over with `HexView::take_scroll_request()`.
 
 Selection convention (one for the whole UI, see `ui/hex_view.h`): `ViewState` selection is
 half-open `[sel_begin, sel_end)`; the caret is drawn on `caret_byte()` (inside the selection);

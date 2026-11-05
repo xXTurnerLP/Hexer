@@ -41,12 +41,22 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Hashes & checksums of selection (Hashes panel: 16 CRCs/checksums/hashes, background, expected
       value match; `hx.hash` / `doc:hash`)
 - [ ] Custom hash algorithms registered from Lua (`hx.hash_algorithm{...}`)
-- [ ] Entropy / byte-class minimap next to the scrollbar
+- [x] Entropy / byte-class minimap next to the scrollbar (View > Minimap: Off / Entropy / Byte Classes;
+      background sampled scan, rescanned 1 s after edits; click / drag scrolls)
+- [ ] Minimap: rescan only the buckets an edit touched (today every edit rescans the whole map,
+      bounded at 1024 x 256 KiB reads); small regions inside huge sampled buckets can be missed
 - [ ] Structure → C header export (turn a parsed tree into `struct` definitions)
 - [ ] Bit-field / flags display in the Inspector (named bits, editable)
-- [ ] Diff/compare two files with synced scrolling
+- [x] Diff/compare two files with synced scrolling (File > Compare With: a Compare tab, F7 / Shift+F7,
+      shift for inserted headers, "Align at Cursors")
+- [ ] Compare: find the shift automatically (align on the first matching block); keep the Compare
+      tab in the session; compare a document with its version on disk
+- [ ] Headless tests for DiffView / PacketsPanel / BitmapPanel (view_diff.cpp etc. live in hexer_ui,
+      which test_ui does not link; move them to hexer_ui_view or add a test exe)
 - [ ] Open process memory and raw disks/devices
-- [ ] pcap/pcapng import: one tab per packet, run protocol parsers on each
+- [x] pcap/pcapng: Packets panel (index in the background, filter, "Parse with" a parser over each
+      packet or its payload, Up / Down steps and re-parses); auto-shown for captures
+- [ ] Packets: open a packet / TCP stream as its own tab, filter expressions (ip.src == ...)
 - [ ] Split view of the same document, multi-selection
 - [x] C struct → parser: paste C definitions, get a Lua parser (apply at the cursor or save it)
 - [x] Parse at offset (Structure panel "Parse at", e.g. a PNG inside a dump)
@@ -57,16 +67,24 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Strings: deduplicate an ASCII-in-UTF-16 string found again shifted by one byte when both
       UTF-16LE and UTF-16BE are on
 - [ ] Verify by hand: Ctrl+hover underline / tooltip and mouse X1/X2 (headless tests only)
-- [ ] Bitmap view: render bytes as pixels (adjustable width / pixel format) to spot tables & images
-- [ ] Byte-class coloring mode (zero / printable / whitespace / control / high bytes)
+- [x] Bitmap view: render bytes as pixels (adjustable width / pixel format) to spot tables & images
+      (View > Bitmap; format / width / zoom remembered in settings.ini)
+- [ ] Bitmap: zoom below 1x (downscale) for very wide images; remember the source mode
+- [x] Byte-class coloring mode (zero / printable / whitespace / control / high bytes; View > Color
+      Bytes by Class)
 - [ ] Disassembly at cursor (Capstone: x86/x64/ARM/AArch64/...)
-- [ ] Live tail mode for growing files (captures, logs)
+- [x] Live tail mode for growing files (captures, logs): View > Live Tail, follows the end while the
+      caret is there, a rewrite falls back to the "changed on disk" banner
+- [ ] Live tail: remember the toggle in the session (today it is off after a restart); rescan the
+      Packets index incrementally while a capture grows
 - [ ] XOR / rotate brute-force helpers to find simple obfuscation
 - [ ] Script API: `doc:view_range()` (visible bytes); bookmark access from Lua
 - [ ] "Restore from .backup" command (swap the file with its `.backup`, or open the backup side by side)
 - [ ] Live font reload from the Settings window (font file / hinting changes need a restart now)
 - [ ] Settings: remember the Bookmarks panel's "All open files" toggle
 - [ ] Linux CI + AppImage; Windows portable zip
+- [ ] Compile the visual-analysis / compare / capture batch with GCC and Clang (written for
+      -Wall -Wextra but only built with MSVC so far)
 - [ ] Run parsers on a worker thread over a Snapshot (a parse slower than ~50 ms is currently
       not re-run after edits; the Structure panel shows it as stale until F5)
 
