@@ -1245,9 +1245,10 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
     // Write the file a symlink points to instead of replacing the link by a regular file.
     const std::string real = os_resolve_symlinks(target);
     const std::string tmp = real + ".hexer-tmp";
+    os_remove(tmp);  // a leftover (or planted symlink) is unlinked, never written through
     {
         std::string e;
-        auto f = OsFile::open(tmp, OsFile::Mode::CreateTruncate, &e);
+        auto f = OsFile::open(tmp, OsFile::Mode::CreateNew, &e);
         if (!f) return fail(err, "Cannot create " + tmp + ": " + e);
         uint64_t size = snap.size();
         if (progress) progress->total = size;

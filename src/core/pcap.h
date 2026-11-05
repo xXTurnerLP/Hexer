@@ -80,6 +80,7 @@ struct PcapIndexResult {
 };
 
 constexpr size_t kPcapMaxPackets = 5000000;
+constexpr size_t kPcapMaxInterfaces = 65536;  // pcapng IDBs per file (a flood of tiny IDBs is not a capture)
 constexpr uint32_t kPcapMaxRecord = 64u << 20;  // a record claiming more captured bytes is corrupt
 
 // Blocking primitive. `progress` (if non-null) gets the offset reached.

@@ -16,7 +16,9 @@ namespace hx {
 // a file we are viewing can still be written in place / replaced by our own save code.
 class OsFile {
 public:
-    enum class Mode { Read, ReadWrite, CreateTruncate };
+    // CreateNew fails if `path` exists (also as a symlink): use it for temp files next to user
+    // files, so a planted <file>.hexer-tmp symlink cannot redirect a save into another file.
+    enum class Mode { Read, ReadWrite, CreateTruncate, CreateNew };
     static std::unique_ptr<OsFile> open(const std::string& path, Mode mode, std::string* err = nullptr);
     ~OsFile();
     OsFile(const OsFile&) = delete;

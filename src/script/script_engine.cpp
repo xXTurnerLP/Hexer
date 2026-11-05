@@ -417,7 +417,9 @@ void ScriptEngine::add_lib_paths() {
         std::string d = from_path(to_path(*it));
         prefix += d + "/lib/?.lua;" + d + "/lib/?/init.lua;";
     }
-    static const char* kCode = "package.path = ... .. package.path";
+    // Only the script dirs' lib/ folders: Lua's defaults also search the current directory
+    // (./?.lua, ./?.dll), where a folder of untrusted files could plant a module. No native modules.
+    static const char* kCode = "package.path = ...; package.cpath = ''";
     if (luaL_loadbufferx(L, kCode, std::strlen(kCode), "=init", "t") != LUA_OK) {
         lua_pop(L, 1);
         return;

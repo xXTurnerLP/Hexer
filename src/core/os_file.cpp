@@ -224,6 +224,10 @@ std::unique_ptr<OsFile> OsFile::open(const std::string& path, Mode mode, std::st
         access |= GENERIC_WRITE;
         disposition = CREATE_ALWAYS;
     }
+    if (mode == Mode::CreateNew) {
+        access |= GENERIC_WRITE;
+        disposition = CREATE_NEW;  // fails on any existing name, symlinks included
+    }
     HANDLE h = CreateFileW(win_path(path).c_str(), access,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -283,6 +287,7 @@ std::unique_ptr<OsFile> OsFile::open(const std::string& path, Mode mode, std::st
     if (mode == Mode::Read) flags |= O_RDONLY;
     if (mode == Mode::ReadWrite) flags |= O_RDWR;
     if (mode == Mode::CreateTruncate) flags |= O_RDWR | O_CREAT | O_TRUNC;
+    if (mode == Mode::CreateNew) flags |= O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW;  // O_EXCL: never through a symlink
     int fd;
     do {
         fd = ::open(path.c_str(), flags, 0666);
@@ -666,8 +671,9 @@ bool os_read_whole(const std::string& path, std::string& out, std::string* err) 
 
 bool os_write_whole_atomic(const std::string& path, const void* data, size_t len, std::string* err) {
     std::string tmp = path + ".tmp";
+    os_remove(tmp);  // a leftover (or planted symlink) is unlinked, never written through
     {
-        auto f = OsFile::open(tmp, OsFile::Mode::CreateTruncate, err);
+        auto f = OsFile::open(tmp, OsFile::Mode::CreateNew, err);
         if (!f) return false;
         if ((len && !f->write_at(0, data, len)) || !f->flush()) {
             set_err(err, "write failed: " + tmp);
@@ -748,7 +754,8 @@ bool copy_rw(const std::string& src, const std::string& dst, const CopyProgress&
              bool* cancelled) {
     auto in = OsFile::open(src, OsFile::Mode::Read, err);
     if (!in) return false;
-    auto out = OsFile::open(dst, OsFile::Mode::CreateTruncate, err);
+    os_remove(dst);
+    auto out = OsFile::open(dst, OsFile::Mode::CreateNew, err);
     if (!out) return false;
     const uint64_t size = in->size();
     std::vector<uint8_t> buf(size_t(std::min<uint64_t>(4u << 20, std::max<uint64_t>(size, 1))));
@@ -801,7 +808,8 @@ bool os_copy_file(const std::string& src, const std::string& dst, const CopyProg
 #ifdef _WIN32
     const uint64_t size = os_stat(src).size;
     // Unbuffered I/O keeps a multi-GB copy from evicting the whole file cache.
-    const DWORD flags = size >= (256ull << 20) ? COPY_FILE_NO_BUFFERING : 0;
+    // COPY_FILE_FAIL_IF_EXISTS: dst was just removed; never copy through something planted since.
+    const DWORD flags = (size >= (256ull << 20) ? COPY_FILE_NO_BUFFERING : 0) | COPY_FILE_FAIL_IF_EXISTS;
     WinCopyCtx ctx{&progress, false};
     if (CopyFileExW(win_path(src).c_str(), win_path(dst).c_str(), win_copy_progress, &ctx, nullptr, flags)) {
         // Durable before the caller overwrites the original (best effort if dst came out read-only).
@@ -842,7 +850,7 @@ bool os_copy_file(const std::string& src, const std::string& dst, const CopyProg
     const uint64_t size = uint64_t(s.st_size);
     int out;
     do {
-        out = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, s.st_mode & 0777);
+        out = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, s.st_mode & 0777);
     } while (out < 0 && errno == EINTR);
     if (out < 0) {
         set_err(err, posix_error(errno));

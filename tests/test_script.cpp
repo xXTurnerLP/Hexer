@@ -592,6 +592,10 @@ TEST_CASE("reload: lib/ modules are require()-able, not run; os.exit is disabled
     CHECK(fx.last_result() == "1");  // required once, never executed as a script
     fx.eng.exec("os.exit(1)");
     CHECK(fx.console_has("os.exit is disabled", ConsoleLine::Error));
+    // require never searches the current directory (planted ./x.lua / ./x.dll) or loads native code.
+    fx.eng.exec("package.path:find('./', 1, true) == nil and package.path:find(string.char(46, 92), 1, true) == nil "
+                "and package.cpath == ''");
+    CHECK(fx.last_result() == "true");
     // Editing a lib module triggers a reload too.
     fx.dir.write("lib/mylib.lua", "return { twice = function(x) return 3 * x end }");
     CHECK(fx.eng.poll_hot_reload());

@@ -426,6 +426,16 @@ TEST_CASE("pcapng: corrupt and truncated blocks stop cleanly") {
     }
 }
 
+TEST_CASE("pcapng: a flood of interface blocks is capped") {
+    W w;
+    ng_shb(w);
+    for (size_t i = 0; i < kPcapMaxInterfaces + 10; ++i) ng_idb(w, 1, 0);
+    auto r = index_of(w.b);
+    CHECK(r.error);
+    CHECK(r.error_msg.find("too many interfaces") != std::string::npos);
+    CHECK(r.interfaces.size() == kPcapMaxInterfaces);
+}
+
 TEST_CASE("pcapng: IDB options that overrun are ignored") {
     W w;
     ng_shb(w);

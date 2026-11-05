@@ -58,6 +58,7 @@ struct ExprParser {
     uint64_t current, size;
     bool default_hex;
     size_t pos = 0;
+    int depth = 0;  // unary / '(' nesting; pasted "((((..." must not overflow the stack
     std::string error;
 
     static constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
@@ -235,6 +236,12 @@ struct ExprParser {
     }
 
     bool unary(int64_t& out) {
+        struct Nest {
+            int& d;
+            explicit Nest(int& v) : d(v) { ++d; }
+            ~Nest() { --d; }
+        } nest(depth);
+        if (depth > 256) return fail("expression nested too deeply");
         char c = peek();
         if (c == '+' || c == '-') {
             ++pos;

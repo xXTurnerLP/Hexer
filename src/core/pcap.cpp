@@ -290,6 +290,10 @@ void index_ng(SeqReader& rd, PcapIndexResult& out, size_t max_packets, const std
             sec.ifaces.clear();
         } else if (type == kIdb) {
             if (!(need(20, 16))) break;
+            if (out.interfaces.size() >= kPcapMaxInterfaces) {
+                fail(out, off, "too many interfaces (more than " + std::to_string(kPcapMaxInterfaces) + ")");
+                break;
+            }
             CaptureInterface ifc;
             ifc.linktype = rd16(h + 8, be);
             ifc.snaplen = rd32(h + 12, be);

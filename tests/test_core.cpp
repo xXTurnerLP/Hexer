@@ -1775,6 +1775,36 @@ TEST_CASE("document: saving through a symlink updates the target") {
     CHECK(!tmp_left_over(t));
 }
 
+TEST_CASE("document: planted temp-name symlinks never redirect a save") {
+    // An archive can ship evil.bin plus evil.bin.hexer-tmp / evil.bin.backup.tmp symlinks to a
+    // victim file: saving must unlink them, never write through them.
+    TempDir t;
+    std::string file = t.file("evil.bin"), victim = t.file("victim.txt");
+    write_file(file, str_bytes("abcdef"));
+    write_file(victim, str_bytes("precious"));
+    std::error_code ec;
+    for (const char* name : {"evil.bin.hexer-tmp", "evil.bin.backup.tmp"}) {
+        fs::create_symlink(from_u8(victim), from_u8(t.file(name)), ec);
+        if (ec) {
+            MESSAGE("symlinks unavailable here, skipped: " << ec.message());
+            return;
+        }
+    }
+    auto d = Document::open_file(file);
+    REQUIRE(d);
+    const uint8_t x = 'X';
+    REQUIRE(d->overwrite(0, &x, 1));  // in place: first save copies the original to .backup
+    std::string err;
+    REQUIRE(d->save(nullptr, &err));
+    CHECK(read_file(victim) == str_bytes("precious"));
+    REQUIRE(d->insert(0, &x, 1));     // size change: rewrite through .hexer-tmp
+    REQUIRE(d->save(nullptr, &err));
+    CHECK(read_file(victim) == str_bytes("precious"));
+    CHECK(read_file(file) == str_bytes("XXbcdef"));
+    CHECK_FALSE(fs::is_symlink(from_u8(file)));
+    CHECK(read_file(file + ".backup") == str_bytes("abcdef"));
+}
+
 TEST_CASE("document: devices never take the rewrite path") {
 #ifdef _WIN32
     const std::string dev = "\\\\.\\NUL";

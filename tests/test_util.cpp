@@ -166,6 +166,17 @@ TEST_CASE("parse_offset: errors") {
     off_err("#");
     off_err("0x10)");
     CHECK(off_err("(0x10") == "missing ')'");
+    // Deep nesting (pasted text) is an error, not a stack overflow.
+    CHECK(off_err(std::string(100000, '(') + "1") == "expression nested too deeply");
+    CHECK(off_err("1+" + std::string(100000, '-') + "1") == "expression nested too deeply");
+    CHECK(off_err(std::string(100000, '-') + "1") == "expression nested too deeply");
+    {
+        std::string ok = std::string(200, '(') + "0x10" + std::string(200, ')');
+        std::string e;
+        uint64_t v = 0;
+        CHECK(parse_offset(ok, 0, 0x1000, true, v, &e));
+        CHECK(v == 0x10);
+    }
     off_err("zz");
     off_err("abc", 0, 0x1000, false);  // not decimal
     off_err("12h3");
