@@ -1,11 +1,18 @@
 #include <doctest/doctest.h>
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <string>
+#include <system_error>
 #include <vector>
 
 #include "core/document.h"
+#include "core/inspector.h"
 #include "core/nav.h"
+#include "core/settings.h"
 
 using namespace hx;
 
@@ -138,10 +145,12 @@ TEST_CASE("nav: decode_pointer widths and endianness") {
     CHECK(t == 0x20);
     CHECK(!decode_pointer(*doc, 8, 4, false, 0, t));  // LE 0x20000000
 
-    // invalid widths
+    // invalid widths (3 is valid: u24)
     CHECK(!decode_pointer(*doc, 0, 0, false, 0, t));
-    CHECK(!decode_pointer(*doc, 0, 3, false, 0, t));
+    CHECK(!decode_pointer(*doc, 0, 5, false, 0, t));
     CHECK(!decode_pointer(*doc, 0, 16, false, 0, t));
+    CHECK(decode_pointer(*doc, 0, 3, false, 0, t));
+    CHECK(t == 0x10);
 }
 
 TEST_CASE("nav: decode_pointer multi-byte values are assembled in the right order") {
@@ -205,4 +214,209 @@ TEST_CASE("nav: decode_pointer reads edited bytes") {
     REQUIRE(doc->insert(0, &ins, 1));  // shifts the pointer to offset 3
     CHECK(decode_pointer(*doc, 3, 2, false, 0, t));
     CHECK(t == 12);
+}
+
+// =============================================================================================
+// PointerType: width 3, signed, relative
+// =============================================================================================
+
+namespace {
+
+PointerType ptype(int width, bool sgn = false, bool be = false, bool rel = false, uint64_t base = 0) {
+    PointerType p;
+    p.width = width;
+    p.is_signed = sgn;
+    p.big_endian = be;
+    p.relative = rel;
+    p.base = base;
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("nav: decode_pointer 24-bit, both byte orders") {
+    std::vector<uint8_t> b(0x20000, 0);
+    b[0] = 0x56;
+    b[1] = 0x34;
+    b[2] = 0x01;  // LE 0x013456, BE 0x563401 (beyond EOF)
+    auto doc = make_doc(b);
+    uint64_t t = 0;
+    CHECK(decode_pointer(*doc, 0, ptype(3), t));
+    CHECK(t == 0x013456);
+    CHECK(!decode_pointer(*doc, 0, ptype(3, false, true), t));
+    CHECK(decode_pointer(*doc, 0, ptype(3, false, true, false, 0x550000), t));
+    CHECK(t == 0x013401);
+    // the old overload accepts width 3 as well
+    CHECK(decode_pointer(*doc, 0, 3, false, 0, t));
+    CHECK(t == 0x013456);
+    // needs 3 bytes before EOF
+    CHECK(decode_pointer(*doc, b.size() - 3, ptype(3), t));
+    CHECK(t == 0);
+    CHECK(!decode_pointer(*doc, b.size() - 2, ptype(3), t));
+}
+
+TEST_CASE("nav: decode_pointer signed absolute values below 0 cannot be followed") {
+    std::vector<uint8_t> b(64, 0);
+    b[0] = 0xFF;  // s8 -1
+    b[1] = 0x10;  // s8 +16
+    b[4] = 0xFE;  // s24 LE -2, u24 0xFFFFFE
+    b[5] = 0xFF;
+    b[6] = 0xFF;
+    b[8] = 0x7F;  // s8 +127 (beyond EOF)
+    auto doc = make_doc(b);
+    uint64_t t = 99;
+    CHECK(!decode_pointer(*doc, 0, ptype(1, true), t));
+    CHECK(t == 99);
+    CHECK(decode_pointer(*doc, 1, ptype(1, true), t));
+    CHECK(t == 16);
+    CHECK(!decode_pointer(*doc, 4, ptype(3, true), t));
+    CHECK(!decode_pointer(*doc, 4, ptype(3, false), t));  // unsigned: ~16 MiB, beyond EOF
+    // an unsigned value minus a base still works; a negative signed one never does
+    CHECK(decode_pointer(*doc, 4, ptype(3, false, false, false, 0xFFFFF0), t));
+    CHECK(t == 0x0E);
+    CHECK(!decode_pointer(*doc, 4, ptype(3, true, false, false, 0xFFFFF0), t));
+    CHECK(!decode_pointer(*doc, 8, ptype(1, true), t));
+    // s64 -1, s16 BE -1
+    std::vector<uint8_t> m(16, 0xFF);
+    auto dm = make_doc(m);
+    CHECK(!decode_pointer(*dm, 0, ptype(8, true), t));
+    CHECK(!decode_pointer(*dm, 0, ptype(2, true, true), t));
+}
+
+TEST_CASE("nav: decode_pointer relative pointers go forward and backward") {
+    std::vector<uint8_t> b(256, 0);
+    b[16] = 0x10;  // +16 -> 32
+    b[40] = 0xF0;  // s8 -16 -> 24 ; u8 240 -> 280 (beyond EOF)
+    b[64] = 0xC0;  // s32 LE -64 -> 0
+    b[65] = 0xFF;
+    b[66] = 0xFF;
+    b[67] = 0xFF;
+    b[80] = 0xAF;  // s32 LE -81 -> before 0
+    b[81] = 0xFF;
+    b[82] = 0xFF;
+    b[83] = 0xFF;
+    b[96] = 0xFF;  // s24 BE -96 -> 0
+    b[97] = 0xFF;
+    b[98] = 0xA0;
+    b[120] = 0x88;  // u8 +136 -> 256 == EOF (allowed)
+    b[121] = 0x88;  // +136 -> 257 beyond EOF
+    b[150] = 0x00;  // s16 BE 0x0020 -> 182
+    b[151] = 0x20;
+    auto doc = make_doc(b);
+    uint64_t t = 0;
+    CHECK(decode_pointer(*doc, 16, ptype(1, false, false, true), t));
+    CHECK(t == 32);
+    CHECK(decode_pointer(*doc, 40, ptype(1, true, false, true), t));
+    CHECK(t == 24);
+    CHECK(!decode_pointer(*doc, 40, ptype(1, false, false, true), t));
+    CHECK(decode_pointer(*doc, 64, ptype(4, true, false, true), t));
+    CHECK(t == 0);
+    t = 7;
+    CHECK(!decode_pointer(*doc, 80, ptype(4, true, false, true), t));  // would be before offset 0
+    CHECK(t == 7);
+    CHECK(decode_pointer(*doc, 96, ptype(3, true, true, true), t));
+    CHECK(t == 0);
+    CHECK(!decode_pointer(*doc, 96, ptype(3, true, false, true), t));  // LE 0xA0FFFF: far forward
+    CHECK(decode_pointer(*doc, 120, ptype(1, false, false, true), t));
+    CHECK(t == 256);
+    CHECK(!decode_pointer(*doc, 121, ptype(1, false, false, true), t));
+    CHECK(decode_pointer(*doc, 150, ptype(2, true, true, true), t));
+    CHECK(t == 182);
+    CHECK(!decode_pointer(*doc, 150, ptype(2, true, false, true), t));  // LE 0x2000: beyond EOF
+    // relative ignores the base
+    CHECK(decode_pointer(*doc, 16, ptype(1, false, false, true, 0x1000), t));
+    CHECK(t == 32);
+    // a zero value points at the pointer itself
+    CHECK(decode_pointer(*doc, 0, ptype(4, true, false, true), t));
+    CHECK(t == 0);
+}
+
+TEST_CASE("nav: decode_pointer relative 64-bit overflow and underflow") {
+    std::vector<uint8_t> b(32, 0);
+    // at 8: u64 LE 0xFFFFFFFFFFFFFFFF: unsigned at + value passes 2^64, signed it is -1 -> 7
+    for (size_t i = 8; i < 16; ++i) b[i] = 0xFF;
+    // at 16: s64 LE INT64_MIN (0x8000000000000000): magnitude 2^63, far before 0
+    b[23] = 0x80;
+    auto doc = make_doc(b);
+    uint64_t t = 0;
+    CHECK(!decode_pointer(*doc, 8, ptype(8, false, false, true), t));
+    CHECK(decode_pointer(*doc, 8, ptype(8, true, false, true), t));
+    CHECK(t == 7);
+    CHECK(!decode_pointer(*doc, 16, ptype(8, true, false, true), t));
+    CHECK(!decode_pointer(*doc, 16, ptype(8, false, false, true), t));  // +2^63: beyond EOF
+    CHECK(!decode_pointer(*doc, 16, ptype(8, true), t));                // negative absolute
+    // big-endian -8 at 24 -> 16
+    std::vector<uint8_t> c(32, 0);
+    for (size_t i = 24; i < 31; ++i) c[i] = 0xFF;
+    c[31] = 0xF8;
+    auto dc = make_doc(c);
+    CHECK(decode_pointer(*dc, 24, ptype(8, true, true, true), t));
+    CHECK(t == 16);
+}
+
+TEST_CASE("nav: pointer_type_name and pointer_link_text") {
+    CHECK(pointer_type_name(ptype(1)) == "u8");
+    CHECK(pointer_type_name(ptype(1, true, true)) == "s8");
+    CHECK(pointer_type_name(ptype(2)) == "u16 LE");
+    CHECK(pointer_type_name(ptype(3, true, true)) == "s24 BE");
+    CHECK(pointer_type_name(ptype(4, true, false, true)) == "s32 LE rel");
+    CHECK(pointer_type_name(ptype(8, false, false, false, 0x140000000ull)) == "u64 LE, base 0x140000000");
+    CHECK(pointer_type_name(ptype(8, false, false, false, 0xABCull), false) == "u64 LE, base 0xabc");
+    CHECK(pointer_type_name(ptype(4, false, false, true, 0x1000)) == "u32 LE rel");  // base unused
+    CHECK(pointer_link_text(ptype(2), true, 0x1234) == "u16 LE \xE2\x86\x92 0x1234");
+    CHECK(pointer_link_text(ptype(2), true, 0xAB, false) == "u16 LE \xE2\x86\x92 0xab");
+    CHECK(pointer_link_text(ptype(4, true), false, 0).rfind("s32 LE \xE2\x86\x92 nothing to follow", 0) == 0);
+}
+
+TEST_CASE("nav: valid_pointer_width") {
+    for (int w : {1, 2, 3, 4, 8}) CHECK(valid_pointer_width(w));
+    for (int w : {-1, 0, 5, 6, 7, 9, 16}) CHECK(!valid_pointer_width(w));
+}
+
+TEST_CASE("nav: Inspector integer rows map to pointer types") {
+    int w = 0;
+    bool s = false;
+    CHECK(insp_int_type(InspType::U8, w, s));
+    CHECK((w == 1 && !s));
+    CHECK(insp_int_type(InspType::I24, w, s));
+    CHECK((w == 3 && s));
+    CHECK(insp_int_type(InspType::U64, w, s));
+    CHECK((w == 8 && !s));
+    for (InspType t : {InspType::Bin8, InspType::F32, InspType::Ascii, InspType::ULEB128, InspType::Unix32,
+                       InspType::Guid})
+        CHECK(!insp_int_type(t, w, s));
+    int n = 0;
+    for (int i = 0; i < int(InspType::Count); ++i) {
+        if (!insp_int_type(InspType(i), w, s)) continue;
+        ++n;
+        CHECK(insp_type_of_int(w, s) == InspType(i));
+    }
+    CHECK(n == 10);
+    CHECK(insp_type_of_int(5, false) == InspType::Count);
+    CHECK(insp_type_of_int(2, true) == InspType::I16);
+}
+
+TEST_CASE("nav: settings follow pointer type round trip") {
+    std::error_code ec;
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path(ec) /
+        ("hexer_nav_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    REQUIRE(std::filesystem::create_directories(dir, ec));
+    const std::string f = (dir / "settings.ini").string();
+    Settings def;
+    CHECK(def.pointer_type() == PointerType{});
+    Settings s;
+    s.pointer_width = 3;
+    s.pointer_signed = true;
+    s.pointer_relative = true;
+    s.big_endian_inspector = true;
+    s.pointer_base = 0x400000;
+    REQUIRE(s.save(f));
+    Settings u;
+    REQUIRE(u.load(f));
+    CHECK(u.pointer_width == 3);
+    CHECK(u.pointer_signed);
+    CHECK(u.pointer_relative);
+    CHECK(u.pointer_type() == ptype(3, true, true, true, 0x400000));
+    std::filesystem::remove_all(dir, ec);
 }

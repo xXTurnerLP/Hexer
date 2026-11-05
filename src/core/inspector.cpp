@@ -816,4 +816,21 @@ bool inspector_encode(InspType type, const std::string& text, bool big_endian, s
     }
 }
 
+bool insp_int_type(InspType type, int& width, bool& is_signed) {
+    IntInfo ii{};
+    if (!int_info(type, ii)) return false;
+    width = int(ii.bytes);
+    is_signed = ii.is_signed;
+    return true;
+}
+
+InspType insp_type_of_int(int width, bool is_signed) {
+    for (int i = 0; i < int(InspType::Count); ++i) {
+        int w = 0;
+        bool s = false;
+        if (insp_int_type(InspType(i), w, s) && w == width && s == is_signed) return InspType(i);
+    }
+    return InspType::Count;
+}
+
 }  // namespace hx

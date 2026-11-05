@@ -345,6 +345,7 @@ struct TextRun {
 };
 
 constexpr uint32_t kLinkColor = IM_COL32(0x6c, 0xa4, 0xff, 0xff);  // follow-pointer underline
+constexpr uint32_t kMarkColor = IM_COL32(0xff, 0xc4, 0x5c, 0xff);  // cfg.mark_* outline
 
 uint32_t with_alpha(uint32_t c, uint32_t a) { return (c & 0x00FFFFFFu) | (a << 24); }
 
@@ -397,6 +398,32 @@ void underline_range(ImDrawList* dl, const Layout& L, uint64_t top, uint64_t dra
         const float t = std::max(1.0f, std::floor(L.font_px / 12.0f));
         dl->AddRectFilled(ImVec2(L.hex_byte_x(a), y), ImVec2(L.hex_byte_x(b - 1) + 2.0f * L.adv, y + t), color);
         if (L.ascii) dl->AddRectFilled(ImVec2(L.text_byte_x(a), y), ImVec2(L.text_byte_x(b), y + t), color);
+    }
+}
+
+// Outlines [begin, end) in the visible rows, hex and text column: one box per row piece, open
+// where the range continues on the next / previous row.
+void outline_range(ImDrawList* dl, const Layout& L, uint64_t top, uint64_t draw_rows, uint64_t begin,
+                   uint64_t end, uint32_t color) {
+    if (end <= begin || draw_rows == 0) return;
+    const uint64_t bpr = uint64_t(L.bpr);
+    uint64_t first = std::max(begin / bpr, top);
+    uint64_t last = std::min((end - 1) / bpr, top + draw_rows - 1);
+    const float th = std::max(1.0f, std::floor(L.font_px / 10.0f));
+    for (uint64_t row = first; row <= last; ++row) {
+        uint64_t rs = row * bpr;
+        int a = int(std::max(begin, rs) - rs);
+        int b = int(std::min(end, rs + bpr) - rs);  // exclusive
+        const bool open_l = rs + uint64_t(a) != begin, open_r = rs + uint64_t(b) != end;
+        const float y0 = L.row_y(row, top) + 0.5f, y1 = y0 + L.line_h - 1.0f;
+        auto box = [&](float x0, float x1) {
+            dl->AddLine(ImVec2(x0, y0), ImVec2(x1, y0), color, th);
+            dl->AddLine(ImVec2(x0, y1), ImVec2(x1, y1), color, th);
+            if (!open_l) dl->AddLine(ImVec2(x0, y0), ImVec2(x0, y1), color, th);
+            if (!open_r) dl->AddLine(ImVec2(x1, y0), ImVec2(x1, y1), color, th);
+        };
+        box(std::floor(L.hex_byte_x(a) - 0.5f * L.adv) + 0.5f, std::floor(L.hex_byte_x(b - 1) + 2.5f * L.adv) - 0.5f);
+        if (L.ascii) box(L.text_byte_x(a), L.text_byte_x(b));
     }
 }
 
@@ -620,7 +647,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             // Follow pointer: the app jumps (and records history); the caret stays put.
             dragging_select_ = false;
             uint64_t t = 0;
-            if (decode_pointer(doc, h.off, cfg.pointer_width, cfg.pointer_big_endian, cfg.pointer_base, t)) {
+            if (decode_pointer(doc, h.off, cfg.pointer_type(), t)) {
                 ev.follow_requested = true;
                 ev.follow_target = t;
                 ev.follow_from = h.off;
@@ -962,6 +989,12 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                         txt_active ? 2.0f : 1.0f);
     }
 
+    // Mark (e.g. the Inspector's type at its decode position): an outline in both columns.
+    if (cfg.mark_length && cfg.mark_offset < size) {
+        const uint64_t e = cfg.mark_length > size - cfg.mark_offset ? size : cfg.mark_offset + cfg.mark_length;
+        outline_range(dl, L, top, draw_rows, cfg.mark_offset, e, kMarkColor);
+    }
+
     // Bookmark markers in the offset gutter.
     for (const Bookmark& bm : v.bookmarks) {
         uint64_t row = bm.offset / bpr;
@@ -991,8 +1024,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                 dl->AddRect(ImVec2(L.text_byte_x(col), y0), ImVec2(L.text_byte_x(col) + L.adv, y1), C.hover, 2.0f);
             if (io.KeyCtrl && !io.KeyShift && !dragging_select_) {
                 link = true;
-                link_ok = decode_pointer(doc, hover.off, cfg.pointer_width, cfg.pointer_big_endian,
-                                         cfg.pointer_base, link_target);
+                link_ok = decode_pointer(doc, hover.off, cfg.pointer_type(), link_target);
                 const uint64_t w = uint64_t(std::clamp(cfg.pointer_width, 1, 8));
                 const uint64_t end = w > size - hover.off ? size : hover.off + w;
                 underline_range(dl, L, top, draw_rows, hover.off, end, link_ok ? kLinkColor : C.unreadable_text);
@@ -1052,16 +1084,9 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     if (link && !ImGui::IsAnyMouseDown()) {
         ImGui::PushFont(ui_font, ui_font_size);
         ImGui::BeginTooltip();
-        if (link_ok)
-            ImGui::Text(cfg.uppercase ? "\xE2\x86\x92 0x%llX  (Ctrl+click to follow)"
-                                      : "\xE2\x86\x92 0x%llx  (Ctrl+click to follow)",
-                        (unsigned long long)link_target);
-        else
-            ImGui::TextUnformatted("\xE2\x86\x92 beyond EOF");  // U+2192
-        std::string kind = "u" + std::to_string(std::clamp(cfg.pointer_width, 1, 8) * 8) +
-                           (cfg.pointer_big_endian ? " big-endian" : " little-endian");
-        if (cfg.pointer_base) kind += ", base 0x" + fmt_hex(cfg.pointer_base, 1, cfg.uppercase);
-        ImGui::TextDisabled("%s", kind.c_str());
+        ImGui::TextUnformatted(pointer_link_text(cfg.pointer_type(), link_ok, link_target, cfg.uppercase).c_str());
+        ImGui::TextDisabled("%s", link_ok ? "Ctrl+click to follow  (type: click an integer row in the Inspector)"
+                                          : "Type: click an integer row in the Inspector");
         ImGui::EndTooltip();
         ImGui::PopFont();
     } else if (tooltip_hover && ev.has_hover && !dragging_select_ && !dragging_scrollbar_ && !ImGui::IsAnyMouseDown()) {

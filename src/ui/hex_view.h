@@ -9,6 +9,7 @@
 
 #include "core/document.h"
 #include "core/highlight.h"
+#include "core/nav.h"
 
 struct ImFont;
 struct ImVec2;
@@ -51,11 +52,35 @@ struct HexViewConfig {
     // Extra scrollbar tick marks (e.g. Find All hits): sorted offsets, drawn at most one per pixel.
     const std::vector<uint64_t>* tick_offsets = nullptr;
     uint32_t tick_color = 0;
-    // Follow pointer (Ctrl+hover / Ctrl+click): the hovered byte starts an unsigned integer of
-    // pointer_width bytes (1, 2, 4, 8); the target offset is value - pointer_base (core/nav.h).
+    // Follow pointer (Ctrl+hover / Ctrl+click): the hovered byte starts an integer of
+    // pointer_width bytes (1, 2, 3, 4, 8), sign-extended if pointer_signed; the target offset is
+    // value - pointer_base, or with pointer_relative the byte's offset + value (core/nav.h PointerType).
     int pointer_width = 4;
     bool pointer_big_endian = false;
     uint64_t pointer_base = 0;
+    bool pointer_signed = false;
+    bool pointer_relative = false;
+    // Outlined bytes [mark_offset, mark_offset + mark_length) in both columns, e.g. what the
+    // Inspector's hovered / selected type covers at its decode position. 0 length = none.
+    uint64_t mark_offset = 0;
+    uint64_t mark_length = 0;
+
+    PointerType pointer_type() const {
+        PointerType t;
+        t.width = pointer_width;
+        t.is_signed = pointer_signed;
+        t.big_endian = pointer_big_endian;
+        t.relative = pointer_relative;
+        t.base = pointer_base;
+        return t;
+    }
+    void set_pointer_type(const PointerType& t) {
+        pointer_width = t.width;
+        pointer_signed = t.is_signed;
+        pointer_big_endian = t.big_endian;
+        pointer_relative = t.relative;
+        pointer_base = t.base;
+    }
 };
 
 // Pixel geometry of the last draw() (screen coordinates), for tests and automation.
@@ -98,7 +123,8 @@ struct HexViewEvents {
 // inclusive; a click on the second hex digit puts the caret on the low nibble; a click below the
 // last row or past the last byte puts the caret at EOF), Shift+click extends from the selection's
 // fixed end, double-click selects the highlight (field) under the mouse, Ctrl+hover underlines the
-// pointer (cfg.pointer_*) starting at the hovered byte with a tooltip of its target and Ctrl+click
+// pointer (cfg.pointer_type()) starting at the hovered byte with a tooltip of its type and target
+// (pointer_link_text, e.g. "u16 LE -> 0x1234") and Ctrl+click
 // on a byte reports ev.follow_requested instead of moving the caret (nothing for a pointer that is
 // unreadable or points beyond EOF), mouse X1/X2 set ev.nav_back / nav_forward, wheel scrolls
 // 3 rows (Ctrl+wheel is left to the app for zoom), dragging the custom scrollbar maps linearly to

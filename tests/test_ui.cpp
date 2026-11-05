@@ -656,6 +656,78 @@ TEST_CASE("ui: ctrl+click on a pointer beyond EOF or cut off by EOF does nothing
     CHECK(!ev.follow_requested);
 }
 
+TEST_CASE("ui: ctrl+click follows every pointer width, signedness and relative mode") {
+    Ui ui(iota_bytes(200));
+    ui.click(ui.hex(3));
+    REQUIRE(ui.v().cursor == 3);
+    auto follow = [&](uint64_t at, int width, bool sgn, bool be, bool rel, uint64_t& target) {
+        PointerType pt;
+        pt.width = width;
+        pt.is_signed = sgn;
+        pt.big_endian = be;
+        pt.relative = rel;
+        ui.cfg.set_pointer_type(pt);
+        CHECK(ui.cfg.pointer_type() == pt);
+        HexViewEvents ev = press_events(ui, ui.hex(at), ImGuiMod_Ctrl);
+        target = ev.follow_target;
+        if (ev.follow_requested) CHECK(ev.follow_from == at);
+        return ev.follow_requested;
+    };
+    uint64_t t = 0;
+    // u8 / s8
+    put(ui, 10, {0x90});
+    CHECK(follow(10, 1, false, false, false, t));
+    CHECK(t == 0x90);
+    CHECK(!follow(10, 1, true, false, false, t));  // -112: negative absolute
+    CHECK(!follow(10, 1, true, false, true, t));   // 10 - 112 < 0: before the file start
+    put(ui, 120, {0x90});
+    CHECK(follow(120, 1, true, false, true, t));  // 120 - 112
+    CHECK(t == 8);
+    CHECK(!follow(120, 1, false, false, true, t));  // 120 + 144 beyond EOF
+    // u16 LE / BE, relative forward
+    put(ui, 20, {0x10, 0x00});
+    CHECK(follow(20, 2, false, false, false, t));
+    CHECK(t == 0x10);
+    CHECK(!follow(20, 2, false, true, false, t));  // 0x1000
+    CHECK(follow(20, 2, false, false, true, t));
+    CHECK(t == 36);
+    // 24-bit
+    put(ui, 30, {0x40, 0x00, 0x00});
+    CHECK(follow(30, 3, false, false, false, t));
+    CHECK(t == 0x40);
+    put(ui, 40, {0xFF, 0xFF, 0xF8});
+    CHECK(follow(40, 3, true, true, true, t));  // s24 BE -8
+    CHECK(t == 32);
+    CHECK(!follow(40, 3, true, true, false, t));
+    CHECK(!follow(40, 3, false, true, true, t));
+    // s32 relative backwards, s64 relative
+    put(ui, 60, {0xF6, 0xFF, 0xFF, 0xFF});  // -10
+    CHECK(follow(60, 4, true, false, true, t));
+    CHECK(t == 50);
+    CHECK(!follow(60, 4, false, false, true, t));
+    put(ui, 80, {0x14, 0, 0, 0, 0, 0, 0, 0});  // +20
+    CHECK(follow(80, 8, true, false, true, t));
+    CHECK(t == 100);
+    CHECK(follow(80, 8, false, false, false, t));
+    CHECK(t == 20);
+    CHECK(ui.v().cursor == 3);  // never moves the caret
+}
+
+TEST_CASE("ui: the mark outline is drawn without touching the selection") {
+    Ui ui(iota_bytes(64));
+    ui.click(ui.hex(5));
+    ui.cfg.mark_offset = 5;
+    ui.cfg.mark_length = 4;
+    ui.frame();
+    ui.cfg.mark_offset = 14;  // across a row end, clipped at EOF further down
+    ui.cfg.mark_length = 1000;
+    ui.frame();
+    ui.cfg.mark_offset = 64;  // at EOF: nothing
+    ui.frame();
+    CHECK(ui.v().cursor == 5);
+    CHECK(!ui.v().has_selection());
+}
+
 TEST_CASE("ui: plain and shift clicks are unaffected by follow pointer") {
     Ui ui(iota_bytes(100));
     put(ui, 8, {0x20, 0x00, 0x00, 0x00});

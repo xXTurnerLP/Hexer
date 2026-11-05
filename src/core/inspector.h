@@ -38,4 +38,10 @@ std::vector<InspRow> inspect(const uint8_t* data, size_t avail, bool big_endian)
 bool inspector_encode(InspType type, const std::string& text, bool big_endian,
                       std::vector<uint8_t>& out, std::string* err = nullptr);
 
+// The integer rows (I8/U8 ... I64/U64) double as follow-pointer types (core/nav.h PointerType):
+// their width (1, 2, 3, 4, 8) and signedness. False for every other row (Bin8, floats, text...).
+bool insp_int_type(InspType type, int& width, bool& is_signed);
+// The integer row of a width / signedness; InspType::Count if there is none.
+InspType insp_type_of_int(int width, bool is_signed);
+
 }  // namespace hx
