@@ -213,12 +213,16 @@ jobs:
           path: subprojects/packagecache
           key: wraps-${{ hashFiles('subprojects/*.wrap') }}
 
+      # FreeType from the wrap (static) too, so the binary needs no libfreetype at run time.
+      # -Wno-restrict: GCC 12's false positive in <string> at -O3 (GCC bug 105329, fixed in 13;
+      # the GCC 13 / Clang jobs above keep it). nfd's portal backend is third-party: no warnings.
       - name: Setup
         run: |
           set +e
           CC=gcc-12 CXX=g++-12 meson setup build --buildtype=release -Dtests=false -Dwerror=false \
-            -Db_colorout=never --force-fallback-for=lua --prefix=/usr \
+            -Db_colorout=never --force-fallback-for=lua,freetype2 --prefix=/usr \
             -Dnativefiledialog-extended:xdg-desktop-portal=enabled \
+            -Dnativefiledialog-extended:warning_level=0 -Dcpp_args=-Wno-restrict \
             -Dcpp_link_args="-static-libstdc++ -static-libgcc" 2>&1 | tee setup.log
           rc=${PIPESTATUS[0]}
           if [ $rc -ne 0 ]; then
