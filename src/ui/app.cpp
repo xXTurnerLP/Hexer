@@ -29,6 +29,9 @@
 #include "core/util.h"
 #include "ui/app_internal.h"
 #include "ui/panels.h"
+#ifndef _WIN32
+#include "ui/icon_data.h"
+#endif
 
 namespace hx {
 
@@ -2864,6 +2867,24 @@ GLFWwindow* create_window() {
     return glfwCreateWindow(1440, 900, "Hexer", nullptr, nullptr);
 }
 
+// Window/taskbar icon. Windows: GLFW picks up the exe's GLFW_ICON resource (src/hexer.rc) by itself.
+// X11: set from the embedded pixels. Wayland has no client-set icons (the .desktop file's Icon= is used).
+void set_window_icon(GLFWwindow* w) {
+#ifdef _WIN32
+    (void)w;
+#else
+    if (glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) return;
+    auto px = [](const uint8_t* p) { return const_cast<unsigned char*>(p); };
+    GLFWimage imgs[] = {
+        {icon::k16Size, icon::k16Size, px(icon::k16)},
+        {icon::k32Size, icon::k32Size, px(icon::k32)},
+        {icon::k48Size, icon::k48Size, px(icon::k48)},
+        {icon::k64Size, icon::k64Size, px(icon::k64)},
+    };
+    glfwSetWindowIcon(w, int(sizeof(imgs) / sizeof(imgs[0])), imgs);
+#endif
+}
+
 }  // namespace
 
 // =============================================================================================
@@ -2890,6 +2911,7 @@ int run_app(const AppOptions& opts) {
         glfwTerminate();
         return 1;
     }
+    set_window_icon(app.window);
     glfwMakeContextCurrent(app.window);
     glfwSwapInterval(1);
     glfwSetWindowUserPointer(app.window, &app);

@@ -31,7 +31,9 @@ scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts li
              <config>/scripts and override bundled ones by name
 tests/       doctest; one exe per module: test_core, test_util, test_script, test_search,
              test_ui (headless ImGui: drives HexView with simulated mouse/keyboard)
-tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion)
+tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
+             make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there)
+assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file
 ```
 Headers are the module contracts. Changing a public signature means updating every caller —
 grep before you change one. Adding members is fine.

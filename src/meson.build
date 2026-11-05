@@ -54,10 +54,11 @@ ui_lib = static_library('hexer_ui',
 hexer_src = ['main.cpp']
 hexer_link_args = []
 if host_machine.system() == 'windows'
-  # Application manifest (UTF-8 active code page, Win10/11, per-monitor DPI v2).
+  # App icon + manifest (UTF-8 active code page, Win10/11, per-monitor DPI v2).
   windows = import('windows')
-  hexer_src += windows.compile_resources('hexer.rc', depend_files : 'hexer.manifest',
-    include_directories : include_directories('.'))
+  hexer_src += windows.compile_resources('hexer.rc',
+    depend_files : ['hexer.manifest', '../assets/icon/hexer.ico'],
+    include_directories : include_directories('.', '../assets/icon'))
   if cpp.get_argument_syntax() == 'msvc'  # MSVC and clang-cl (link.exe / lld-link)
     hexer_link_args += ['/MANIFEST:NO']  # ours is the only one (no linker-generated manifest)
   endif
@@ -78,3 +79,12 @@ hexer_exe = executable('hexer',
 )
 
 install_subdir(meson.project_source_root() / 'scripts', install_dir : get_option('bindir'))
+
+# Linux desktop integration: launcher entry + hicolor theme icons.
+if host_machine.system() == 'linux'
+  install_data('../assets/hexer.desktop', install_dir : get_option('datadir') / 'applications')
+  foreach s : [16, 24, 32, 48, 64, 128, 256]
+    install_data('../assets/icon/hexer-@0@.png'.format(s), rename : 'hexer.png',
+      install_dir : get_option('datadir') / 'icons' / 'hicolor' / '@0@x@0@'.format(s) / 'apps')
+  endforeach
+endif

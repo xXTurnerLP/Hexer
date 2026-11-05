@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hexer
+GenericName=Hex Editor
+Comment=Hex editor for binary analysis with Lua protocol parsers
+Exec=hexer %F
+Icon=hexer
+Terminal=false
+Categories=Development;Utility;
+MimeType=application/octet-stream;
+StartupWMClass=Hexer
