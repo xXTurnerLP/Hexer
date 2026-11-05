@@ -55,6 +55,9 @@ tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
              make_pcap.py (demo pcapng with HXP packets for the Packets panel)
 assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file
+.github/     CI (workflows/ci.yml): release builds + tests on GCC / Clang / MSVC; packages
+             (Windows zip, Linux AppImage on ubuntu-22.04 + tar.gz) as 7-day artifacts, smoke-tested
+             by ci/smoke-package.sh (source scripts/ moved away); `v*` tags publish a GitHub Release
 ```
 Headers are the module contracts. Changing a public signature means updating every caller —
 grep before you change one. Adding members is fine.

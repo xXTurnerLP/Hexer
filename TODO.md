@@ -110,7 +110,9 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Settings: remember the Bookmarks panel's "All open files" toggle
 - [ ] Headless App-level tests (session extras round trip of split / tail / parse at / Compare,
       the History and XOR panels' clicks): app.cpp is not linked by any test exe yet
-- [ ] Linux CI + AppImage; Windows portable zip
+- [x] Linux CI + AppImage; Windows portable zip (CI artifacts on every push, GitHub Release on
+      `v*` tags; each package is smoke-tested with its own bundled scripts)
+- [ ] Linux packages: AppStream metainfo in the AppImage; an aarch64 build
 - [ ] Compile the visual-analysis / compare / capture batch with GCC and Clang (written for
       -Wall -Wextra but only built with MSVC so far)
 - [ ] Run parsers on a worker thread over a Snapshot (a parse slower than ~50 ms is currently

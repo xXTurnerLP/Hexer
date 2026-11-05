@@ -19,9 +19,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++,     matcher: gcc-matcher.json,  owner: hexer-gcc,  package: true }
-          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++, matcher: gcc-matcher.json,  owner: hexer-gcc,  package: false }
-          - { name: windows-msvc, os: windows-2025, cc: '',    cxx: '',      matcher: msvc-matcher.json, owner: hexer-msvc, package: true }
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++,     matcher: gcc-matcher.json,  owner: hexer-gcc }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++, matcher: gcc-matcher.json,  owner: hexer-gcc }
+          - { name: windows-msvc, os: windows-2025, cc: '',    cxx: '',      matcher: msvc-matcher.json, owner: hexer-msvc }
     defaults:
       run:
         shell: bash
@@ -115,34 +115,216 @@ jobs:
             exit 1
           fi
 
+      # Windows portable zip from this build (release, static CRT via the project default
+      # b_vscrt=static_from_buildtype): hexer/{hexer.exe, scripts/, README.md}. The app finds its
+      # bundled scripts in <exe dir>/scripts.
+      - name: Package (Windows)
+        id: package
+        if: runner.os == 'Windows' && steps.compile.outcome == 'success'
+        run: |
+          rm -rf dist && mkdir -p dist/hexer
+          cp build/src/hexer.exe README.md dist/hexer/
+          cp -r scripts dist/hexer/
+          (cd dist && 7z a -bso0 ../hexer-windows-x64.zip hexer)
+          7z l hexer-windows-x64.zip
+
+      - name: Check DLL dependencies (Windows)
+        if: runner.os == 'Windows' && steps.package.outcome == 'success'
+        run: |
+          vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          dumpbin=$("$vswhere" -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' \
+            | head -n 1 | tr -d '\r')
+          "$dumpbin" -nologo -dependents dist/hexer/hexer.exe | tee deps.txt
+          dlls=$(grep -iE '^ +[A-Za-z0-9_.-]+\.dll *$' deps.txt | tr -d ' \r')
+          bad=""
+          for d in $dlls; do
+            case "${d,,}" in
+              vcruntime*|msvcp*|ucrtbase*|api-ms-win-crt-*|concrt*|vcomp*) bad="$bad $d" ;;
+              *) [ -f "/c/Windows/System32/$d" ] || bad="$bad $d" ;;
+            esac
+          done
+          echo "::notice title=hexer.exe DLLs::$(echo $dlls)"
+          if [ -z "$dlls" ] || [ -n "$bad" ]; then
+            echo "::error title=Non-system DLL dependencies::${bad:-dumpbin listed no DLLs}"
+            exit 1
+          fi
+
+      # The runner has no OpenGL 3 driver: Mesa llvmpipe (mesa-dist-win) is put next to an unzipped
+      # test copy only (an opengl32.dll in the exe's directory wins over the system one).
+      - name: Smoke test package (Windows)
+        if: runner.os == 'Windows' && steps.package.outcome == 'success'
+        env:
+          GALLIUM_DRIVER: llvmpipe
+        run: |
+          curl -fsSL --retry 3 -o mesa.7z \
+            https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z
+          7z x -bso0 -omesa mesa.7z
+          rm -rf pkgtest && mkdir pkgtest && 7z x -bso0 -opkgtest hexer-windows-x64.zip
+          cp mesa/x64/*.dll pkgtest/hexer/
+          bash .github/ci/smoke-package.sh windows-zip pkgtest/hexer/hexer.exe
+
       - name: Upload screenshot
-        if: runner.os == 'Linux' && always()
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: screenshot-${{ matrix.name }}
           path: smoke/
+          retention-days: 7
           if-no-files-found: ignore
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux' && matrix.package
-        run: |
-          meson install -C build --destdir "$PWD/stage"
-          tar -C stage -czf hexer-linux-x86_64.tar.gz .
-          tar -tzf hexer-linux-x86_64.tar.gz
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows' && matrix.package
-        run: |
-          mkdir -p dist/hexer
-          cp build/src/hexer.exe dist/hexer/
-          cp -r scripts dist/hexer/
-          cp README.md dist/hexer/
-          cd dist && 7z a ../hexer-windows-x64.zip hexer
-
-      - name: Upload package
-        if: matrix.package
+      - name: Upload package (Windows)
+        if: runner.os == 'Windows' && steps.package.outcome == 'success'
         uses: actions/upload-artifact@v6
         with:
-          name: hexer-${{ matrix.name }}
-          path: hexer-*.*
+          name: hexer-windows-x64
+          path: hexer-windows-x64.zip
+          retention-days: 7
           if-no-files-found: error
+
+  # Linux packages, built on the oldest supported runner (glibc 2.35) so they run on older distros:
+  # an AppImage and a plain tar.gz. File dialogs use xdg-desktop-portal (D-Bus) instead of GTK, so
+  # no GTK gets bundled; libstdc++ / libgcc are linked statically.
+  package-linux:
+    name: linux-package
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install meson + ninja
+        run: python -m pip install --upgrade meson ninja
+
+      - name: Install Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential g++-12 pkg-config \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
+            libgl-dev libdbus-1-dev xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl-mesa0
+
+      - name: Cache subproject downloads
+        uses: actions/cache@v5
+        with:
+          path: subprojects/packagecache
+          key: wraps-${{ hashFiles('subprojects/*.wrap') }}
+
+      - name: Setup
+        run: |
+          set +e
+          CC=gcc-12 CXX=g++-12 meson setup build --buildtype=release -Dtests=false -Dwerror=false \
+            -Db_colorout=never --force-fallback-for=lua --prefix=/usr \
+            -Dnativefiledialog-extended:xdg-desktop-portal=enabled \
+            -Dcpp_link_args="-static-libstdc++ -static-libgcc" 2>&1 | tee setup.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            bash .github/ci/annotate.sh tail error "meson setup failed" setup.log 40
+            bash .github/ci/annotate.sh tail error "meson-log.txt (tail)" build/meson-logs/meson-log.txt 40
+          fi
+          exit $rc
+
+      - name: Compile
+        run: |
+          echo "::add-matcher::.github/ci/gcc-matcher.json"
+          set +e
+          meson compile -C build 2>&1 | tee compile.log
+          rc=${PIPESTATUS[0]}
+          echo "::remove-matcher owner=hexer-gcc::"
+          bash .github/ci/annotate.sh warnings compile.log
+          if [ $rc -ne 0 ]; then
+            bash .github/ci/annotate.sh grep error "Compile errors" compile.log \
+              'error:|FAILED:|undefined reference|multiple definition|ld returned|fatal'
+          fi
+          exit $rc
+
+      # tar.gz: hexer-linux-x86_64/{hexer, scripts/, README.md, hexer.desktop, hexer.png}.
+      # AppImage: the meson install tree (usr/bin/hexer + usr/bin/scripts, desktop file, icons).
+      # Both find their bundled scripts next to the binary (/proc/self/exe).
+      - name: Package
+        run: |
+          meson install -C build --strip --destdir "$PWD/AppDir"
+          d=dist/hexer-linux-x86_64
+          rm -rf dist && mkdir -p $d
+          cp AppDir/usr/bin/hexer README.md assets/hexer.desktop $d/
+          cp -r AppDir/usr/bin/scripts $d/
+          cp assets/icon/hexer-256.png $d/hexer.png
+          tar -C dist -czf hexer-linux-x86_64.tar.gz hexer-linux-x86_64
+          tar -tzvf hexer-linux-x86_64.tar.gz
+          echo "::notice title=hexer NEEDED::$(readelf -d $d/hexer | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
+          curl -fsSL --retry 3 -o linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          APPIMAGE_EXTRACT_AND_RUN=1 LDAI_OUTPUT=hexer-x86_64.AppImage ./linuxdeploy --appdir AppDir \
+            --executable AppDir/usr/bin/hexer \
+            --desktop-file AppDir/usr/share/applications/hexer.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/hexer.png \
+            --output appimage
+          ls -l hexer-x86_64.AppImage hexer-linux-x86_64.tar.gz
+
+      - name: Smoke test packages (Xvfb + Mesa)
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          xvfb=(xvfb-run -a -s "-screen 0 1600x1000x24")
+          rm -rf pkgtest && mkdir pkgtest && tar -C pkgtest -xzf hexer-linux-x86_64.tar.gz
+          set +e
+          bash .github/ci/smoke-package.sh linux-tar "${xvfb[@]}" pkgtest/hexer-linux-x86_64/hexer
+          rc1=$?
+          bash .github/ci/smoke-package.sh appimage "${xvfb[@]}" ./hexer-x86_64.AppImage --appimage-extract-and-run
+          rc2=$?
+          [ $rc1 -eq 0 ] && [ $rc2 -eq 0 ]
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshot-linux-package
+          path: smoke/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload tar.gz
+        uses: actions/upload-artifact@v6
+        with:
+          name: hexer-linux-x86_64
+          path: hexer-linux-x86_64.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v6
+        with:
+          name: hexer-linux-appimage
+          path: hexer-x86_64.AppImage
+          retention-days: 7
+          if-no-files-found: error
+
+  # Tags v*: attach the packages to a GitHub Release (created if it does not exist yet).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, package-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: hexer-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          tag=$GITHUB_REF_NAME
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --title "Hexer $tag" --generate-notes
+          fi
