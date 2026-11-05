@@ -23,3 +23,13 @@ test('search', test_search, timeout : 300)
 test_ui = executable('test_ui', 'test_ui.cpp', test_main,
   dependencies : [ui_view_dep, doctest_dep], cpp_args : conf_args)
 test('ui', test_ui, timeout : 300)
+
+# Feature suites (one exe each so features can be built/tested independently).
+foreach t : ['nav', 'strings', 'hash']
+  exe = executable('test_' + t, 'test_' + t + '.cpp', test_main,
+    dependencies : [core_dep, doctest_dep], cpp_args : conf_args)
+  test(t, exe, timeout : 300)
+endforeach
+test_cstruct = executable('test_cstruct', 'test_cstruct.cpp', test_main,
+  dependencies : [script_dep, doctest_dep], cpp_args : conf_args)
+test('cstruct', test_cstruct, timeout : 300)

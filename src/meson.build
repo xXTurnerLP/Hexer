@@ -12,6 +12,10 @@ core_lib = static_library('hexer_core',
   'core/inspector.cpp',
   'core/util.cpp',
   'core/settings.cpp',
+  'core/nav.cpp',            # pointer follow + jump history
+  'core/strings_scan.cpp',   # background strings extraction
+  'core/hash.cpp',           # checksums / hashes of ranges
+  'core/cstruct.cpp',        # C struct definitions -> Lua parser source
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [threads_dep],
@@ -45,6 +49,9 @@ ui_view_dep = declare_dependency(link_with : ui_view_lib, include_directories : 
 ui_lib = static_library('hexer_ui',
   'ui/panels.cpp',
   'ui/app.cpp',
+  'ui/panel_strings.cpp',
+  'ui/panel_hash.cpp',
+  'ui/dialog_cstruct.cpp',
   include_directories : inc,
   cpp_args : conf_args,
   link_with : ui_view_lib,
