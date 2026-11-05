@@ -85,6 +85,7 @@ struct Tab {
     bool disk_changed = false;
     bool ignore_valid = false;
     FileStat ignored_stat;            // "Ignore" pressed for this on-disk version
+    bool io_warned = false;           // console warning about unreadable data already shown
 
     // Highlight layers.
     HighlightSet bookmark_layer;
@@ -207,6 +208,7 @@ struct App final : ScriptHost {
     AfterSave overwrite_prompt_after = AfterSave::None;
     bool overwrite_prompt_pending = false;
     bool quit_prompt_pending = false;
+    std::vector<uint64_t> quit_prompt_docs;  // docs the quit prompt asks about (empty = all dirty)
     std::vector<MsgBox> messages;
 
     // Goto popup.
@@ -246,6 +248,12 @@ struct App final : ScriptHost {
     bool quit_requested = false;      // window close / File > Exit (waits for running save)
     bool quitting_with_saves = false; // "Save all" chosen in the quit prompt
     std::vector<uint64_t> quit_queue; // doc ids still to save before quitting
+    bool quit_skip_unsafe = false;    // hot exit: the !hot_exit_safe() docs were already decided
+
+    // Single instance: this instance owns the main session dir and opens files other Hexer
+    // processes forward to it (Session inbox).
+    bool inbox = false;
+    double next_inbox_poll = 0.0;
 
     bool wants_poll = false;          // something animates/debounces: don't block in WaitEvents
     double next_script_poll = 0.0;

@@ -79,6 +79,7 @@ bool Settings::load(const std::string& path) {
     if (!os_read_whole(path, text)) return false;
     std::vector<std::string> recent(kMaxRecent);
     unknown_keys.clear();
+    bool saw_ui_scale = false, saw_factor = false;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t nl = text.find('\n', pos);
@@ -97,7 +98,8 @@ bool Settings::load(const std::string& path) {
         else if (key == "insert_mode") parse_bool(v, insert_mode);
         else if (key == "big_endian_inspector") parse_bool(v, big_endian_inspector);
         else if (key == "font_size") parse_float(v, 6.0f, 96.0f, font_size);
-        else if (key == "ui_scale") parse_float(v, 0.5f, 4.0f, ui_scale);
+        else if (key == "ui_scale") saw_ui_scale = parse_float(v, 0.5f, 4.0f, ui_scale) || saw_ui_scale;
+        else if (key == "ui_scale_factor") saw_factor = true;
         else if (key == "restore_session") parse_bool(v, restore_session);
         else if (key == "session_autosave_seconds") parse_int(v, 1, 3600, session_autosave_seconds);
         else if (key == "goto_default_hex") parse_bool(v, goto_default_hex);
@@ -110,6 +112,7 @@ bool Settings::load(const std::string& path) {
             unknown_keys.emplace_back(key, v);
         }
     }
+    legacy_ui_scale = saw_ui_scale && !saw_factor;
     recent_files.clear();
     for (auto& r : recent)
         if (!r.empty()) recent_files.push_back(std::move(r));
@@ -133,6 +136,7 @@ bool Settings::save(const std::string& path) const {
     put("big_endian_inspector", b(big_endian_inspector));
     put("font_size", fmt_float(font_size));
     put("ui_scale", fmt_float(ui_scale));
+    put("ui_scale_factor", "true");  // marks ui_scale as a user factor (see legacy_ui_scale)
     put("restore_session", b(restore_session));
     put("session_autosave_seconds", std::to_string(session_autosave_seconds));
     put("goto_default_hex", b(goto_default_hex));
@@ -143,6 +147,14 @@ bool Settings::save(const std::string& path) const {
     std::string dir = path_dirname(path);
     if (!dir.empty()) os_mkdirs(dir);
     return os_write_whole_atomic(path, s.data(), s.size());
+}
+
+bool Settings::migrate_ui_scale(float monitor_scale) {
+    const bool legacy = legacy_ui_scale;
+    legacy_ui_scale = false;
+    if (!legacy || !(monitor_scale > 1.0f) || std::fabs(ui_scale - monitor_scale) > 0.005f) return false;
+    ui_scale = 1.0f;
+    return true;
 }
 
 void Settings::push_recent(const std::string& path) {

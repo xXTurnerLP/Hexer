@@ -21,7 +21,9 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   history survives saves and restarts.
 - **Safe, fast saving.** If the size is unchanged, Hexer patches only the changed bytes in place.
   Otherwise it writes a temp file and renames it over the original. Saves run in the background
-  with progress and Cancel.
+  with progress and Cancel (until the last step, when the dialog shows "Finishing..."). If another
+  program changed the file since you opened it, saving asks first: Save As, **Overwrite anyway**,
+  Reload or Cancel.
 - **Hot exit** (as in Sublime Text). Closing Hexer never asks "save changes?". Open tabs, unsaved
   edits, undo history, cursor, scroll position and bookmarks are restored on the next launch.
 - **Data inspector.** Integers (8 to 64 bit, plus 24 bit), half/float/double, LEB128 and zigzag,
@@ -41,6 +43,12 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Lua console** (REPL), script commands, and hot reload: save a `.lua` file and it reloads.
 - Tabs, drag and drop, recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
   banner when the file changes on disk, a read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
+- **One window** (as in Sublime Text). Opening files while Hexer runs (`hexer file.bin`, "Open
+  with") adds them as tabs to the running window and brings it to the front. `--new-instance`
+  opens a separate window instead.
+- **Unreadable data** (bad sectors, a removed drive, a file truncated by another program) is shown
+  as `??` and flagged with a red "I/O error" badge in the status bar; searches stop there and say
+  where, instead of matching the zeros that stand in for it.
 
 ## Building
 
@@ -96,6 +104,7 @@ GCC 11 or newer (or a recent Clang with libc++) is needed for `std::from_chars` 
 hexer [options] [files...]
   --config-dir DIR     use DIR for settings, session and user scripts (portable mode)
   --no-session         do not restore or write the hot-exit session
+  --new-instance       open a new window even if Hexer is already running
   --exec "LUA"         run Lua in the console after startup
   --screenshot OUT.ppm render, save the window as a PPM and exit
   --frames N           exit after N frames
@@ -146,7 +155,13 @@ after each change, so a crash loses almost nothing. The next launch restores eve
 - If a file changed on disk in the meantime, Hexer warns you. If a file is gone but the session
   still has every byte the document needs, it comes back as a "(recovered)" untitled tab.
 - If the session cannot be written (e.g. the disk is full), quitting asks Save / Discard / Cancel
-  for the unsaved documents instead of losing them.
+  for the unsaved documents instead of losing them. The same question comes up for a document
+  whose unsaved state refers to a large part of a file version that a save replaced (undo past a
+  save that rewrote the file): the session cannot keep it, so Hexer asks for just that document.
+- A second `hexer` started while one runs hands its files to the running window and exits (with
+  the same config directory; `--no-session`, `--new-instance` and `--exec` / `--screenshot` /
+  `--frames` runs never do). Files sent to a Hexer that quit before taking them are opened by the
+  next start.
 - Closing a single **tab** with unsaved changes still asks Save / Discard / Cancel. A discarded
   tab can be brought back with `Ctrl+Shift+T` until you quit.
 - `<config>` is `%APPDATA%\Hexer` on Windows and `~/.config/hexer` on Linux (or

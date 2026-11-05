@@ -325,7 +325,8 @@ int inner_msgh(lua_State* L) {
 int doc_transaction(lua_State* L) {
     Document* d = check_doc(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
-    const char* label = luaL_optstring(L, 3, "Script");
+    // Inside an open group (a command) an unlabelled transaction keeps that step's label.
+    const char* label = luaL_optstring(L, 3, d->in_group() ? "" : "Script");
     uint64_t id = d->id();
     d->begin_group(label);
     lua_pushcfunction(L, inner_msgh);
@@ -1418,10 +1419,7 @@ int l_run(lua_State* L) {
     }
     if (!known) return luaL_error(L, "hx.run: unknown command '%s'", name);
     if (im.depth > 16) return luaL_error(L, "hx.run: commands nested too deeply");
-    {
-        std::string n(name);
-        im.eng.run_command(n);
-    }
+    im.eng.run_command(name);
     return 0;
 }
 

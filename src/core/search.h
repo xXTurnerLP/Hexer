@@ -61,6 +61,7 @@ public:
         bool truncated = false;      // All: hit max_results
         bool cancelled = false;
         bool io_error = false;       // part of the data could not be read; the scan stopped there
+        uint64_t io_error_offset = 0;  // with io_error: the first unreadable byte the scan met
     };
     Result result() const;         // copy of the last finished run
 

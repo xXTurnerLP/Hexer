@@ -15,6 +15,8 @@ struct Settings {
     bool insert_mode = false;          // default typing mode for new tabs
     bool big_endian_inspector = false;
     float font_size = 16.0f;           // monospace font pixel size (Ctrl +/- / Ctrl+wheel)
+    // User zoom factor for the UI on top of the monitor's content scale (DPI), which is read at
+    // startup and followed when the window moves to another monitor: 1.0 = native size everywhere.
     float ui_scale = 1.0f;
     bool restore_session = true;       // hot exit
     int session_autosave_seconds = 3;  // crash-safety interval while dirty
@@ -24,9 +26,17 @@ struct Settings {
     // Keys this version does not know (e.g. written by a newer Hexer); written back unchanged by save().
     std::vector<std::pair<std::string, std::string>> unknown_keys;
 
+    // Set by load() for a file written before ui_scale became a factor (no "ui_scale_factor" key):
+    // back then the first run stored the monitor scale itself in ui_scale. Not saved.
+    bool legacy_ui_scale = false;
+
     bool load(const std::string& path);
     bool save(const std::string& path) const;
     void push_recent(const std::string& path);
+    // One-time migration of a legacy file: a ui_scale equal to the current monitor scale (> 1) was
+    // the old DPI-derived default, not a user choice, so it becomes 1.0 (else it would apply twice).
+    // Clears legacy_ui_scale; returns true if ui_scale changed.
+    bool migrate_ui_scale(float monitor_scale);
 };
 
 namespace paths {

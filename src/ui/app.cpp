@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -53,11 +54,13 @@ const char* const kPopMessage = "###message";
 const char* const kPopAbout = "About Hexer###about";
 
 std::vector<std::string> command_line_utf8(int argc, char** argv);  // bottom of file
+void allow_foreground_handoff();                                    // bottom of file
 
 const char* const kUsage =
     "usage: hexer [options] [files...]\n"
     "  --config-dir DIR     use DIR for settings, session and user scripts\n"
     "  --no-session         do not restore or write the hot-exit session\n"
+    "  --new-instance       open a new window even if Hexer is already running\n"
     "  --screenshot OUT.ppm render, save the window as a binary PPM and exit\n"
     "  --frames N           exit after N frames (default 30 with --screenshot)\n"
     "  --exec \"LUA\"         run Lua in the console after startup";
@@ -90,6 +93,8 @@ bool parse_args(int argc, char** argv, AppOptions& out, std::string* err) {
             only_files = true;
         } else if (a == "--no-session") {
             out.no_session = true;
+        } else if (a == "--new-instance") {
+            out.new_instance = true;
         } else if (a == "--config-dir") {
             if (!value(out.config_dir) || out.config_dir.empty()) return fail("--config-dir needs a directory");
         } else if (a == "--screenshot") {
@@ -479,6 +484,7 @@ bool start_save(App& app, Tab& tab, bool save_as, AfterSave after, bool confirme
     s.progress.done = 0;
     s.progress.total = 0;
     s.progress.cancel = false;
+    s.progress.committing = false;
     s.finished = false;
     s.ok = false;
     s.err.clear();
@@ -509,6 +515,14 @@ void abort_quit(App& app) {
     app.quitting_with_saves = false;
     app.quit_queue.clear();
     app.quit_requested = false;
+    app.quit_skip_unsafe = false;
+}
+
+// Asks Save / Discard / Cancel before quitting, for `docs` (empty = every dirty document).
+void prompt_quit(App& app, std::vector<uint64_t> docs) {
+    app.quit_prompt_docs = std::move(docs);
+    app.quit_requested = false;  // the prompt decides
+    app.quit_prompt_pending = true;
 }
 
 void poll_save(App& app) {
@@ -536,14 +550,30 @@ void poll_save(App& app) {
         t->ignore_valid = false;
         t->doc->view_generation++;
         if (s.after == AfterSave::CloseTab) close_tab_now(app, tab_index(app, t));
+        // Write the session right away: until then it holds the pre-save pieces (a restore would
+        // notice the stale state; this closes that window).
+        save_session(app, true);
         return;
     }
     // Cancel can be pressed while an in-place write is already past the point of no return; only
     // a save that really stopped because of it is reported as cancelled, any other error is shown.
-    if (s.progress.cancel.load() && s.err.find("cancelled") != std::string::npos)
+    if (s.progress.cancel.load() && s.err.find("cancelled") != std::string::npos) {
         set_status(app, "Save cancelled");
-    else
+    } else if (s.target.empty() && t->doc->changed_on_disk() &&
+               (s.err.find("modified on disk by another program since") != std::string::npos ||
+                s.err.find("File size changed on disk") != std::string::npos)) {
+        // Refused because another program modified the file (after "Ignore" on the banner, or it
+        // changed just before the save): offer Overwrite anyway / Save As / Reload / Cancel.
+        // Only for that refusal: a failed in-place write also changes the file's mtime, and its
+        // error ("may be partially written") must be shown, not a prompt blaming another program.
+        t->disk_changed = true;
+        t->ignore_valid = false;
+        app.overwrite_prompt_doc = t->doc->id();
+        app.overwrite_prompt_after = s.after;
+        app.overwrite_prompt_pending = true;
+    } else {
         show_message(app, "Save failed", "Could not save " + t->label + ":\n" + s.err);
+    }
     if (app.quitting_with_saves || s.after == AfterSave::Quit) abort_quit(app);
 }
 
@@ -559,29 +589,40 @@ void process_quit(App& app) {
             if (!start_save(app, *t, false, AfterSave::Quit)) abort_quit(app);
             return;
         }
-        app.quit = true;
-        return;
+        // Everything chosen is saved. Continue below: other dirty docs may still hot-exit.
+        app.quitting_with_saves = false;
+        app.quit_skip_unsafe = true;
     }
     if (app.hot_exit) {
+        // Documents whose unsaved state the session cannot hold (Document::hot_exit_safe) are not
+        // hot-exited silently: ask for just those; the others hot-exit as usual.
+        if (!app.quit_skip_unsafe) {
+            std::vector<uint64_t> unsafe;
+            for (auto& t : app.tabs)
+                if (t->doc->dirty() && !t->doc->hot_exit_safe()) unsafe.push_back(t->doc->id());
+            if (!unsafe.empty()) {
+                prompt_quit(app, std::move(unsafe));
+                return;
+            }
+        }
         // Quitting without a prompt is only safe once the session (the unsaved edits) is on disk.
         std::string err;
         if (save_session(app, true, &err) || !any_dirty(app)) {
             app.quit = true;
             return;
         }
+        app.quit_skip_unsafe = false;
         show_message(app, "Session not saved",
                      "Hot exit could not write the session, so unsaved edits would be lost on quit:\n" + err +
                          "\n\nSave or discard them in the next dialog.");
-        app.quit_requested = false;
-        app.quit_prompt_pending = true;
+        prompt_quit(app, {});
         return;
     }
     if (!any_dirty(app)) {
         app.quit = true;
         return;
     }
-    app.quit_requested = false;  // the prompt decides
-    app.quit_prompt_pending = true;
+    prompt_quit(app, {});
 }
 
 }  // namespace
@@ -912,6 +953,11 @@ void poll_search(App& app) {
     if (r.cancelled) {
         set_status(app, "Search cancelled");
         return;
+    }
+    if (r.io_error) {  // the scan stopped there: no hits past it, not even in Find All
+        const std::string msg = "Search stopped: unreadable data at " + fmt_offset(r.io_error_offset) + " in " + t->label;
+        log_console(app, ConsoleLine::Warn, msg);
+        notify(app, msg, true);
     }
     if (r.mode == SearchJob::Mode::All) {
         SearchHits& h = t->hits;
@@ -1902,7 +1948,7 @@ void draw_overwrite_prompt(App& app) {
         start_save(app, *t, true, after);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Overwrite")) {
+    if (ImGui::Button("Overwrite anyway")) {
         ImGui::CloseCurrentPopup();
         start_save(app, *t, false, after, true);
     }
@@ -1919,25 +1965,48 @@ void draw_overwrite_prompt(App& app) {
 void draw_quit_prompt(App& app) {
     center_next_window(app, 0.0f, 0.3f);
     if (!ImGui::BeginPopupModal(kPopQuit, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
-    ImGui::TextUnformatted("These documents have unsaved changes:");
-    for (auto& t : app.tabs)
-        if (t->doc->dirty()) ImGui::BulletText("%s", t->label.c_str());
+    // Scoped (hot exit keeps every other document): only the listed docs need a decision.
+    const bool scoped = !app.quit_prompt_docs.empty();
+    std::vector<Tab*> docs;
+    for (auto& t : app.tabs) {
+        const bool listed = std::find(app.quit_prompt_docs.begin(), app.quit_prompt_docs.end(), t->doc->id()) !=
+                            app.quit_prompt_docs.end();
+        if (t->doc->dirty() && (!scoped || listed)) docs.push_back(t.get());
+    }
+    if (scoped) {
+        ImGui::TextUnformatted("Hot exit cannot keep the unsaved changes of:");
+        for (Tab* t : docs) ImGui::BulletText("%s", t->label.c_str());
+        ImGui::PushTextWrapPos(520.0f * app.ui_scale);
+        ImGui::TextDisabled("They refer to a large part of a file version that a save replaced. Your other "
+                            "documents are restored on the next start as usual.");
+        ImGui::PopTextWrapPos();
+    } else {
+        ImGui::TextUnformatted("These documents have unsaved changes:");
+        for (Tab* t : docs) ImGui::BulletText("%s", t->label.c_str());
+    }
     ImGui::Spacing();
     if (ImGui::Button("Save All")) {
         app.quit_queue.clear();
-        for (auto& t : app.tabs)
-            if (t->doc->dirty()) app.quit_queue.push_back(t->doc->id());
+        for (Tab* t : docs) app.quit_queue.push_back(t->doc->id());
         app.quitting_with_saves = true;
         app.quit_requested = true;
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
     if (ImGui::Button("Discard All")) {
-        app.quit = true;
+        if (scoped) {  // the rest still goes through hot exit (and its session-save check)
+            app.quit_skip_unsafe = true;
+            app.quit_requested = true;
+        } else {
+            app.quit = true;
+        }
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        abort_quit(app);
+        ImGui::CloseCurrentPopup();
+    }
     ImGui::EndPopup();
 }
 
@@ -1955,8 +2024,11 @@ void draw_saving(App& app) {
     ImGui::Text("Saving %s", t ? t->label.c_str() : "document");
     ImGui::ProgressBar(float(p.fraction()), ImVec2(360.0f * app.ui_scale, 0.0f));
     ImGui::TextDisabled("%s of %s", fmt_size(p.done.load()).c_str(), fmt_size(p.total.load()).c_str());
-    ImGui::BeginDisabled(p.cancel.load());
-    if (ImGui::Button(p.cancel.load() ? "Cancelling..." : "Cancel")) app.save.progress.cancel = true;
+    // Past the point of no return (in-place writes / final rename) Cancel cannot stop the save.
+    const bool committing = p.committing.load();
+    ImGui::BeginDisabled(committing || p.cancel.load());
+    if (ImGui::Button(committing ? "Finishing..." : p.cancel.load() ? "Cancelling..." : "Cancel"))
+        app.save.progress.cancel = true;
     ImGui::EndDisabled();
     ImGui::EndPopup();
 }
@@ -2148,6 +2220,38 @@ void poll_disk_change(App& app) {
     t->disk_changed = t->doc->changed_on_disk() && !ignored_version(*t);
 }
 
+// Unreadable data (bad sector, removed drive, file truncated elsewhere): one console warning per
+// document; the status bar shows an "I/O error" badge while it lasts.
+void poll_io_errors(App& app) {
+    for (auto& t : app.tabs) {
+        if (t->io_warned || t->doc->busy() || !t->doc->io_error()) continue;
+        t->io_warned = true;
+        log_console(app, ConsoleLine::Warn,
+                    t->label + ": I/O error while reading the file; unreadable bytes are shown as ?? and read as 0");
+    }
+}
+
+void bring_to_front(GLFWwindow* w) {
+    if (glfwGetWindowAttrib(w, GLFW_ICONIFIED)) glfwRestoreWindow(w);
+    glfwFocusWindow(w);
+    // The OS may refuse to steal the focus (Windows foreground rules): flash the taskbar instead.
+    if (!glfwGetWindowAttrib(w, GLFW_FOCUSED)) glfwRequestWindowAttention(w);
+}
+
+// Single instance: open the files another Hexer process forwarded (see run_app) and come to the
+// front. Also picks up messages left over from an instance that died before reading them.
+void poll_inbox(App& app) {
+    if (!app.inbox) return;
+    const double n = now_s();
+    if (n < app.next_inbox_poll) return;
+    app.next_inbox_poll = n + 0.5;
+    std::vector<std::vector<std::string>> msgs = inbox_take(app.session->dir());
+    if (msgs.empty()) return;
+    for (const auto& m : msgs)
+        for (const std::string& p : m) app.pending_open.push_back(p);  // opened next frame, deduped
+    bring_to_front(app.window);
+}
+
 void poll_scripts(App& app) {
     if (app.save.running) return;  // scripts may read documents
     const double n = now_s();
@@ -2280,10 +2384,14 @@ void draw_panels(App& app) {
 
 void frame(App& app) {
     app.wants_poll = false;
+    // Inbox first: forwarded files are opened this frame, before process_quit can end the app
+    // (the sender already exited, believing them delivered; open tabs go into the session).
+    poll_inbox(app);
     process_pending_opens(app);
     poll_save(app);
     poll_search(app);
     poll_disk_change(app);
+    poll_io_errors(app);
     poll_scripts(app);
     if (Tab* t = active_tab(app); t && !t->doc->busy()) update_structure(app, *t);
 
@@ -2365,6 +2473,33 @@ void restore_session(App& app) {
     app.session_sig = session_signature(app);
 }
 
+// Single instance (Sublime-like): when another Hexer owns this config dir's session, post our
+// files to its inbox, wait until it has taken them and return true (the caller exits). Never for
+// --no-session, --new-instance or automation runs (--exec, --screenshot, --frames); --config-dir
+// scopes it to that directory, so test runs never reach the user's instance. If the running
+// instance does not respond within a few seconds, the message is withdrawn and we start normally.
+bool forward_to_running_instance(const AppOptions& opts) {
+    if (opts.no_session || opts.new_instance || !opts.run_lua.empty() || !opts.screenshot.empty() || opts.frames > 0)
+        return false;
+    const std::string dir = paths::session_dir();
+    if (!session_primary_running(dir)) return false;
+    std::vector<std::string> files;
+    for (const std::string& f : opts.files) files.push_back(os_absolute_path(f));
+    std::string posted, err;
+    if (!inbox_post(dir, files, &posted, &err)) {
+        std::fprintf(stderr, "hexer: cannot reach the running instance (%s); opening a new window\n", err.c_str());
+        return false;
+    }
+    allow_foreground_handoff();  // let the running instance take the focus from us
+    for (int i = 0; i < 100; ++i) {  // it polls the inbox every 0.5 s
+        if (!os_stat(posted).exists) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!inbox_withdraw(posted)) return true;  // taken just now
+    std::fprintf(stderr, "hexer: the running instance does not respond; opening a new window\n");
+    return false;
+}
+
 void startup(App& app) {
     app.engine = std::make_unique<ScriptEngine>(&app);
     app.engine->set_script_dirs({paths::bundled_scripts_dir(), paths::user_scripts_dir()});
@@ -2372,6 +2507,7 @@ void startup(App& app) {
     if (!app.opts.no_session) app.session = std::make_unique<Session>(paths::session_dir());
     app.hot_exit = app.session && app.settings.restore_session;
     if (app.hot_exit) restore_session(app);
+    app.inbox = app.session && app.session->primary();
     for (const std::string& f : app.opts.files) open_path(app, f);
     app.next_autosave = now_s() + std::max(1, app.settings.session_autosave_seconds);
 }
@@ -2438,6 +2574,7 @@ int run_app(const AppOptions& opts) {
     if (!opts.config_dir.empty()) paths::set_config_dir_override(opts.config_dir);
     paths::ensure_dirs();
     app.settings.load(paths::settings_file());
+    if (forward_to_running_instance(opts)) return 0;
 
     glfwSetErrorCallback(on_glfw_error);
     if (!glfwInit()) {
@@ -2461,6 +2598,8 @@ int run_app(const AppOptions& opts) {
     float sx = 1.0f, sy = 1.0f;
     glfwGetWindowContentScale(app.window, &sx, &sy);
     app.dpi_scale = sx > 0.0f ? sx : 1.0f;
+    // Older versions stored the monitor scale itself as ui_scale on first run: make it 1.0 once.
+    if (app.settings.migrate_ui_scale(app.dpi_scale)) app.settings.save(paths::settings_file());
     app.ui_scale = std::clamp(app.dpi_scale * app.settings.ui_scale, 0.5f, 4.0f);
     app.settings.font_size = std::clamp(app.settings.font_size, kMinFont, kMaxFont);
 
@@ -2558,6 +2697,7 @@ std::vector<std::string> command_line_utf8(int argc, char** argv) {
     if (w) LocalFree(w);
     return out;
 }
+void allow_foreground_handoff() { AllowSetForegroundWindow(ASFW_ANY); }
 }  // namespace
 }  // namespace hx
 #else
@@ -2568,6 +2708,7 @@ std::vector<std::string> command_line_utf8(int argc, char** argv) {
     for (int i = 0; i < argc; ++i) out.emplace_back(argv[i] ? argv[i] : "");
     return out;
 }
+void allow_foreground_handoff() {}
 }  // namespace
 }  // namespace hx
 #endif

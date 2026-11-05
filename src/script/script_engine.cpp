@@ -651,7 +651,10 @@ bool ScriptEngine::edit_field(Document& doc, const Field& field, const std::stri
 
 // ---- commands & highlights --------------------------------------------------------------------------
 
-void ScriptEngine::run_command(const std::string& name) {
+void ScriptEngine::run_command(const std::string& name_in) {
+    // A copy: callers may pass a reference into command_refs, which the command itself can change
+    // (hx.command re-registering, reload).
+    const std::string name = name_in;
     lua_State* L = impl_->L;
     auto it = impl_->command_refs.find(name);
     if (!L || it == impl_->command_refs.end()) {

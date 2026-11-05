@@ -904,8 +904,12 @@ void draw_doc_status(App& app, Tab& t) {
     else
         ImGui::TextDisabled("No selection");
     status_sep();
-    uint8_t b = 0;
-    if (v.cursor < d.size() && d.read(v.cursor, &b, 1) == 1) {
+    uint8_t b = 0, bad = 0;
+    const bool have = v.cursor < d.size() && d.read(v.cursor, &b, 1, &bad) == 1;
+    if (have && bad) {
+        ImGui::TextColored(kErrColor, "Byte ??");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("This byte could not be read from disk");
+    } else if (have) {
         const char c = (b >= 0x20 && b < 0x7F) ? char(b) : '.';
         ImGui::Text("Byte 0x%02X  %u  '%c'", unsigned(b), unsigned(b), c);
     } else {
@@ -925,6 +929,14 @@ void draw_doc_status(App& app, Tab& t) {
     if (d.read_only()) {
         status_sep();
         ImGui::TextColored(kWarnColor, "RO");
+    }
+    if (d.io_error()) {
+        status_sep();
+        ImGui::TextColored(kErrColor, "I/O error");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Part of the file could not be read (bad sector, removed drive, or truncated by\n"
+                              "another program). Unreadable bytes are shown as ??. Searches stop at them and\n"
+                              "saves that rewrite the file refuse; copies and scripts read them as 0.");
     }
     if (!t.st.used_parser.empty()) {
         status_sep();

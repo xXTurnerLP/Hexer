@@ -9,7 +9,8 @@
 // modules for require("name") (package.path includes <dir>/lib/?.lua) and are not run directly.
 // os.exit and stdin are disabled (no killing the editor): io.read, io.lines(), io.stdin:read,
 // io.input():read, loadfile() and dofile() without a file name raise. File names passed to
-// io.open/io.lines/loadfile/dofile/require are UTF-8, also on Windows.
+// io.open/io.lines/loadfile/dofile/require are UTF-8, also on Windows (hexer.exe's manifest
+// selects the UTF-8 code page, so there os.rename/os.remove/package.loadlib are UTF-8 too).
 // __gc finalizers set through setmetatable run under a 1 s limit each (also at reload / exit).
 // Global table `hexer` (also aliased as `hx`):
 //
@@ -37,8 +38,8 @@
 //       u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)  -> number (nil past EOF)
 //       (also u24le/u24be/i24le/i24be)
 //   doc:write(off, bytes)   doc:insert(off, bytes)   doc:erase(off, len)   doc:replace(off, len, bytes)
-//   doc:transaction(fn, label?)          -- all edits inside fn become ONE undo step (label is
-//                                           ignored inside a command: it already is one step)
+//   doc:transaction(fn, label?)          -- all edits inside fn become ONE undo step; inside a
+//                                           command (already one step) a label renames that step
 //   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:goto(off)
 //       (`goto` is a Lua keyword: write doc:jump(off), the same function, or doc["goto"](doc, off))
 //   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")

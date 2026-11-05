@@ -63,6 +63,7 @@ bool os_mkdirs(const std::string& path);  // like mkdir -p; true if it exists af
 std::vector<std::string> os_list_files(const std::string& dir, const std::string& ext);
 std::string os_exe_dir();
 std::string os_env(const char* name);                     // "" if unset
+uint64_t os_process_id();
 void os_reveal_in_file_manager(const std::string& path);  // opens the folder (Explorer / xdg-open)
 // Small-file helpers (scripts, settings, session index). Not for user data files.
 bool os_read_whole(const std::string& path, std::string& out, std::string* err = nullptr);

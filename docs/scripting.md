@@ -154,7 +154,7 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | `doc:u8(off)` `doc:i8(off)` `doc:u16le/u16be/i16le/i16be/u24le/u24be/u32le/u32be/i32le/i32be/u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)` | number, or `nil` past the end |
 | `doc:write(off, bytes)` | overwrite (may extend at the end) |
 | `doc:insert(off, bytes)` `doc:erase(off, len)` `doc:replace(off, len, bytes)` | |
-| `doc:transaction(fn, label?)` | every edit inside `fn` becomes **one** undo step, even if `fn` errors. Inside a command, which already is one step (`Script: <name>`), the label is ignored |
+| `doc:transaction(fn, label?)` | every edit inside `fn` becomes **one** undo step, even if `fn` errors. Inside a command, which already is one step (`Script: <name>`), a label renames that step (the innermost label wins: Edit > Undo shows "Undo Append TLV") |
 | `doc:cursor()` `doc:selection()` → start, len | |
 | `doc:select(off, len)` `doc:jump(off)` | moves the selection/cursor and scrolls it into view (`doc:goto` also exists, but `goto` is a Lua keyword: call it as `doc["goto"](doc, off)`) |
 | `doc:find(needle, start?, {hex=bool, backward=bool})` | offset or `nil`; `hex=true` takes patterns like `"DE ?? AD"` |
@@ -185,7 +185,8 @@ and while a save is running.
 `os.exit` and stdin are disabled: Hexer has no stdin (`io.read`, `io.lines()`, `io.stdin`,
 `loadfile()` / `dofile()` without a file name raise), and a stray `os.exit()` must not close the
 editor. File names are UTF-8 everywhere, also on Windows (`io.open`, `io.lines`, `loadfile`,
-`dofile`, `require`). A `__gc` finalizer runs under a 1 s limit of its own.
+`dofile`, `require`; in hexer.exe, whose manifest selects the UTF-8 code page, also `os.rename`,
+`os.remove` and `package.loadlib`). A `__gc` finalizer runs under a 1 s limit of its own.
 
 ---
 

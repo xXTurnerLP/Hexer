@@ -66,6 +66,7 @@ private:
     double scrollbar_grab_ = 0.0;
     uint64_t drag_origin_ = 0;
     std::vector<uint8_t> buf_;  // visible bytes scratch
+    std::vector<uint8_t> bad_;  // 1 per visible byte that could not be read (drawn as ??)
     std::vector<const Highlight*> hl_tmp_;  // per-frame highlight query scratch
     float wheel_accum_ = 0.0f;  // fractional wheel rows (touchpads)
     int last_bpr_ = 0;          // keeps the first visible byte stable when bytes/row changes

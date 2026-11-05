@@ -123,6 +123,9 @@ struct Progress {
     std::atomic<uint64_t> done{0};
     std::atomic<uint64_t> total{0};
     std::atomic<bool> cancel{false};
+    // Set by Document while a save is past the point of no return (in-place writes into the file,
+    // or the final rename over it): cancel is no longer honoured, the UI shows "Finishing...".
+    std::atomic<bool> committing{false};
     double fraction() const {
         uint64_t t = total.load();
         return t ? double(done.load()) / double(t) : 0.0;
@@ -149,6 +152,12 @@ public:
     // ---- reading -----------------------------------------------------------------------------
     uint64_t size() const { return table_.size(); }
     size_t read(uint64_t offset, uint8_t* dst, size_t len) const;  // bytes copied (clamped to size)
+    // Like read(), and `unreadable` (len bytes) gets 1 for every byte that could not be read from
+    // disk (I/O error; returned as 0 in dst), 0 for every other one.
+    size_t read(uint64_t offset, uint8_t* dst, size_t len, uint8_t* unreadable) const;
+    // Sticky: true once a read of any file version this document uses failed (bad sector,
+    // unplugged drive, file truncated by another program). Unreadable bytes read as 0.
+    bool io_error() const;
     std::shared_ptr<const Snapshot> snapshot() const;
     // True if any byte in [offset, offset+len) is not original file content (typed, pasted, filled,
     // inserted; used to tint edited bytes). Original bytes merely shifted by an insert/erase earlier
@@ -167,8 +176,12 @@ public:
     bool fill(uint64_t offset, uint64_t len, const uint8_t* pattern, size_t pattern_len);
 
     // Group several edits into one undo step (nestable). Used by scripts and multi-step actions.
+    // The step's label is the innermost non-empty group label (a labelled doc:transaction inside a
+    // script command names the step instead of the command's generic "Script: <name>"); without
+    // any, the label of the first edit ("Paste", "Fill", ...).
     void begin_group(const std::string& label = {});
     void end_group();
+    bool in_group() const;             // a group is open
 
     // Bookmarks go through the document so they are part of undo/redo history.
     bool add_bookmark(const Bookmark& b);

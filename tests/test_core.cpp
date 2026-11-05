@@ -616,7 +616,7 @@ TEST_CASE("document: groups, bookmarks, cursor in history") {
     CHECK(d->insert(0, x.data(), 1));
     d->end_group();
     REQUIRE(d->undo_stack().size() == 2);
-    CHECK(d->undo_stack().back().label == "Paste");
+    CHECK(d->undo_stack().back().label == "inner");  // innermost non-empty label wins
     CHECK(d->view().bookmarks.size() == 1);
     d->view().cursor = 9;
     CHECK(d->undo());
@@ -642,6 +642,42 @@ TEST_CASE("document: groups, bookmarks, cursor in history") {
     CHECK(d->view().bookmarks[0].name == "renamed");
     CHECK(d->undo());
     CHECK(d->view().bookmarks[0].name == "bm");
+    CHECK(d->undo_stack().back().label == "inner");
+}
+
+TEST_CASE("document: group labels - innermost non-empty label names the step") {
+    auto d = Document::create_empty("Untitled 1");
+    const uint8_t x[2] = {1, 2};
+    CHECK_FALSE(d->in_group());
+    // A labelled inner group opened after the outer group already pushed its step renames it.
+    d->begin_group("Script: cmd");
+    CHECK(d->in_group());
+    REQUIRE(d->insert(0, x, 1));
+    d->begin_group("Append TLV");
+    REQUIRE(d->insert(1, x, 1));
+    d->end_group();
+    REQUIRE(d->insert(2, x, 1));
+    d->end_group();
+    CHECK_FALSE(d->in_group());
+    REQUIRE(d->undo_stack().size() == 1);
+    CHECK(d->undo_stack().back().label == "Append TLV");
+    // An unlabelled inner group keeps the outer label.
+    d->begin_group("Script: cmd");
+    d->begin_group("");
+    REQUIRE(d->insert(0, x, 2));
+    d->end_group();
+    d->end_group();
+    REQUIRE(d->undo_stack().size() == 2);
+    CHECK(d->undo_stack().back().label == "Script: cmd");
+    // No label anywhere: the first edit's own label.
+    d->begin_group();
+    REQUIRE(d->fill(0, 2, x, 1));
+    d->end_group();
+    CHECK(d->undo_stack().back().label == "Fill");
+    // The next group starts from its own label again.
+    d->begin_group("Paste");
+    REQUIRE(d->insert(0, x, 1));
+    d->end_group();
     CHECK(d->undo_stack().back().label == "Paste");
 }
 
@@ -1707,4 +1743,106 @@ TEST_CASE("document: add-buffer chunks nothing references are released") {
     CHECK(total <= big.size() + 2 * AddBuffer::kChunkSize);
     REQUIRE(e->undo());
     CHECK(doc_bytes(*e) == big);
+}
+
+TEST_CASE("document: unreadable bytes are reported per byte and by io_error()") {
+    TempDir t;
+    std::string p = t.file("io.bin");
+    write_file(p, str_bytes("abcdefgh"));
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    const uint8_t z = 'Z';
+    REQUIRE(d->overwrite(2, &z, 1));
+    uint8_t buf[8], bad[8];
+    std::memset(bad, 7, sizeof bad);
+    REQUIRE(d->read(0, buf, 8, bad) == 8);
+    for (uint8_t b : bad) CHECK(b == 0);
+    CHECK_FALSE(d->io_error());
+
+    d->original()->close_file();  // every read of the file fails from now on
+    REQUIRE(d->read(0, buf, 8, bad) == 8);
+    for (int i = 0; i < 8; ++i) {
+        CHECK(bad[i] == (i == 2 ? 0 : 1));        // the edited byte lives in the add buffer
+        CHECK(buf[i] == (i == 2 ? 'Z' : 0));      // unreadable bytes still read as 0
+    }
+    CHECK(d->io_error());
+    REQUIRE(d->read(6, buf, 8, bad) == 2);  // clamped to the size like read()
+    CHECK(bad[0] == 1);
+    CHECK(bad[1] == 1);
+    CHECK(d->original()->reopen_file());
+    CHECK(d->io_error());  // sticky
+}
+
+TEST_CASE("document: Progress::committing is cleared after every save") {
+    TempDir t;
+    std::string p = t.file("commit.bin");
+    write_file(p, random_bytes(1 << 20, 3));
+    auto d = Document::open_file(p);
+    const uint8_t v = 1;
+    Progress pr;
+    std::string err;
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 0) REQUIRE(d->overwrite(5, &v, 1));  // in place
+        else REQUIRE(d->insert(5, &v, 1));               // rewrite
+        CHECK_FALSE(pr.committing.load());
+        REQUIRE(d->save(&pr, &err));
+        CHECK_FALSE(pr.committing.load());
+    }
+    // A save cancelled before its point of no return never sets it.
+    REQUIRE(d->insert(5, &v, 1));
+    pr.cancel = true;
+    CHECK_FALSE(d->save(&pr, &err));
+    CHECK_FALSE(pr.committing.load());
+}
+
+TEST_CASE("session: single-instance inbox (post, take, withdraw, leftovers)") {
+    TempDir t;
+    std::string sdir = t.file("session");
+    REQUIRE(os_mkdirs(sdir));
+    CHECK_FALSE(session_primary_running(sdir));
+    {
+        Session s(sdir);
+        CHECK(s.primary());
+        CHECK_FALSE(s.secondary());
+        CHECK(session_primary_running(sdir));  // the main dir's lock is held
+        Session second(sdir);
+        CHECK_FALSE(second.primary());
+        CHECK(second.secondary());
+        CHECK(session_primary_running(sdir));
+    }
+    CHECK_FALSE(session_primary_running(sdir));  // released when the instance ends
+
+    CHECK(inbox_take(sdir).empty());  // no inbox dir yet
+    std::string a, b, c;
+    const std::string uni = "C:/d\xC3\xBC/\xE2\x82\xAC.bin";  // UTF-8 survives unchanged
+    REQUIRE(inbox_post(sdir, {"/x/one.bin", uni}, &a));
+    REQUIRE(inbox_post(sdir, {}, &b));  // "come to the front" only
+    CHECK(a != b);
+    CHECK(os_stat(a).exists);
+    auto msgs = inbox_take(sdir);
+    REQUIRE(msgs.size() == 2);
+    std::sort(msgs.begin(), msgs.end());  // name order is not chronological
+    CHECK(msgs[0].empty());
+    CHECK(msgs[1] == std::vector<std::string>{"/x/one.bin", uni});
+    CHECK_FALSE(os_stat(a).exists);
+    CHECK_FALSE(inbox_withdraw(a));  // already taken
+    CHECK(inbox_take(sdir).empty());  // each message is delivered once
+    CHECK(os_list_files(path_join(sdir, "inbox"), "").empty());
+
+    // Withdrawn before the running instance took it: never delivered.
+    REQUIRE(inbox_post(sdir, {"/y.bin"}, &c));
+    CHECK(inbox_withdraw(c));
+    CHECK(inbox_take(sdir).empty());
+
+    // A claimed message that an instance died before reading is delivered at the next start;
+    // so is one it never got to (stale .paths).
+    REQUIRE(inbox_post(sdir, {"/claimed.bin"}, &a));
+    REQUIRE(os_replace_file(a, a + ".taken"));
+    REQUIRE(inbox_post(sdir, {"/stale.bin"}, &b));
+    msgs = inbox_take(sdir);
+    std::sort(msgs.begin(), msgs.end());
+    REQUIRE(msgs.size() == 2);
+    CHECK(msgs[0] == std::vector<std::string>{"/claimed.bin"});
+    CHECK(msgs[1] == std::vector<std::string>{"/stale.bin"});
+    CHECK(os_list_files(path_join(sdir, "inbox"), "").empty());
 }

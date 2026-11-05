@@ -40,14 +40,29 @@ ui_lib = static_library('hexer_ui',
   dependencies : [script_dep, imgui_dep, glfw_dep, nfd_dep],
 )
 
+hexer_src = ['main.cpp']
+hexer_link_args = []
+if host_machine.system() == 'windows'
+  # Application manifest (UTF-8 active code page, Win10/11, per-monitor DPI v2).
+  windows = import('windows')
+  hexer_src += windows.compile_resources('hexer.rc', depend_files : 'hexer.manifest',
+    include_directories : include_directories('.'))
+  if cpp.get_argument_syntax() == 'msvc'  # MSVC and clang-cl (link.exe / lld-link)
+    hexer_link_args += ['/MANIFEST:NO']  # ours is the only one (no linker-generated manifest)
+  endif
+endif
+if cpp.get_id() == 'msvc' and get_option('buildtype') == 'release'
+  hexer_link_args += ['/ENTRY:mainCRTStartup']
+endif
+
 hexer_exe = executable('hexer',
-  'main.cpp',
+  hexer_src,
   include_directories : inc,
   cpp_args : conf_args,
   link_with : ui_lib,
   dependencies : [script_dep, imgui_dep, glfw_dep, nfd_dep] + sys_deps,
   win_subsystem : get_option('buildtype') == 'release' ? 'windows' : 'console',
-  link_args : (cpp.get_id() == 'msvc' and get_option('buildtype') == 'release') ? ['/ENTRY:mainCRTStartup'] : [],
+  link_args : hexer_link_args,
   install : true,
 )
 

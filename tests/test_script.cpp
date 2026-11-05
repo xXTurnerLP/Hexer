@@ -618,6 +618,48 @@ TEST_CASE("hx.run runs a command from Lua; unknown names and runaway recursion a
     CHECK(fx.last_result() == "2");  // engine still usable
 }
 
+TEST_CASE("run_command: the name may refer into commands() although the command changes them") {
+    Fixture fx;
+    // Registering many commands reallocates the command list the caller's name points into; the
+    // error message after the call must still carry the right name.
+    fx.load("hx.command { name = 'grow', run = function(doc)\n"
+            "  for i = 1, 200 do hx.command { name = 'c' .. i, run = function() end } end\n"
+            "  error('boom')\n"
+            "end }");
+    fx.host.add("xyz");
+    REQUIRE(!fx.eng.commands().empty());
+    REQUIRE(fx.eng.commands()[0].name == "grow");
+    fx.eng.run_command(fx.eng.commands()[0].name);
+    CHECK(fx.console_has("Command 'grow': ", ConsoleLine::Error));
+    CHECK(fx.console_has("boom", ConsoleLine::Error));
+    CHECK(fx.eng.commands().size() == 201);
+}
+
+TEST_CASE("doc:transaction labels: inside a command the innermost label names the step") {
+    Fixture fx;
+    fx.load("hx.command { name = 'tlv', run = function(doc)\n"
+            "  doc:write(0, 'A')\n"
+            "  doc:transaction(function() doc:insert(1, 'BC') end, 'Append TLV')\n"
+            "end }\n"
+            "hx.command { name = 'plain', run = function(doc)\n"
+            "  doc:transaction(function() doc:insert(0, 'Q') end)\n"
+            "end }");
+    Document* d = fx.host.add("xyz");
+    fx.eng.run_command("tlv");
+    CHECK(fx.errors() == 0);
+    CHECK(bytes_of(*d) == "ABCyz");
+    REQUIRE(d->undo_stack().size() == 1);
+    CHECK(d->undo_stack().back().label == "Append TLV");
+    fx.eng.run_command("plain");  // unlabelled: keeps the command's label
+    REQUIRE(d->undo_stack().size() == 2);
+    CHECK(d->undo_stack().back().label == "Script: plain");
+    fx.eng.exec("doc:transaction(function() doc:write(0, 'z') end)");  // outside a command
+    CHECK(d->undo_stack().back().label == "Script");
+    fx.eng.exec("doc:transaction(function() doc:write(0, 'y') end, 'Mine')");
+    CHECK(d->undo_stack().back().label == "Mine");
+    CHECK(d->undo_stack().size() == 4);
+}
+
 // ---- bundled example scripts -------------------------------------------------------------------------
 
 struct Examples : Fixture {

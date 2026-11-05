@@ -258,6 +258,7 @@ const HexColors& hex_colors() {
         /* separator       */ rgba(0x39, 0x3b, 0x40),
         /* search_hit      */ rgba(0xf2, 0xc9, 0x3b, 110),
         /* bookmark        */ rgba(0xef, 0x5f, 0x6b),
+        /* unreadable_text */ rgba(0xff, 0x6b, 0x6b),
     };
     return c;
 }

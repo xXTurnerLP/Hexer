@@ -422,9 +422,15 @@ TEST_CASE("search: unreadable bytes stop the scan instead of matching as zeros")
     auto r = run_job(job, s, zeros, 0, SearchJob::Mode::All);
     CHECK(r.hits.empty());
     CHECK(r.io_error);
+    CHECK(r.io_error_offset == good);  // first unreadable byte
     r = run_job(job, s, pat(SearchKind::Hex, "11 11"), 0, SearchJob::Mode::All);
     CHECK(r.hits.size() == good / 2);  // matches before the unreadable bytes are still found
     CHECK(r.io_error);
+    CHECK(r.io_error_offset == good);
+    r = run_job(job, s, zeros, good + bad, SearchJob::Mode::Prev);  // backward into the bad range
+    CHECK(r.io_error);
+    CHECK(r.io_error_offset >= good);
+    CHECK(r.io_error_offset < good + bad);
     r = run_job(job, s, pat(SearchKind::Hex, "11"), 0, SearchJob::Mode::Next);
     CHECK(r.hits == std::vector<uint64_t>{0});
     CHECK_FALSE(r.io_error);
@@ -756,6 +762,48 @@ TEST_CASE("settings: hand-edited file, unknown keys preserved, bad values ignore
     REQUIRE(t.load(f));
     CHECK(t.recent_files == s.recent_files);
     CHECK(t.unknown_keys.size() == 2);
+}
+
+TEST_CASE("settings: a DPI-derived ui_scale from an older version is reset to 1.0 once") {
+    TempDir tmp;
+    std::string f = path_join(tmp.path, "settings.ini");
+    auto write = [&](const std::string& text) { REQUIRE(os_write_whole_atomic(f, text.data(), text.size())); };
+
+    write("ui_scale = 1.5\nfont_size = 16\n");  // old file: first run stored the monitor scale
+    Settings s;
+    REQUIRE(s.load(f));
+    CHECK(s.legacy_ui_scale);
+    CHECK(s.migrate_ui_scale(1.5f));
+    CHECK(s.ui_scale == 1.0f);
+    CHECK_FALSE(s.legacy_ui_scale);
+    CHECK_FALSE(s.migrate_ui_scale(1.5f));  // once
+    REQUIRE(s.save(f));
+
+    // Saved by this version: the value is a user factor and is kept, even if it equals the DPI.
+    Settings t;
+    REQUIRE(t.load(f));
+    CHECK_FALSE(t.legacy_ui_scale);
+    t.ui_scale = 1.5f;
+    REQUIRE(t.save(f));
+    REQUIRE(t.load(f));
+    CHECK_FALSE(t.migrate_ui_scale(1.5f));
+    CHECK(t.ui_scale == 1.5f);
+    CHECK(t.unknown_keys.empty());  // the marker key is not an unknown key
+
+    // Old files whose value does not look like the old default keep it.
+    for (auto [text, monitor] : {std::pair<const char*, float>{"ui_scale = 1.25\n", 1.5f},
+                                 {"ui_scale = 1\n", 1.0f}, {"ui_scale = 2\n", 1.0f}}) {
+        write(text);
+        Settings u;
+        REQUIRE(u.load(f));
+        const float before = u.ui_scale;
+        CHECK_FALSE(u.migrate_ui_scale(monitor));
+        CHECK(u.ui_scale == before);
+    }
+    write("font_size = 16\n");  // no ui_scale at all: nothing to migrate
+    Settings v;
+    REQUIRE(v.load(f));
+    CHECK_FALSE(v.legacy_ui_scale);
 }
 
 #ifdef _WIN32

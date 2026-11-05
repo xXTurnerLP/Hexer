@@ -8,6 +8,7 @@
 - [x] Save: fast in-place patching when size-preserving, otherwise temp-file + atomic rename; progress + cancel
 - [x] Hot exit / crash recovery (Sublime-style session), restore tabs, cursor, scroll, bookmarks, history
 - [x] External change detection (reload banner)
+- [x] Single instance (Sublime-like): a second `hexer` hands its files to the running window (`--new-instance` opts out)
 - [x] Dark theme, system fonts, zoom (Ctrl +/- / Ctrl+wheel), dockable panels
 - [x] Tabs, drag & drop, recent files, command-line files, reopen closed tab (Ctrl+Shift+T)
 - [x] Command palette (Ctrl+Shift+P) incl. script commands
@@ -58,3 +59,6 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
   an append-only chunk store would scale better for hundreds of MiB of pasted data.
 - The hex view is replaced by a progress placeholder while that document is being saved.
 - Script time limits only interrupt Lua code, not one long C call (e.g. `string.rep` of gigabytes).
+- `__gc` assigned to a metatable after `setmetatable` runs without the script time limit.
+- Single instance: bringing the running window to the front can be refused by Windows' foreground
+  rules when the second `hexer` was not started from the foreground (the taskbar button flashes).

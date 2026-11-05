@@ -10,6 +10,9 @@
 //   lock                held (OS file lock) by the instance that owns this directory
 //   instance-<k>/       same layout, used by further Hexer instances running at the same time;
 //                       the next instance that owns the main directory adopts their documents
+//   inbox/<pid>-<n>.paths  single instance: files a second Hexer process forwarded to the one
+//                       that owns the main directory (one UTF-8 path per line; empty = only
+//                       "come to the front"). Claimed by renaming to .taken, then deleted.
 //
 // Documents whose file cannot be restored right now (file on an unplugged drive / offline share /
 // locked, session file unreadable or written by another Hexer version) stay in the index and on
@@ -49,6 +52,8 @@ public:
     void discard_kept();  // give up on them (deleted; the index is rewritten by the next save())
     // True if another running instance owns dir(): this one persists into instance-<k>/.
     bool secondary();
+    // True if this instance owns dir() itself (and so receives forwarded files, see inbox_take).
+    bool primary();
 
 private:
     struct Saved {
@@ -75,5 +80,18 @@ private:
     std::vector<std::string> kept_;
     std::vector<Adopted> adopted_;
 };
+
+// ---- single instance (Sublime-like): a second process forwards its files and exits ----------
+// True if a running process holds the lock of the main session directory `dir` right now.
+bool session_primary_running(const std::string& dir);
+// Atomically writes a new "<dir>/inbox/<pid>-<n>.paths" holding `files` (absolute paths); *posted
+// gets its path (for inbox_withdraw).
+bool inbox_post(const std::string& dir, const std::vector<std::string>& files, std::string* posted,
+                std::string* err = nullptr);
+// Takes every message in "<dir>/inbox" (in name order), including ones a crashed instance
+// left behind: claims (renames), reads and deletes each. One path list per message.
+std::vector<std::vector<std::string>> inbox_take(const std::string& dir);
+// Withdraws a posted message; false if it was already taken (the running instance has it).
+bool inbox_withdraw(const std::string& posted);
 
 }  // namespace hx

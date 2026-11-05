@@ -20,7 +20,7 @@ void apply_dark_theme(float ui_scale);
 struct HexColors {
     uint32_t background, row_alt, offset_text, header_text, hex_text, zero_text, ascii_text,
         nonprint_text, cursor, cursor_inactive, selection, modified_text, hover, separator,
-        search_hit, bookmark;
+        search_hit, bookmark, unreadable_text;
 };
 const HexColors& hex_colors();
 

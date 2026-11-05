@@ -25,6 +25,17 @@ struct BusyGuard {
     ~BusyGuard() { flag = false; }
 };
 
+// Clears Progress::committing when a save phase ends (success or failure).
+struct CommitGuard {
+    Progress* p;
+    void begin() {
+        if (p) p->committing = true;
+    }
+    ~CommitGuard() {
+        if (p) p->committing = false;
+    }
+};
+
 struct Range {
     uint64_t off, len;
     uint64_t end() const { return off + len; }
@@ -111,10 +122,13 @@ bool references_ranges(const std::vector<Piece>& ps, uint32_t cur, const std::ve
 size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
                    const std::vector<std::shared_ptr<AddBuffer::Chunk>>& chunks,
                    const std::vector<Piece>& pieces, size_t i, uint64_t off, uint8_t* dst, size_t len,
-                   bool* ok, size_t* valid = nullptr) {
+                   bool* ok, size_t* valid = nullptr, uint8_t* unreadable = nullptr) {
     auto bad_at = [&](size_t at) {
         if (ok) *ok = false;
         if (valid && at < *valid) *valid = at;
+    };
+    auto mark = [&](size_t at, size_t n) {
+        if (unreadable) std::memset(unreadable + at, 1, n);
     };
     size_t done = 0;
     while (done < len && i < pieces.size()) {
@@ -127,6 +141,7 @@ size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
             } else {
                 std::memset(dst + done, 0, n);
                 bad_at(done);
+                mark(done, n);
             }
         } else {
             const FileSource* s = p.chunk < sources.size() ? sources[p.chunk].get() : nullptr;
@@ -141,6 +156,7 @@ size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
                 size_t skip = s ? size_t(std::min<uint64_t>(n - got, FileSource::kBlockSize - at % FileSource::kBlockSize))
                                 : n - got;
                 std::memset(dst + done + got, 0, skip);
+                mark(done + got, skip);
                 got += skip;
             }
         }
@@ -278,6 +294,22 @@ size_t Document::read(uint64_t offset, uint8_t* dst, size_t len) const {
     len = size_t(std::min<uint64_t>(len, table_.size() - offset));
     auto [i, off] = table_.locate(offset);
     return read_pieces(sources_, add_.chunks(), table_.pieces(), i, off, dst, len, nullptr);
+}
+
+size_t Document::read(uint64_t offset, uint8_t* dst, size_t len, uint8_t* unreadable) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (offset >= table_.size() || len == 0) return 0;
+    len = size_t(std::min<uint64_t>(len, table_.size() - offset));
+    std::memset(unreadable, 0, len);
+    auto [i, off] = table_.locate(offset);
+    return read_pieces(sources_, add_.chunks(), table_.pieces(), i, off, dst, len, nullptr, nullptr, unreadable);
+}
+
+bool Document::io_error() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& s : sources_)
+        if (s && s->io_error()) return true;
+    return false;
 }
 
 std::shared_ptr<Snapshot> Document::make_snapshot() const {
@@ -575,8 +607,17 @@ void Document::begin_group(const std::string& label) {
         group_label_ = label;
         group_pushed_ = false;
         coalesce_open_ = false;
+    } else if (!label.empty()) {
+        // Innermost non-empty label wins, also for the step an outer group already pushed.
+        group_label_ = label;
+        if (group_pushed_ && !undo_.empty()) undo_.back().label = label;
     }
     group_depth_++;
+}
+
+bool Document::in_group() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return group_depth_ > 0;
 }
 
 void Document::end_group() {
@@ -812,6 +853,9 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
         persist_gen_++;
     }
 
+    // Point of no return: the file is being patched; cancel is no longer checked.
+    CommitGuard commit{progress};
+    commit.begin();
     bool ok = true;
     uint64_t done = progress ? progress->done.load() : 0;
     for (size_t i = 0; i < snap.pieces.size() && ok; ++i) {
@@ -884,6 +928,8 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
             if (progress) progress->done = off;
         }
         if (why.empty() && !f->flush()) why = "Flush failed while saving; nothing was changed";
+        // Flushing gigabytes takes a while: Cancel pressed meanwhile still stops before the rename.
+        if (why.empty() && progress && progress->cancel) why = "Save cancelled";
         f.reset();
         if (!why.empty()) {
             os_remove(tmp);
@@ -897,6 +943,9 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
         std::lock_guard<std::mutex> lk(mu_);
         old_cur = sources_.back();
     }
+    // Point of no return: the rename replaces the target; cancel is no longer checked.
+    CommitGuard commit{progress};
+    commit.begin();
     std::string rerr;
     if (!os_replace_file(tmp, real, &rerr)) {
         // Some filesystems cannot replace a file we still hold open: release ours and retry.

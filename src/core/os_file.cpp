@@ -568,6 +568,14 @@ std::string os_exe_dir() {
 #endif
 }
 
+uint64_t os_process_id() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return uint64_t(::getpid());
+#endif
+}
+
 std::string os_env(const char* name) {
 #ifdef _WIN32
     std::wstring wname = utf8_to_wide(name);

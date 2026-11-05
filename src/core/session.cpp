@@ -353,6 +353,7 @@ bool Session::acquire() {
 }
 
 bool Session::secondary() { return acquire() && slot_dir_ != dir_; }
+bool Session::primary() { return acquire() && slot_dir_ == dir_; }
 
 bool Session::save(const std::vector<Document*>& docs, int active_index, std::string* err) {
     if (!acquire()) {
@@ -562,6 +563,73 @@ void Session::discard_kept() {
     if (!acquire()) return;
     for (const std::string& f : kept_) os_remove(path_join(slot_dir_, f));
     kept_.clear();
+}
+
+// ---- single instance inbox ----------------------------------------------------------------------
+
+namespace {
+std::string inbox_dir(const std::string& dir) { return path_join(dir, "inbox"); }
+}  // namespace
+
+bool session_primary_running(const std::string& dir) {
+    bool held = false;
+    auto l = OsLock::acquire(path_join(dir, "lock"), &held);
+    return !l && held;  // taken by us: nobody runs (released again right here)
+}
+
+bool inbox_post(const std::string& dir, const std::vector<std::string>& files, std::string* posted,
+                std::string* err) {
+    const std::string in = inbox_dir(dir);
+    if (!os_mkdirs(in)) {
+        if (err) *err = "cannot create " + in;
+        return false;
+    }
+    std::string text;
+    for (const std::string& f : files) text += f + "\n";
+    const std::string prefix = path_join(in, std::to_string(os_process_id()) + "-");
+    std::string file;
+    for (int n = 1;; ++n) {  // a stale file of a recycled pid must not be replaced
+        file = prefix + std::to_string(n) + ".paths";
+        if (!os_stat(file).exists && !os_stat(file + ".taken").exists) break;
+    }
+    if (!os_write_whole_atomic(file, text.data(), text.size(), err)) return false;
+    if (posted) *posted = file;
+    return true;
+}
+
+std::vector<std::vector<std::string>> inbox_take(const std::string& dir) {
+    std::vector<std::vector<std::string>> out;
+    const std::string in = inbox_dir(dir);
+    // ".taken" leftovers: claimed by an instance that died before reading them.
+    std::vector<std::string> claimed = os_list_files(in, ".paths.taken");
+    for (const std::string& f : os_list_files(in, ".paths"))
+        if (os_replace_file(f, f + ".taken")) claimed.push_back(f + ".taken");  // fails: withdrawn
+    for (const std::string& f : claimed) {
+        std::string text;
+        const bool ok = os_read_whole(f, text);
+        os_remove(f);
+        if (!ok) continue;
+        std::vector<std::string> paths;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t eol = text.find('\n', pos);
+            if (eol == std::string::npos) eol = text.size();
+            std::string line = text.substr(pos, eol - pos);
+            pos = eol + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) paths.push_back(std::move(line));
+        }
+        out.push_back(std::move(paths));
+    }
+    return out;
+}
+
+bool inbox_withdraw(const std::string& posted) {
+    // A rename fails if the running instance claimed the file first (os_remove would not tell).
+    const std::string gone = posted + ".withdrawn";
+    if (!os_replace_file(posted, gone)) return false;
+    os_remove(gone);
+    return true;
 }
 
 }  // namespace hx

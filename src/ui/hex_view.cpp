@@ -704,7 +704,9 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     const uint64_t vis_begin = top * bpr;
     const uint64_t vis_end = std::min(size, (top + draw_rows) * bpr);
     buf_.resize(size_t(draw_rows * bpr));
-    const size_t got = vis_end > vis_begin ? doc.read(vis_begin, buf_.data(), size_t(vis_end - vis_begin)) : 0;
+    bad_.resize(buf_.size());
+    const size_t got =
+        vis_end > vis_begin ? doc.read(vis_begin, buf_.data(), size_t(vis_end - vis_begin), bad_.data()) : 0;
     const uint64_t data_end = vis_begin + got;  // bytes in [vis_begin, data_end) are available
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -798,6 +800,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         const int row_len = rs < data_end ? int(std::min(bpr, data_end - rs)) : 0;
         if (row_len == 0) continue;
         const uint8_t* bytes = buf_.data() + (rs - vis_begin);
+        const uint8_t* bad = bad_.data() + (rs - vis_begin);
         const bool row_modified = cfg.highlight_modified && doc.is_modified_range(rs, uint64_t(row_len));
 
         TextRun hex_run(dl, L, L.hex_x, y);
@@ -806,14 +809,20 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             const uint8_t b = bytes[i];
             const bool modified = row_modified && doc.is_modified_range(rs + uint64_t(i), 1);
             const bool is_caret = caret_visible && row == cur_row && i == cur_col;
+            const bool unreadable = bad[i] != 0;  // I/O error: not a real zero
             char t[2] = {hexchars[b >> 4], hexchars[b & 0xF]};
-            uint32_t hc = modified ? C.modified_text : (b == 0 ? C.zero_text : C.hex_text);
+            if (unreadable) t[0] = t[1] = '?';
+            uint32_t hc = unreadable ? C.unreadable_text
+                          : modified ? C.modified_text
+                                     : (b == 0 ? C.zero_text : C.hex_text);
             if (is_caret && caret_solid_hex) hc = on_caret;
             hex_run.put(L.cell(i), t, 2, hc);
             if (L.ascii) {
-                const bool printable = b >= 0x20 && b < 0x7F;
-                char ch = printable ? char(b) : '.';
-                uint32_t tc = modified ? C.modified_text : (printable ? C.ascii_text : C.nonprint_text);
+                const bool printable = !unreadable && b >= 0x20 && b < 0x7F;
+                char ch = unreadable ? '?' : printable ? char(b) : '.';
+                uint32_t tc = unreadable ? C.unreadable_text
+                              : modified ? C.modified_text
+                                         : (printable ? C.ascii_text : C.nonprint_text);
                 if (is_caret && caret_solid_txt) tc = on_caret;
                 txt_run.put(i, &ch, 1, tc);
             }
