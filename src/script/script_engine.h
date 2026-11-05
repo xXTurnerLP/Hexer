@@ -53,7 +53,7 @@
 //   doc:write(off, bytes)   doc:insert(off, bytes)   doc:erase(off, len)   doc:replace(off, len, bytes)
 //   doc:transaction(fn, label?)          -- all edits inside fn become ONE undo step; inside a
 //                                           command (already one step) a label renames that step
-//   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:goto(off)
+//   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:jump(off) (alias doc["goto"])
 //       (`goto` is a Lua keyword: write doc:jump(off), the same function, or doc["goto"](doc, off))
 //   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")
 //   doc:hash(algo, off?, len?) -> hex   (default: the whole doc; clamped to EOF; at most 256 MiB per
