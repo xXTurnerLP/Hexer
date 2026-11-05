@@ -46,6 +46,8 @@
 //
 // Doc (userdata; every call raises "document closed" if its tab was closed):
 //   doc:size()  doc:name()  doc:path()  doc:id()
+//   doc:target() -> "file" | "device" | "process"   doc:pid() -> process id (process memory) | nil
+//       (process memory: offset = virtual address, unmapped pages read as 0; fixed size)
 //   doc:read(off, len) -> string         (clamped to EOF; at most 64 MiB per call)
 //   doc:u8(off) doc:i8(off) doc:u16le/u16be/i16le/i16be/u32le/u32be/i32le/i32be/
 //       u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)  -> number (nil past EOF)

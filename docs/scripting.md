@@ -225,6 +225,7 @@ check (see `png.lua`) shows the mismatch, or write a command that fixes it (see 
 | Call | |
 |---|---|
 | `doc:size()` `doc:name()` `doc:path()` `doc:id()` | |
+| `doc:target()` `doc:pid()` | `"file"` (also untitled), `"device"` (raw disk / volume) or `"process"`; `doc:pid()` is the process id of a process-memory document, else `nil`. In process memory the offset is the virtual address, unmapped pages read as `0` (`doc:read` returns zeros there), and the size cannot change: `doc:insert` / `doc:erase` edits are refused when saving |
 | `doc:read(off, len)` | string, clamped to the end; at most 64 MiB per call |
 | `doc:u8(off)` `doc:i8(off)` `doc:u16le/u16be/i16le/i16be/u24le/u24be/u32le/u32be/i32le/i32be/u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)` | number, or `nil` past the end |
 | `doc:write(off, bytes)` | overwrite (may extend at the end) |

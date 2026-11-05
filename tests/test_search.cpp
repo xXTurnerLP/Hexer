@@ -890,7 +890,7 @@ TEST_CASE("settings: follow pointer and hash algorithm fields round trip, bad wi
     CHECK(t.pointer_width == 8);
     CHECK(t.pointer_base == 0x140000000ull);
     CHECK(t.hash_algorithms == "CRC-32,SHA-256");
-    for (const char* bad : {"3", "16", "0", "-4", "x"}) {
+    for (const char* bad : {"5", "16", "0", "-4", "x"}) {
         std::string text = std::string("pointer_width = ") + bad + "\n";
         REQUIRE(os_write_whole_atomic(f, text.data(), text.size()));
         Settings u;

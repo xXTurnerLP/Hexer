@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "core/nav.h"
 #include "core/os_file.h"
 
 namespace hx {
@@ -107,10 +108,13 @@ bool Settings::load(const std::string& path) {
         else if (key == "big_endian_inspector") parse_bool(v, big_endian_inspector);
         else if (key == "pointer_width") {
             int w = 0;
-            if (parse_int(v, -1, 9, w) && (w == 1 || w == 2 || w == 4 || w == 8)) pointer_width = w;
+            if (parse_int(v, -1, 9, w) && valid_pointer_width(w)) pointer_width = w;
         }
+        else if (key == "pointer_signed") parse_bool(v, pointer_signed);
+        else if (key == "pointer_relative") parse_bool(v, pointer_relative);
         else if (key == "pointer_base") parse_u64(v, pointer_base);
         else if (key == "hash_algorithms") hash_algorithms = v;
+        else if (key == "bookmarks_all_files") parse_bool(v, bookmarks_all_files);
         else if (key == "font_size") parse_float(v, 6.0f, 96.0f, font_size);
         else if (key == "ui_scale") saw_ui_scale = parse_float(v, 0.5f, 4.0f, ui_scale) || saw_ui_scale;
         else if (key == "ui_scale_factor") saw_factor = true;
@@ -170,8 +174,11 @@ bool Settings::save(const std::string& path) const {
     put("insert_mode", b(insert_mode));
     put("big_endian_inspector", b(big_endian_inspector));
     put("pointer_width", std::to_string(pointer_width));
+    put("pointer_signed", b(pointer_signed));
+    put("pointer_relative", b(pointer_relative));
     put("pointer_base", std::to_string(pointer_base));
     put("hash_algorithms", hash_algorithms);
+    put("bookmarks_all_files", b(bookmarks_all_files));
     put("font_size", fmt_float(font_size));
     put("ui_scale", fmt_float(ui_scale));
     put("ui_scale_factor", "true");  // marks ui_scale as a user factor (see legacy_ui_scale)

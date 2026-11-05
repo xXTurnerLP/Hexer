@@ -240,6 +240,22 @@ int doc_id(lua_State* L) {
     return 1;
 }
 
+// "file" (also untitled documents), "device" (raw disk / volume) or "process" (process memory).
+int doc_target(lua_State* L) {
+    const SourceKind k = check_doc(L, 1)->target();
+    lua_pushstring(L, k == SourceKind::Process ? "process" : k == SourceKind::Device ? "device" : "file");
+    return 1;
+}
+
+int doc_pid(lua_State* L) {
+    const Document* d = check_doc(L, 1);
+    if (d->target() == SourceKind::Process)
+        lua_pushinteger(L, lua_Integer(d->process_id()));
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
 int doc_read(lua_State* L) {
     Document* d = check_doc(L, 1);
     uint64_t off = check_u64(L, 2);
@@ -486,7 +502,7 @@ const luaL_Reg kDocMethods[] = {
     {"transaction", doc_transaction},                      {"cursor", doc_cursor},
     {"selection", doc_selection},                          {"select", doc_select},
     {"goto", doc_goto},       {"jump", doc_goto},          {"find", doc_find},
-    {"hash", doc_hash},
+    {"hash", doc_hash},       {"target", doc_target},      {"pid", doc_pid},
     {nullptr, nullptr},
 };
 

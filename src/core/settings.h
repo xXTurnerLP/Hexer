@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/nav.h"
+
 namespace hx {
 
 struct Settings {
@@ -15,12 +17,28 @@ struct Settings {
     bool show_ascii = true;
     bool insert_mode = false;          // default typing mode for new tabs
     bool big_endian_inspector = false;  // also the byte order of Follow pointer (Ctrl+click)
-    // Follow pointer: a Ctrl+click reads an unsigned pointer_width-byte integer (1, 2, 4 or 8) at
-    // the byte and jumps to value - pointer_base (e.g. a load address).
+    // Follow pointer type (core/nav.h PointerType): a Ctrl+click reads a pointer_width-byte integer
+    // (1, 2, 3, 4 or 8; signed if pointer_signed) at the byte and jumps to value - pointer_base
+    // (e.g. a load address), or with pointer_relative to the byte's offset + value. Byte order is
+    // big_endian_inspector. Picked in Settings, Search > Follow Pointer Settings or by clicking an
+    // integer row in the Inspector.
     int pointer_width = 4;
+    bool pointer_signed = false;
+    bool pointer_relative = false;
     uint64_t pointer_base = 0;
+    PointerType pointer_type() const {
+        PointerType t;
+        t.width = pointer_width;
+        t.is_signed = pointer_signed;
+        t.big_endian = big_endian_inspector;
+        t.relative = pointer_relative;
+        t.base = pointer_base;
+        return t;
+    }
     // Hashes panel: selected algorithms, comma-separated display names ("" = the defaults).
     std::string hash_algorithms;
+    // Bookmarks panel: list the bookmarks of every open file, not just the active tab's.
+    bool bookmarks_all_files = false;
     float font_size = 16.0f;           // monospace font pixel size (Ctrl +/- / Ctrl+wheel)
     // User zoom factor for the UI on top of the monitor's content scale (DPI), which is read at
     // startup and followed when the window moves to another monitor: 1.0 = native size everywhere.

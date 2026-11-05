@@ -35,8 +35,17 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Native file dialogs, drag & drop, long saves with Cancel, the external-change banner
 - [ ] Linux build (POSIX code paths are written but have never been compiled)
 
+### User feedback fixes
+- [x] App icon consistent at every size (16/24/32 px hand-drawn pixel art of the same pointy-top
+      hexagon and "101" as the large sizes; `tools/make_icon.py`)
+- [x] Follow pointer type picked in the Inspector: clicking an integer row (int8..uint64, 24-bit
+      too) sets width + signedness (byte order = LE/BE), the row is marked and its bytes are
+      outlined in the hex view; signed and relative pointers; Structure fields follow as their own type
+
 ## Later
-- [ ] History panel (click to jump to any undo state)
+- [x] History panel (View > History: every undo state with its label and changed range; click to
+      undo / redo to it; "saved" tag)
+- [ ] History: relative time per entry (UndoEntry has no timestamp yet; needs the session format)
 - [ ] Undo for the remaining view-level actions that benefit from it (read-only toggle, chosen parser)
 - [x] Hashes & checksums of selection (Hashes panel: 16 CRCs/checksums/hashes, background, expected
       value match; `hx.hash` / `doc:hash`)
@@ -49,18 +58,29 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Bit-field / flags display in the Inspector (named bits, editable)
 - [x] Diff/compare two files with synced scrolling (File > Compare With: a Compare tab, F7 / Shift+F7,
       shift for inserted headers, "Align at Cursors")
-- [ ] Compare: find the shift automatically (align on the first matching block); keep the Compare
-      tab in the session; compare a document with its version on disk
+- [x] Compare: keep the Compare tab (documents + shift) in the session
+- [ ] Compare: find the shift automatically (align on the first matching block); compare a
+      document with its version on disk
 - [ ] Headless tests for DiffView / PacketsPanel / BitmapPanel (view_diff.cpp etc. live in hexer_ui,
       which test_ui does not link; move them to hexer_ui_view or add a test exe)
-- [ ] Open process memory and raw disks/devices
+- [x] Open process memory and raw disks/devices (File > Open Process... / Open Disk..., Regions
+      panel, read-only unless asked, in-place saves of overwrites, `doc:target()` / `doc:pid()`)
+- [ ] Process memory: Search / Strings / XOR search / minimap stop at the first unreadable byte
+      (the null page at 0), so they find nothing yet; skip holes with `Snapshot::next_readable`
+      (core/document.h) in search.cpp, strings_scan.cpp, xorscan.cpp, entropy.cpp
+- [ ] Process memory: default the follow-pointer width to the process's pointer size; module
+      list / jump to a module's base from the palette; Lua `hx.open_process(pid)`
+- [ ] Compile and test core/procmem.cpp + core/devices.cpp on Linux (/proc/PID/mem, /sys/block)
+- [ ] Verify by hand: Open Process / Open Disk pickers, writable process save, the Regions click
+      (screenshots only so far)
 - [x] pcap/pcapng: Packets panel (index in the background, filter, "Parse with" a parser over each
       packet or its payload, Up / Down steps and re-parses); auto-shown for captures
 - [ ] Packets: open a packet / TCP stream as its own tab, filter expressions (ip.src == ...)
-- [ ] Split view of the same document, multi-selection
+- [x] Split view of the same document (View > Split View, Ctrl+\, F6; kept in the session)
+- [ ] Multi-selection
 - [x] C struct → parser: paste C definitions, get a Lua parser (apply at the cursor or save it)
 - [x] Parse at offset (Structure panel "Parse at", e.g. a PNG inside a dump)
-- [ ] Remember the parse offset in the session (it is per tab and lost on restart now)
+- [x] Remember the parse offset in the session (Parse at offset / range per tab)
 - [x] Follow pointer: Ctrl+click / Ctrl+Enter, width + base + byte order settings, Inspector /
       Structure buttons; jump history (Alt+Left / Alt+Right, mouse back / forward)
 - [x] Strings panel (ASCII / UTF-16, min length, background scan, click to jump, live filter)
@@ -75,13 +95,17 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Disassembly at cursor (Capstone: x86/x64/ARM/AArch64/...)
 - [x] Live tail mode for growing files (captures, logs): View > Live Tail, follows the end while the
       caret is there, a rewrite falls back to the "changed on disk" banner
-- [ ] Live tail: remember the toggle in the session (today it is off after a restart); rescan the
-      Packets index incrementally while a capture grows
-- [ ] XOR / rotate brute-force helpers to find simple obfuscation
+- [x] Live tail: remember the toggle in the session
+- [ ] Live tail: rescan the Packets index incrementally while a capture grows
+- [x] XOR / rotate brute-force helpers to find simple obfuscation (XOR Search panel: known
+      plaintext with 1-byte XOR / ADD / ROL and 2..16-byte XOR keys, key guess, undoable decode)
+- [ ] XOR search: Lua API (`hx.xor_scan`, key guess); multi-byte ADD keys
 - [ ] Script API: `doc:view_range()` (visible bytes); bookmark access from Lua
 - [ ] "Restore from .backup" command (swap the file with its `.backup`, or open the backup side by side)
 - [ ] Live font reload from the Settings window (font file / hinting changes need a restart now)
-- [ ] Settings: remember the Bookmarks panel's "All open files" toggle
+- [x] Settings: remember the Bookmarks panel's "All open files" toggle
+- [ ] Headless App-level tests (session extras round trip of split / tail / parse at / Compare,
+      the History and XOR panels' clicks): app.cpp is not linked by any test exe yet
 - [ ] Linux CI + AppImage; Windows portable zip
 - [ ] Compile the visual-analysis / compare / capture batch with GCC and Clang (written for
       -Wall -Wextra but only built with MSVC so far)

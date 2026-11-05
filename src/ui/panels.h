@@ -4,6 +4,8 @@
 // and with a document that is currently being saved (busy: not touched at all).
 #include <cstdint>
 
+#include "core/nav.h"
+
 namespace hx {
 
 struct App;
@@ -32,9 +34,27 @@ void draw_hash_panel(App& app);            // "Hashes": ui/panel_hash.h (selecti
 void draw_bitmap_panel(App& app);          // "Bitmap": ui/panel_bitmap.h (bytes as pixels, click jumps)
 void draw_packets_panel(App& app);         // "Packets": ui/panel_packets.h (pcap/pcapng packet list;
                                            // a row selects the packet, "Parse with" parses it)
+void draw_history_panel(App& app);         // "History": ui/panel_history.h (click a state to undo / redo to it)
+void draw_xor_panel(App& app);             // "XOR Search": ui/panel_xor.h (known plaintext / key guess)
+void draw_regions_panel(App& app);         // "Regions": memory map of a process document (ui/dialog_targets.h)
 void draw_status_bar(App& app);            // fixed bottom bar (call before the dockspace)
 
 // Bookmark the selection (or the caret byte) of `d`, undoable; reports in the status bar.
 void add_bookmark_here(App& app, Document& d);
+
+// ---- follow pointer type (picked in the Inspector, Settings or Search > Follow Pointer Settings) ----
+// The type itself is app.settings.pointer_type(): width / signedness (clicking an integer row in
+// the Inspector sets them), relative, base, byte order = the Inspector's LE / BE.
+//
+// Decodes the pointer of `type` at `at` in the tab's document and jumps there (recorded in the
+// history, reveal_range). Reports success / failure in the status bar.
+bool follow_pointer_as(App& app, Tab& tab, uint64_t at, const PointerType& type);
+// Width / Signed / Relative / Big endian / base editors (Search menu: in_menu = true; Settings
+// window: false). Edits app.settings in place; returns true on change (caller marks settings dirty).
+bool draw_pointer_settings(App& app, bool in_menu);
+// The bytes the Inspector's hovered row (else its selected row) covers at its decode position, for
+// HexViewConfig::mark_offset / mark_length of `t`'s view. False (0, 0) when `t` is not the active
+// tab, the Inspector is hidden or the row does not decode there.
+bool inspector_mark(App& app, const Tab& t, uint64_t& offset, uint64_t& length);
 
 }  // namespace hx

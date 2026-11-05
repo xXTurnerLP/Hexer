@@ -1,5 +1,5 @@
 // Dockable panels: Inspector, Structure, Console, Search Results, Bookmarks, Strings, Hashes,
-// Bitmap, Packets + the status bar.
+// Bitmap, Packets, History, XOR Search, Regions + the status bar.
 // Each panel reads the active tab through App helpers and never touches a busy (saving) document.
 #include "ui/panels.h"
 
@@ -106,13 +106,12 @@ bool follow_button(bool enabled, const std::string& tooltip) {
     return clicked && enabled;
 }
 
-// Tooltip / target of following the `width`-byte pointer at `at`.
-std::string follow_tip(App& app, const Document& d, uint64_t at, int width, bool be, bool& ok) {
+// Tooltip / target of following the pointer of type `pt` at `at`.
+std::string follow_tip(const Document& d, uint64_t at, const PointerType& pt, bool& ok) {
     uint64_t target = 0;
-    ok = decode_pointer(d, at, width, be, app.settings.pointer_base, target);
-    std::string base = app.settings.pointer_base ? " - base " + fmt_offset(app.settings.pointer_base) : std::string();
-    return ok ? "Follow pointer" + base + " \xE2\x86\x92 " + fmt_offset(target) + "  (Alt+Left goes back)"
-              : "Cannot follow: the value" + base + " points beyond EOF";
+    ok = decode_pointer(d, at, pt, target);
+    return ok ? "Follow " + pointer_type_name(pt) + " \xE2\x86\x92 " + fmt_offset(target) + "  (Alt+Left goes back)"
+              : "Cannot follow " + pointer_type_name(pt) + ": negative, below the base or beyond EOF";
 }
 
 std::string hex_preview(const uint8_t* data, size_t n) {
@@ -156,8 +155,37 @@ void commit_inspector_edit(App& app, Document& d, const InspRow& r, bool be) {
                         fmt_offset(at));
 }
 
+// The Inspector row under the mouse, for inspector_mark() (which may run before the panel in a
+// frame, so the previous frame's row counts too).
+struct InspectorHover {
+    int row = -1;          // hovered row (index = InspType), -1 = none
+    int frame = -100;      // frame `row` was seen
+    int drawn_frame = -100;  // last frame the Inspector's rows were drawn
+};
+InspectorHover g_insp_hover;
+
+// Makes integer row `type` the follow-pointer type (width + signedness; byte order stays the
+// Inspector's LE / BE). Nothing for other rows: the last integer type is kept.
+void pick_follow_type(App& app, InspType type) {
+    int w = 0;
+    bool sgn = false;
+    if (!insp_int_type(type, w, sgn)) return;
+    Settings& s = app.settings;
+    if (s.pointer_width == w && s.pointer_signed == sgn) return;
+    s.pointer_width = w;
+    s.pointer_signed = sgn;
+    mark_settings_dirty(app);
+    set_status(app, "Follow pointer type: " + pointer_type_name(s.pointer_type()) +
+                        "  (Ctrl+click / Ctrl+Enter in the hex view)");
+}
+
 void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, bool be) {
     const uint64_t cur = focus_offset(d.view());
+    const PointerType pt = app.settings.pointer_type();
+    int iw = 0;
+    bool isg = false;
+    const bool is_int = insp_int_type(r.type, iw, isg);
+    const bool is_follow = is_int && iw == pt.width && isg == pt.is_signed;
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::PushID(i);
@@ -165,20 +193,41 @@ void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, 
     const char* value = r.value.empty() ? "-" : r.value.c_str();
     if (ImGui::Selectable(r.name, app.insp_sel == i,
                           ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick |
-                              ImGuiSelectableFlags_AllowOverlap))
+                              ImGuiSelectableFlags_AllowOverlap)) {
         app.insp_sel = i;
+        pick_follow_type(app, r.type);
+    }
     const bool hovered = ImGui::IsItemHovered();
+    if (hovered) {
+        g_insp_hover.row = i;
+        g_insp_hover.frame = ImGui::GetFrameCount();
+    }
     if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && r.editable && !d.read_only())
         app.insp_edit.begin(i, cur, r.value);
-    if (hovered && !editing && r.size)
-        ImGui::SetItemTooltip("%s: %zu byte%s%s", r.name, r.size, r.size == 1 ? "" : "s",
-                              r.editable ? "  (double-click or Enter to edit)" : "");
+    if (hovered && !editing && (r.size || is_int))
+        ImGui::SetItemTooltip("%s: %zu byte%s%s%s", r.name, r.size, r.size == 1 ? "" : "s",
+                              r.editable ? "  (double-click or Enter to edit)" : "",
+                              is_follow ? "\nThe follow-pointer type (Ctrl+click / Ctrl+Enter in the hex view)"
+                              : is_int  ? "\nClick: follow pointers as this type (Ctrl+click in the hex view)"
+                                        : "");
     if (ImGui::BeginPopupContextItem("##ctx")) {
         if (ImGui::MenuItem("Copy value")) ImGui::SetClipboardText(value);
         if (ImGui::MenuItem("Edit value", nullptr, false, r.editable && !d.read_only()))
             app.insp_edit.begin(i, cur, r.value);
+        if (is_int) {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Use as Follow Pointer Type", nullptr, is_follow)) pick_follow_type(app, r.type);
+        }
         close_popup_on_escape();
         ImGui::EndPopup();
+    }
+    if (is_follow) {  // link glyph at the right end of the name cell
+        const char* arrow = "\xE2\x86\x92";  // U+2192
+        ImGui::SameLine();
+        const float aw = ImGui::CalcTextSize(arrow).x;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        if (avail > aw) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - aw);
+        ImGui::TextColored(kInputColor, "%s", arrow);
     }
     ImGui::TableSetColumnIndex(1);
     if (editing) {
@@ -192,11 +241,10 @@ void draw_inspector_row(App& app, Tab& t, Document& d, const InspRow& r, int i, 
         else
             ImGui::TextUnformatted(value);
         ImGui::PopFont();
-        const int width = r.type == InspType::U32 ? 4 : r.type == InspType::U64 ? 8 : 0;
-        if (width && r.size) {
+        if (is_follow && r.size) {
             bool ok = false;
-            const std::string tip = follow_tip(app, d, cur, width, be, ok);
-            if (follow_button(ok, tip)) follow_pointer(app, t, cur, width, be);
+            const std::string tip = follow_tip(d, cur, pt, ok);
+            if (follow_button(ok, tip)) follow_pointer_as(app, t, cur, pt);
         }
     }
     ImGui::PopID();
@@ -263,10 +311,108 @@ void draw_inspector_panel(App& app) {
         ImGui::TableHeadersRow();
         for (size_t i = 0; i < rows.size(); ++i) draw_inspector_row(app, *active_tab(app), *d, rows[i], int(i), be);
         ImGui::EndTable();
+        g_insp_hover.drawn_frame = ImGui::GetFrameCount();
     }
     ImGui::Separator();
     draw_selection_info(*d);
     ImGui::End();
+}
+
+bool inspector_mark(App& app, const Tab& t, uint64_t& offset, uint64_t& length) {
+    offset = length = 0;
+    const int frame = ImGui::GetFrameCount();
+    if (!app.show_inspector || g_insp_hover.drawn_frame < frame - 1 || active_tab(app) != &t || !t.doc ||
+        t.doc->busy())
+        return false;
+    int row = g_insp_hover.frame >= frame - 1 ? g_insp_hover.row : -1;
+    if (row < 0) row = app.insp_sel;
+    if (row < 0 || row >= int(InspType::Count)) return false;
+    const Document& d = *t.doc;
+    const uint64_t at = focus_offset(d.view());
+    uint8_t buf[16] = {};
+    const size_t n = d.read(at, buf, sizeof buf);
+    const std::vector<InspRow> rows = inspect(buf, n, app.settings.big_endian_inspector);
+    if (size_t(row) >= rows.size() || rows[size_t(row)].size == 0) return false;
+    offset = at;
+    length = rows[size_t(row)].size;
+    return true;
+}
+
+bool follow_pointer_as(App& app, Tab& tab, uint64_t at, const PointerType& type) {
+    Document& d = *tab.doc;
+    if (d.busy()) return false;
+    uint64_t target = 0;
+    if (!decode_pointer(d, at, type, target)) {
+        set_status(app, "No pointer to follow at " + fmt_offset(at) + " (" + pointer_type_name(type) +
+                            "): unreadable, negative, below the base or beyond EOF");
+        return false;
+    }
+    reveal_range(app, tab, target, 0, true);
+    set_status(app, "Followed " + pointer_type_name(type) + " at " + fmt_offset(at) + " -> " + fmt_offset(target) +
+                        "  (Alt+Left goes back)", 6.0);
+    return true;
+}
+
+bool draw_pointer_settings(App& app, bool in_menu) {
+    Settings& s = app.settings;
+    bool changed = false;
+    static const int kWidths[] = {1, 2, 3, 4, 8};
+    auto width_label = [](int w) {
+        return std::to_string(w) + (w == 1 ? " byte" : " bytes") + " (" + std::to_string(w * 8) + "-bit)";
+    };
+    auto set_width = [&](int w) {
+        changed |= s.pointer_width != w;
+        s.pointer_width = w;
+    };
+    const char* signed_tip = "Sign-extend the value: a negative absolute pointer cannot be followed, a negative "
+                             "relative one points backwards";
+    const char* rel_tip = "target = offset of the pointer + value (self-relative offsets, rel32 displacements); "
+                          "the base is not used";
+    if (in_menu) {
+        ImGui::TextDisabled("Type: %s", pointer_type_name(s.pointer_type()).c_str());
+        if (ImGui::BeginMenu("Pointer Width")) {
+            for (int w : kWidths)
+                if (ImGui::MenuItem(width_label(w).c_str(), nullptr, s.pointer_width == w)) set_width(w);
+            ImGui::EndMenu();
+        }
+        changed |= ImGui::MenuItem("Signed", nullptr, &s.pointer_signed);
+        ImGui::SetItemTooltip("%s", signed_tip);
+        changed |= ImGui::MenuItem("Relative to the Pointer", nullptr, &s.pointer_relative);
+        ImGui::SetItemTooltip("%s", rel_tip);
+        changed |= ImGui::MenuItem("Big Endian (same as the Inspector)", nullptr, &s.big_endian_inspector);
+    } else {
+        ImGui::SetNextItemWidth(200.0f * app.ui_scale);
+        if (ImGui::BeginCombo("Pointer width", width_label(s.pointer_width).c_str())) {
+            for (int w : kWidths)
+                if (ImGui::Selectable(width_label(w).c_str(), s.pointer_width == w)) set_width(w);
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        changed |= ImGui::Checkbox("Signed##ptr", &s.pointer_signed);
+        ImGui::SetItemTooltip("%s", signed_tip);
+        ImGui::SameLine();
+        changed |= ImGui::Checkbox("Relative##ptr", &s.pointer_relative);
+        ImGui::SetItemTooltip("%s", rel_tip);
+        ImGui::TextDisabled("Type: %s  (byte order: the Inspector's; clicking an integer row in the Inspector picks "
+                            "width and signedness)",
+                            pointer_type_name(s.pointer_type()).c_str());
+    }
+    ImGui::BeginDisabled(s.pointer_relative);
+    ImGui::SetNextItemWidth((in_menu ? 140.0f : 200.0f) * app.ui_scale);
+    changed |= ImGui::InputScalar("Pointer base (hex)", ImGuiDataType_U64, &s.pointer_base, nullptr, nullptr, "%llX",
+                                  ImGuiInputTextFlags_CharsHexadecimal);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("%s", s.pointer_relative
+                                    ? "Not used by relative pointers"
+                                    : "Subtracted from the value: target offset = value - base (e.g. the load "
+                                      "address of an image)");
+    // Keep the Inspector's selected row (and its hex-view outline) on the follow type.
+    if (changed) {
+        if (InspType ft = insp_type_of_int(s.pointer_width, s.pointer_signed); ft != InspType::Count)
+            app.insp_sel = int(ft);
+    }
+    return changed;
 }
 
 // =============================================================================================
@@ -478,14 +624,18 @@ bool commit_field_edit(App& app, Document& d, const Field& f) {
     return true;
 }
 
-// Width (1, 2, 4, 8) and byte order of an integer field from its pack format ("<I4", ">H", "B"...);
-// 0 for anything else (floats, strings, structs, 3-byte ints).
-int int_field_width(const Field& f, bool& be) {
+// Pointer type of an integer field from its pack format ("<I4", ">h", "B"...): its own width
+// (1, 2, 3, 4, 8), signedness (lower-case letter) and byte order; relative mode and base come from
+// the follow-pointer settings. Width 0 for anything else (floats, strings, structs).
+PointerType int_field_pointer(const App& app, const Field& f) {
+    PointerType pt = app.settings.pointer_type();
+    pt.width = 0;
     const std::string& p = f.pack;
     size_t i = 0;
-    be = false;
-    if (i < p.size() && (p[i] == '<' || p[i] == '>' || p[i] == '=')) be = p[i++] == '>';
-    if (i >= p.size()) return 0;
+    pt.big_endian = false;
+    if (i < p.size() && (p[i] == '<' || p[i] == '>' || p[i] == '=')) pt.big_endian = p[i++] == '>';
+    if (i >= p.size()) return pt;
+    pt.is_signed = p[i] >= 'a' && p[i] <= 'z';
     int w = 0;
     switch (p[i++]) {
         case 'b': case 'B': w = 1; break;
@@ -496,10 +646,10 @@ int int_field_width(const Field& f, bool& be) {
             while (i < p.size() && p[i] >= '0' && p[i] <= '9' && w < 100) w = w * 10 + (p[i++] - '0');
             if (w == 0) w = 4;
             break;
-        default: return 0;
+        default: return pt;
     }
-    if (i != p.size() || uint64_t(w) != f.size || (w != 1 && w != 2 && w != 4 && w != 8)) return 0;
-    return w;
+    if (i == p.size() && uint64_t(w) == f.size && valid_pointer_width(w)) pt.width = w;
+    return pt;
 }
 
 // Returns whether the row is visible (taken from the name cell: the last cell may be in a hidden column).
@@ -510,8 +660,8 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
     const bool leaf = f.children.empty();
     // A stale result (content changed, not re-parsed yet) has stale offsets: no field edits.
     const bool can_edit = f.editable() && !d.read_only() && st.gen == d.generation();
-    bool ptr_be = false;
-    const int ptr_w = int_field_width(f, ptr_be);
+    const PointerType ptr = int_field_pointer(app, f);
+    const int ptr_w = ptr.width;
     ImGui::TableNextRow();
     if (fi == hover_field && fi != st.cursor_field)
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, ImGui::GetColorU32(ImGuiCol_HeaderHovered, 0.45f));
@@ -557,7 +707,7 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
         if (ptr_w) {
             ImGui::Separator();
             if (ImGui::MenuItem("Follow as pointer", nullptr, false, st.gen == d.generation()))
-                follow_pointer(app, t, f.offset, ptr_w, ptr_be);
+                follow_pointer_as(app, t, f.offset, ptr);
         }
         close_popup_on_escape();
         ImGui::EndPopup();
@@ -578,8 +728,8 @@ bool draw_field_row(App& app, Tab& t, Document& d, int row, int hover_field) {
         // 32/64-bit integers that point inside the file get a follow button (any width: context menu).
         if ((ptr_w == 4 || ptr_w == 8) && st.gen == d.generation()) {
             bool ok = false;
-            const std::string tip = follow_tip(app, d, f.offset, ptr_w, ptr_be, ok);
-            if (ok && follow_button(true, tip)) follow_pointer(app, t, f.offset, ptr_w, ptr_be);
+            const std::string tip = follow_tip(d, f.offset, ptr, ok);
+            if (ok && follow_button(true, tip)) follow_pointer_as(app, t, f.offset, ptr);
         }
     }
     ImGui::PushFont(app.fonts.mono, 0.0f);
@@ -1067,7 +1217,7 @@ void draw_bookmarks_panel(App& app) {
     ImGui::EndDisabled();
     ImGui::SetItemTooltip("Bookmark the selection, or the byte at the caret (Ctrl+B)");
     ImGui::SameLine();
-    ImGui::Checkbox("All open files", &app.bm_all_files);
+    if (ImGui::Checkbox("All open files", &app.settings.bookmarks_all_files)) mark_settings_dirty(app);
     ImGui::SameLine();
     ImGui::TextDisabled("Ctrl+B toggle  \xC2\xB7  F2 / Shift+F2 next / previous  \xC2\xB7  Ctrl+Shift+B find  \xC2\xB7  "
                         "double-click name or note to edit");
@@ -1075,7 +1225,7 @@ void draw_bookmarks_panel(App& app) {
     // The tabs to list: the active one, or every open (not saving) one.
     std::vector<Tab*> tabs;
     size_t total = 0;
-    if (app.bm_all_files) {
+    if (app.settings.bookmarks_all_files) {
         for (auto& tp : app.tabs)
             if (!tp->doc->busy() && !tp->doc->view().bookmarks.empty()) {
                 tabs.push_back(tp.get());
@@ -1087,10 +1237,10 @@ void draw_bookmarks_panel(App& app) {
     }
     if (total == 0) {
         ImGui::Spacing();
-        if (!d && !app.bm_all_files)
+        if (!d && !app.settings.bookmarks_all_files)
             empty_note(app, "No document.");
         else
-            ImGui::TextDisabled(app.bm_all_files ? "No bookmarks in the open files." : "No bookmarks in this file.");
+            ImGui::TextDisabled(app.settings.bookmarks_all_files ? "No bookmarks in the open files." : "No bookmarks in this file.");
         ImGui::TextDisabled("Ctrl+B adds a bookmark at the cursor/selection.");
         ImGui::End();
         return;
@@ -1110,7 +1260,7 @@ void draw_bookmarks_panel(App& app) {
         ImGui::TableHeadersRow();
         for (Tab* tab : tabs) {
             ImGui::PushID(int(tab->doc->id()));
-            if (app.bm_all_files) {  // file header row
+            if (app.settings.bookmarks_all_files) {  // file header row
                 ImGui::TableNextRow(ImGuiTableRowFlags_None);
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImGuiCol_TableHeaderBg));
                 ImGui::TableSetColumnIndex(0);
@@ -1261,6 +1411,75 @@ void draw_packets_panel(App& app) {
 }
 
 // =============================================================================================
+// History / XOR Search / Regions (self-contained panels, ui/panel_history.h / ui/panel_xor.h /
+// ui/dialog_targets.h)
+// =============================================================================================
+
+void draw_history_panel(App& app) {
+    dock_like(kWinBookmarks);
+    if (!begin_panel(kWinHistory, &app.show_history)) return;
+    Tab* t = active_tab(app);
+    HistoryPanel& hp = app.history_panel;
+    hp.mono = app.fonts.mono;
+    hp.ui_scale = app.ui_scale;
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    HistoryPanelCallbacks cb;
+    // Undo / redo restored the selection of that state: only scroll there (like do_undo), no
+    // reveal_range (it would replace the selection and fill the jump history).
+    cb.moved = [&app, doc_id](uint64_t off) {
+        if (Tab* tab = find_tab(app, doc_id)) {
+            tab->doc->view().low_nibble = false;
+            tab->doc->view_generation++;
+            tab->view.request_scroll_to(off, false);
+        }
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    hp.draw(t ? t->doc.get() : nullptr, cb);  // the panel shows busy / read-only states itself
+    ImGui::End();
+}
+
+void draw_xor_panel(App& app) {
+    dock_like(kWinConsole);  // below the hex view, with Console / Strings
+    if (!begin_panel(kWinXor, &app.show_xor)) return;
+    Tab* t = active_tab(app);
+    XorPanel& xp = app.xor_panel;
+    xp.mono = app.fonts.mono;
+    xp.ui_scale = app.ui_scale;
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    XorPanelCallbacks cb;
+    cb.jump = [&app, doc_id](uint64_t off, uint64_t len) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, off, len, false);
+    };
+    cb.copy = [&app](const std::string& s) {
+        ImGui::SetClipboardText(s.c_str());
+        set_status(app, "Copied " + s);
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m, 6.0); };
+    // cb.apply stays empty: "Decode selection" is then one undoable Document edit
+    // (hx::apply_transform, labelled "Decode <key>" in the History panel).
+    xp.draw(t ? t->doc.get() : nullptr, cb);
+    if (xp.wants_frames()) app.wants_poll = true;
+    ImGui::End();
+}
+
+void draw_regions_panel(App& app) {
+    dock_like(kWinConsole);
+    if (!begin_panel(kWinRegions, &app.show_regions)) return;
+    Tab* t = active_tab(app);
+    RegionsPanel& rp = app.regions_panel;
+    rp.mono = app.fonts.mono;
+    rp.ui_scale = app.ui_scale;
+    const uint64_t doc_id = t ? t->doc->id() : 0;
+    RegionsPanelCallbacks cb;
+    cb.jump = [&app, doc_id](uint64_t base, uint64_t size) {
+        if (Tab* tab = find_tab(app, doc_id)) reveal_range(app, *tab, base, size, false);
+    };
+    cb.notify = [&app](const std::string& m) { set_status(app, m); };
+    rp.draw(t && !t->doc->busy() ? t->doc.get() : nullptr, cb);
+    ImGui::End();
+}
+
+// =============================================================================================
 // Status bar
 // =============================================================================================
 
@@ -1270,6 +1489,33 @@ void status_sep() {
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
+}
+
+// Where the bytes come from, for a device or a process document ("process 1234 · 47-bit address
+// space"; red "exited" once the process is gone). Nothing for files.
+void draw_target_status(Document& d) {
+    const SourceKind k = d.target();
+    if (k == SourceKind::File) return;
+    status_sep();
+    if (k == SourceKind::Device) {
+        ImGui::TextColored(kWarnColor, "device");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Raw disk / volume: fixed size (overwrite only), saved in place without a backup.\n"
+                              "Edit > Read-only toggles writing.");
+        return;
+    }
+    int bits = 0;  // address space bits: the document spans [0, process_address_limit)
+    while (bits < 64 && d.size() > 0 && ((d.size() - 1) >> bits) != 0) ++bits;
+    ImGui::Text("process %u \xC2\xB7 %d-bit address space", unsigned(d.process_id()), bits);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Live memory of %s. Unmapped pages show as ??. Overwrite only: Save writes the\n"
+                          "changed bytes into the process. F5 / File > Refresh Memory re-reads the memory map\n"
+                          "(cached bytes also refresh every second). View > Regions lists the regions.",
+                          d.display_name().c_str());
+    if (!d.target_alive()) {
+        ImGui::SameLine();
+        ImGui::TextColored(kErrColor, "exited");
+    }
 }
 
 void draw_doc_status(App& app, Tab& t) {
@@ -1300,9 +1546,12 @@ void draw_doc_status(App& app, Tab& t) {
     status_sep();
     ImGui::Text("Size %s", fmt_size(d.size()).c_str());
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%llu bytes", ull(d.size()));
+    draw_target_status(d);
     status_sep();
     ImGui::TextUnformatted(t.insert_mode ? "INS" : "OVR");
-    if (ImGui::IsItemClicked()) {
+    if (ImGui::IsItemClicked() && d.fixed_size()) {
+        set_status(app, "Overwrite only: a device / process memory cannot change size");
+    } else if (ImGui::IsItemClicked()) {
         t.insert_mode = !t.insert_mode;
         app.settings.insert_mode = t.insert_mode;
         mark_settings_dirty(app);
@@ -1310,7 +1559,7 @@ void draw_doc_status(App& app, Tab& t) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Insert / overwrite (Insert key)");
     if (d.read_only()) {
         status_sep();
-        ImGui::TextColored(kWarnColor, "RO");
+        ImGui::TextColored(kWarnColor, d.target() == SourceKind::File ? "RO" : "read-only");
     }
     if (d.io_error()) {
         status_sep();

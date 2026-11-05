@@ -13,6 +13,17 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Huge files.** Files are read in 64 KiB blocks on demand and never loaded whole. Offsets are
   64-bit everywhere, and the hex view uses its own 64-bit scrollbar. Opening a 3 TiB sparse file
   takes no measurable time and adds about 6 MB of memory.
+- **Process memory and raw disks.** File > Open Process... lists the running processes (filter
+  by name, pid or path) and opens one's address space as a document: offset = virtual address,
+  unmapped pages show as `??`, the status bar says `process 1234 · 47-bit address space`, and the
+  **Regions** panel (opens by itself) lists the memory map (base, size, protection, type, module);
+  click a region to select it. File > Open Disk... opens a physical disk or volume
+  (`\\.\PhysicalDrive0`, `/dev/sda`). Both open **read-only** unless you tick Writable (or turn
+  Edit > Read-only off later); they keep their size, so they stay in overwrite mode and a save
+  writes just the changed bytes in place (no backup). `F5` / File > Refresh Memory re-reads a
+  process's memory map (cached bytes also refresh every second). Reading another process usually
+  needs administrator rights on Windows (ptrace rights on Linux). Process tabs are not kept by
+  hot exit; disks are, like files.
 - **Editing.** Overwrite or insert (toggle with `Ins`), delete, fill a selection, cut, copy and
   paste. Paste is lenient: `DE AD BE EF`, `0xde,0xad`, `\xde\xad` and `b64:...` all work.
   Edited bytes are tinted amber.
@@ -20,6 +31,10 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   paste, fill, inspector and structure edits, and script commands (one undo step each). The
   history survives saves and restarts. Typing is grouped into one step per run of keys: a pause
   of more than 500 ms, or more than 32 typed bytes, starts a new step (both in Settings).
+- **History panel** (View > History): every state of the document, oldest first, with the
+  action's name (Typing, Paste, Fill, Decode XOR 0x5A, Script: ...) and the bytes it changed.
+  The current state is highlighted, redo states are greyed and the last saved one is tagged
+  "saved". Click a row (or use `Up` / `Down` in the panel) to undo or redo to exactly that state.
 - **Safe, fast saving.** If the size is unchanged, Hexer patches only the changed bytes in place.
   Otherwise it writes a temp file and renames it over the original. Saves run in the background
   with progress and Cancel (until the last step, when the dialog shows "Finishing..."). If another
@@ -34,7 +49,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   name.backup)". Files Hexer created itself and devices get no backup. Turn it off or change the
   limit in Edit > Settings > Saving.
 - **Hot exit** (as in Sublime Text). Closing Hexer never asks "save changes?". Open tabs, unsaved
-  edits, undo history, cursor, scroll position and bookmarks are restored on the next launch.
+  edits, undo history, cursor, scroll position and bookmarks are restored on the next launch,
+  and so are a split view, live tail, the Structure panel's Parse at offset and the Compare tab.
 - **Selection.** Dragging over bytes a..b selects exactly those bytes; the caret is drawn on the
   last byte you dragged to (inside the selection). The Inspector, the status bar's Offset/Byte
   and inspector edits all work on the **first selected byte** (else the caret byte), and ranges
@@ -52,16 +68,26 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **C struct to parser** (Scripts > New Parser from C Struct...). Paste C `struct`/`union`/`enum`
   definitions (bit fields, `#pragma pack`, arrays sized by earlier fields, `// @be`) and get a
   readable Lua parser live. Apply it at the cursor, or save it as a script.
-- **Follow pointer and jump history.** Hold `Ctrl` over a byte to see where the 32-bit value
-  there points (underlined, with a tooltip), `Ctrl+click` jumps there; `Ctrl+Enter` follows the
-  value at the cursor. Width (8/16/32/64 bit), base address and byte order (the Inspector's LE/BE)
-  are in Search > Follow Pointer Settings and the Settings window. The Inspector's uint32/uint64
-  rows and the Structure panel's 32/64-bit integer fields have a `→` button. Every big jump (Go
-  to, search hits, bookmarks, Structure / Strings / Packets rows, Bitmap clicks, follow) is recorded: `Alt+Left` /
-  `Alt+Right` or the mouse back / forward buttons walk the history.
+- **Follow pointer and jump history.** Hold `Ctrl` over a byte to see where the value there
+  points (underlined, with a tooltip such as `u16 LE → 0x1234`), `Ctrl+click` jumps there;
+  `Ctrl+Enter` follows the value at the cursor. **Click an integer row in the Inspector** (int8 ..
+  uint64, including 24-bit) to pick the pointer type: its width and signedness, with the
+  Inspector's LE/BE as byte order. The chosen row is marked `→`, has a follow button, and the
+  bytes it reads are outlined in the hex view. *Relative* (target = the pointer's own offset +
+  value, e.g. rel32) and a base address (target = value - base) are in Search > Follow Pointer
+  Settings and the Settings window. The Structure panel's integer fields follow with their own
+  declared type. Every big jump (Go to, search hits, bookmarks, Structure / Strings / Packets
+  rows, Bitmap clicks, follow) is recorded: `Alt+Left` / `Alt+Right` or the mouse back / forward
+  buttons walk the history.
 - **Strings panel.** ASCII, UTF-16LE and UTF-16BE strings of the file or the selection, with a
   minimum length, scanned in the background (progress, Cancel), up to a million results with a
   live filter. Click a row to select the string.
+- **XOR / ADD / ROL search** (Search > XOR / ADD / ROL Search..., View > XOR Search): finds
+  copies of a known plaintext (`This program`, `MZ`, `PE\0\0`, `http`, or your own text / hex)
+  hidden by a 1-byte XOR, ADD/SUB or rotate, or by a repeating XOR key of 2..16 bytes, in the whole
+  file or the selection, in the background. Each hit shows its transform, key and the decoded
+  bytes; click it to select the match and choose its key. *Guess key* ranks likely XOR keys of a
+  zero- or space-heavy selection. **Decode selection** applies the chosen key as one undo step.
 - **Minimap.** A strip right of the hex view shows the whole file top to bottom as an entropy
   heat map (dark = zeros, blue/teal = structured data and text, orange/red = compressed or
   random) or as the byte-class mix of each row (View > Minimap). It is scanned in the
@@ -87,6 +113,14 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   shows up within half a second and the view follows it while the caret is at the end
   (`Ctrl+End`). Edits and undo keep working; a file that is rewritten instead of appended to
   turns tailing off and shows the usual "changed on disk" banner.
+- **Split view** (View > Split View, `Ctrl+\`): two panes of the same file, top / bottom or side by
+  side (*Split Horizontally* / *Split Vertically*), each with its own scroll position and
+  minimap, e.g. the header in one while you edit the end in the other. Caret, selection,
+  edits and highlights are shared; the pane you clicked last (or switched to with `F6`) is the
+  active one that follows the caret and every jump (Go to, search, bookmarks, follow pointer,
+  live tail). Drag the divider to resize it, double-click it for half / half. Side by side,
+  the rows auto-fit the narrower panes. The split (orientation, divider, both scroll
+  positions) is kept by hot exit.
 - **Hashes panel.** CRC-8/16/32/32C, Adler-32, Fletcher-16, FNV-1a, Sum-8, XOR-8, MD5, SHA-1,
   SHA-256 and SHA-512 of the selection (or the whole file), computed in the background and
   automatically up to 64 MiB. Paste an expected value to highlight the matching row. Scripts get
@@ -101,6 +135,7 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   file. The Bookmarks panel (bottom dock) lists name, note, offset, length and the first bytes,
   for this file or **all open files**; double-click a name or note to edit it. The Bookmarks menu
   lists the active file's bookmarks. Bookmarks (and Find All hits) show as ticks on the scrollbar.
+  The "All open files" choice is remembered in `settings.ini`.
 - **Settings window** (Edit > Settings..., `Ctrl+,`): bytes per row, grouping, font size, UI
   scale, undo grouping, backups, hot exit, autosave interval and fonts. Changes apply right away
   (fonts after a restart) and are saved to `settings.ini`.
@@ -211,9 +246,10 @@ hexer [options] [files...]
 | `Ctrl+Shift+B` | Jump to a bookmark in any open file (fuzzy search) |
 | `Ctrl+click` / `Ctrl+Enter` | Follow the pointer under the mouse / at the cursor (`Ctrl+hover` previews the target) |
 | `Alt+Left` / `Alt+Right`, mouse back / forward | Back / forward through the jump history |
+| `Ctrl+\` / `F6` | Split view on / off; switch to the other pane |
 | `Ctrl+,` | Settings |
 | `Ctrl+Shift+P` | Command palette |
-| `F5` | Re-parse structure |
+| `F5` | Re-parse structure (and re-read a process's memory map) |
 | `F7` / `Shift+F7` (Compare tab) | Next / previous difference |
 | `Ctrl+=` or `Ctrl++` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Zoom in / out / reset |
 | `Ctrl+L` (in the console) | Clear console |
@@ -227,8 +263,9 @@ mouse, `Ctrl+click` follows the pointer there, right-click opens the context men
 
 Hexer never asks whether to save when you close it. Instead it writes a session to
 `<config>/session/`: the open tabs, each document's unsaved edits and full undo/redo history,
-cursor, selection, scroll position and bookmarks. The session is also autosaved a few seconds
-after each change, so a crash loses almost nothing. The next launch restores everything.
+cursor, selection, scroll position and bookmarks, plus each tab's split view, live tail and Parse
+at offset, and the Compare tab. The session is also autosaved a few seconds after each change,
+so a crash loses almost nothing. The next launch restores everything.
 
 - Only your **edits** are stored, never a copy of the original file. A restored tab reads its
   original bytes from the file on disk.
@@ -242,6 +279,9 @@ after each change, so a crash loses almost nothing. The next launch restores eve
   the same config directory; `--no-session`, `--new-instance` and `--exec` / `--screenshot` /
   `--frames` runs never do). Files sent to a Hexer that quit before taking them are opened by the
   next start.
+- **Process memory** tabs are not kept (a process id means nothing after a restart): quitting
+  drops them without asking, unsaved edits included, and notes it in the console. Save them into
+  the process first if you want to keep them. Disk / volume tabs are kept like files.
 - Closing a single **tab** with unsaved changes still asks Save / Discard / Cancel. A discarded
   tab can be brought back with `Ctrl+Shift+T` until you quit.
 - `<config>` is `%APPDATA%\Hexer` on Windows and `~/.config/hexer` on Linux (or
@@ -283,9 +323,10 @@ See **[docs/scripting.md](docs/scripting.md)** for the full guide and API refere
 
 ## Project layout
 
-`src/core` holds documents, streaming I/O, the piece table, undo, saving, the session, search,
-the inspector, strings extraction, hashes, the C struct converter, the jump history, entropy,
-bitmap decoding, the compare engine, the pcap reader and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
+`src/core` holds documents, streaming I/O (files, disks and process memory), the piece table,
+undo, saving, the session, search, the inspector, strings extraction, hashes, XOR search, the C
+struct converter, the jump history, entropy, bitmap decoding, the compare engine, the pcap reader
+and utilities. `src/script` is the Lua engine. `src/ui` is the ImGui app. Tests
 live in `tests/`, one executable per module; `tests/test_ui.cpp` drives the hex view headlessly
 (simulated mouse and keyboard, no window). See `CLAUDE.md` for contributor notes and `TODO.md`
 for the roadmap.

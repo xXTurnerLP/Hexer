@@ -26,8 +26,10 @@
 #include "nfd.h"
 
 #include "core/highlight.h"
+#include "core/inspector.h"
 #include "core/nav.h"
 #include "core/os_file.h"
+#include "core/procmem.h"
 #include "core/util.h"
 #include "ui/app_internal.h"
 #include "ui/panels.h"
@@ -233,27 +235,6 @@ void reveal_range(App& app, Tab& tab, uint64_t offset, uint64_t len, bool focus_
     if (idx >= 0 && idx != app.active) app.select_request = idx;
 }
 
-static std::string pointer_desc(const App& app, int width, bool big_endian) {
-    std::string s = "u" + std::to_string(width * 8) + (width > 1 ? (big_endian ? " BE" : " LE") : "");
-    if (app.settings.pointer_base) s += ", base " + fmt_offset(app.settings.pointer_base);
-    return s;
-}
-
-bool follow_pointer(App& app, Tab& tab, uint64_t at, int width, bool big_endian) {
-    Document& d = *tab.doc;
-    if (d.busy()) return false;
-    uint64_t target = 0;
-    if (!decode_pointer(d, at, width, big_endian, app.settings.pointer_base, target)) {
-        set_status(app, "No pointer to follow at " + fmt_offset(at) + " (" + pointer_desc(app, width, big_endian) +
-                            "): unreadable, below the base or beyond EOF");
-        return false;
-    }
-    reveal_range(app, tab, target, 0, true);
-    set_status(app, "Followed " + pointer_desc(app, width, big_endian) + " at " + fmt_offset(at) + " -> " +
-                        fmt_offset(target) + "  (Alt+Left goes back)", 6.0);
-    return true;
-}
-
 // Back / Forward through the tab's jump history.
 static void navigate(App& app, Tab& t, bool forward) {
     Document& d = *t.doc;
@@ -293,10 +274,13 @@ void refresh_tab_cache(Tab& t) {
 Tab& add_tab(App& app, std::unique_ptr<Document> doc) {
     auto t = std::make_unique<Tab>();
     t->doc = std::move(doc);
-    t->insert_mode = app.settings.insert_mode;
+    // Devices and process memory cannot change size: they stay in overwrite mode.
+    t->insert_mode = app.settings.insert_mode && !t->doc->fixed_size();
     refresh_tab_cache(*t);
     // A pcap / pcapng capture: show the Packets panel (it indexes the capture when first drawn).
     if (PacketsPanel::is_capture(*t->doc)) app.show_packets = app.focus_packets = true;
+    // Process memory: show its region map next to it.
+    if (t->doc->target() == SourceKind::Process) app.show_regions = app.focus_regions = true;
     app.tabs.push_back(std::move(t));
     app.active = int(app.tabs.size()) - 1;
     app.select_request = app.active;
@@ -333,6 +317,8 @@ void close_tab_now(App& app, int index) {
     const uint64_t id = t->doc->id();
     app.strings_panel.forget(id);  // results are cheap to rescan; free the memory now
     app.packets_panel.forget(id);
+    app.xor_panel.forget(id);
+    app.regions_panel.forget(id);
     if (app.diff && (app.diff_a == id || app.diff_b == id)) end_compare(app);
     t->entropy.cancel();  // rescanned if the tab is reopened
     t->entropy_gen = t->entropy_pending_gen = UINT64_MAX;
@@ -438,6 +424,9 @@ bool open_path(App& app, const std::string& path) {
     }
     std::string err;
     std::unique_ptr<Document> doc = Document::open_file(abs, &err);
+    // A raw disk from the recent files / command line opens read-only, like the Open Disk picker
+    // (Edit > Read-only makes it writable).
+    if (doc && doc->target() == SourceKind::Device) doc->set_read_only(true);
     if (!doc) {
         std::string msg = "Cannot open " + path + (err.empty() ? "" : ": " + err);
         log_console(app, ConsoleLine::Error, msg);
@@ -445,8 +434,11 @@ bool open_path(App& app, const std::string& path) {
         return false;
     }
     add_tab(app, std::move(doc));
-    app.settings.push_recent(abs);
-    mark_settings_dirty(app);
+    uint32_t pid = 0;
+    if (!parse_process_url(abs, &pid)) {  // pids are ephemeral: not a recent file
+        app.settings.push_recent(abs);
+        mark_settings_dirty(app);
+    }
     return true;
 }
 
@@ -599,6 +591,15 @@ bool start_save(App& app, Tab& tab, bool save_as, AfterSave after, bool confirme
     return true;
 }
 
+// Hot exit does not keep process documents (Document::persistable): say so once, without a prompt.
+void log_dropped_targets(App& app) {
+    for (auto& t : app.tabs)
+        if (!t->doc->persistable())
+            log_console(app, ConsoleLine::Info,
+                        "Hot exit: " + t->label + " (process memory) is not kept" +
+                            (t->doc->dirty() ? "; its unsaved edits are dropped" : ""));
+}
+
 void abort_quit(App& app) {
     app.quitting_with_saves = false;
     app.quit_queue.clear();
@@ -707,6 +708,7 @@ void process_quit(App& app) {
         // Quitting without a prompt is only safe once the session (the unsaved edits) is on disk.
         std::string err;
         if (save_session(app, true, &err) || !any_dirty(app)) {
+            log_dropped_targets(app);
             app.quit = true;
             return;
         }
@@ -889,6 +891,11 @@ void select_all(App& app) {
 void toggle_insert_mode(App& app) {
     Tab* t = active_tab(app);
     if (!t) return;
+    if (!t->doc->busy() && t->doc->fixed_size()) {
+        t->insert_mode = false;
+        set_status(app, "Overwrite only: a device / process memory cannot change size");
+        return;
+    }
     t->insert_mode = !t->insert_mode;
     app.settings.insert_mode = t->insert_mode;  // new tabs follow the last choice
     mark_settings_dirty(app);
@@ -1047,6 +1054,24 @@ void tail_poll_once(App& app, Tab& t) {
     }
 }
 
+// Turns live tail on for `t`. The first poll records the bytes before the end that later
+// appends are checked against. `to_end`: put the caret at the end so new data is followed right
+// away (Ctrl+End resumes after looking around); a session restore keeps the saved caret.
+void start_live_tail(App& app, Tab& t, bool to_end) {
+    Document& d = *t.doc;
+    if (d.busy() || !d.has_path() || d.target() != SourceKind::File) return;
+    t.tail = TailState{};
+    t.tail.enabled = true;
+    if (to_end) {
+        ViewState& v = d.view();
+        v.cursor = v.anchor = d.size();
+        v.low_nibble = false;
+        d.view_generation++;
+        t.view.request_scroll_to(d.size(), false);
+    }
+    tail_poll_once(app, t);
+}
+
 void toggle_live_tail(App& app) {
     Tab* t = active_tab(app);
     Document* d = usable_doc(app);
@@ -1056,16 +1081,7 @@ void toggle_live_tail(App& app) {
         set_status(app, "Live tail off");
         return;
     }
-    t->tail = TailState{};
-    t->tail.enabled = true;
-    // Start at the end so new data is followed right away (Ctrl+End resumes after looking around).
-    ViewState& v = d->view();
-    v.cursor = v.anchor = d->size();
-    v.low_nibble = false;
-    d->view_generation++;
-    t->view.request_scroll_to(d->size(), false);
-    // The first call records the bytes before the end that later appends are checked against.
-    tail_poll_once(app, *t);
+    start_live_tail(app, *t, true);
     if (t->tail.enabled) set_status(app, "Live tail on: " + t->label + " is followed while the caret is at the end", 6.0);
 }
 
@@ -1305,11 +1321,27 @@ void follow_at_cursor(App& a) {
     Tab* t = active_tab(a);
     Document* d = usable_doc(a);
     if (!d) return;
-    follow_pointer(a, *t, focus_offset(d->view()), a.settings.pointer_width, a.settings.big_endian_inspector);
+    follow_pointer_as(a, *t, focus_offset(d->view()), a.settings.pointer_type());
 }
 
 void show_strings(App& a) { a.show_strings = a.focus_strings = true; }
 void show_hashes(App& a) { a.show_hashes = a.focus_hashes = true; }
+void show_history(App& a) { a.show_history = a.focus_history = true; }
+void show_xor(App& a) { a.show_xor = a.focus_xor = true; }
+
+bool has_process(App& a) {
+    Document* d = usable_doc(a);
+    return d && d->target() == SourceKind::Process;
+}
+
+// Process memory: re-read the region map and drop the cached bytes (they also expire after ~1 s).
+void refresh_memory(App& a) {
+    Document* d = usable_doc(a);
+    if (!d || d->target() != SourceKind::Process) return;
+    d->refresh_target();
+    a.regions_panel.request_refresh();
+    set_status(a, d->target_alive() ? "Memory refreshed (region map re-read)" : "The process has exited");
+}
 
 void toggle_panel(bool& show, bool& focus) {
     show = !show;
@@ -1347,6 +1379,60 @@ void parse_selection(App& a) {
     a.show_structure = a.focus_structure = true;
 }
 
+// Split view: make the other pane the active one (its HexView, minimap and scroll become the tab's
+// `view`, `minimap` and doc.view().top_row; see Tab::split).
+void activate_other_pane(Tab& t) {
+    std::swap(t.view, t.split_view);
+    std::swap(t.minimap, t.split_minimap);
+    std::swap(t.doc->view().top_row, t.split_top);
+    std::swap(t.top_bpr, t.split_bpr);
+    t.split_active_pos ^= 1;
+    // A jump requested this frame (asked of the previously active view) moves the new active pane.
+    uint64_t off = 0;
+    bool center = true;
+    if (t.split_view.take_scroll_request(off, center)) t.view.request_scroll_to(off, center);
+}
+
+// Split view on / off for the tab. The new pane starts where the current one is.
+void set_split(Tab& t, bool on, bool vertical) {
+    t.split_vertical = vertical;
+    if (t.split == on) return;
+    t.split = on;
+    if (!on) return;  // the active pane stays
+    t.split_view = HexView{};
+    t.split_minimap = Minimap{};
+    t.split_top = t.doc->view().top_row;
+    t.split_bpr = t.top_bpr;
+    t.split_active_pos = 0;
+    // The active pane gets about half the height: keep the caret on screen in it.
+    if (!t.doc->busy()) t.view.request_scroll_to(t.doc->view().cursor, false);
+}
+
+void toggle_split(App& a) {
+    Tab* t = active_tab(a);
+    if (!t) return;
+    set_split(*t, !t->split, t->split_vertical);
+    set_status(a, t->split ? "Split view: each pane scrolls on its own; the clicked one follows the caret (F6 switches)"
+                           : "Split view off", 4.0);
+}
+
+void split_orientation(App& a, bool vertical) {
+    if (Tab* t = active_tab(a)) set_split(*t, true, vertical);
+}
+
+// Keyboard way to the other pane (F6): activate it and give it the focus.
+void switch_pane(App& a) {
+    Tab* t = active_tab(a);
+    if (!t || !t->split) return;
+    activate_other_pane(*t);
+    t->view.request_focus();
+}
+
+bool has_split(App& a) {
+    Tab* t = active_tab(a);
+    return t && t->split;
+}
+
 constexpr ImGuiKeyChord C(ImGuiKeyChord k) { return ImGuiMod_Ctrl | k; }
 constexpr ImGuiKeyChord CS(ImGuiKeyChord k) { return ImGuiMod_Ctrl | ImGuiMod_Shift | k; }
 constexpr ImGuiKeyChord S(ImGuiKeyChord k) { return ImGuiMod_Shift | k; }
@@ -1356,6 +1442,9 @@ const Action kActions[] = {
     // File
     {"New", {C(ImGuiKey_N), 0}, [](App& a) { new_document(a); }, nullptr, true, false},
     {"Open...", {C(ImGuiKey_O), 0}, [](App& a) { open_with_dialog(a); }, nullptr, true, false},
+    {"Open Process...", {0, 0}, [](App& a) { a.targets.open_process_picker(); }, nullptr, true, false},
+    {"Open Disk...", {0, 0}, [](App& a) { a.targets.open_disk_picker(); }, nullptr, true, false},
+    {"Refresh Memory", {0, 0}, refresh_memory, has_process, true, false},
     {"Save", {C(ImGuiKey_S), 0},
      [](App& a) { if (Tab* t = active_tab(a)) start_save(a, *t, false, AfterSave::None); }, has_doc, true, false},
     {"Save As...", {CS(ImGuiKey_S), 0},
@@ -1394,7 +1483,11 @@ const Action kActions[] = {
     {"Previous Bookmark", {S(ImGuiKey_F2), 0}, [](App& a) { jump_bookmark(a, false); }, has_doc, false, true},
     {"Jump to Bookmark...", {CS(ImGuiKey_B), 0}, [](App& a) { a.req_bookmark_jump = true; }, nullptr, true, false},
     {"Show All Bookmarks", {0, 0}, [](App& a) {
-         a.show_bookmarks = a.bm_all_files = a.focus_bookmarks = true;
+         a.show_bookmarks = a.focus_bookmarks = true;
+         if (!a.settings.bookmarks_all_files) {
+             a.settings.bookmarks_all_files = true;
+             mark_settings_dirty(a);
+         }
      }, nullptr, true, false},
     {"Next Tab", {C(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, +1); }, nullptr, true, true},
     {"Previous Tab", {CS(ImGuiKey_Tab), 0}, [](App& a) { switch_tab(a, -1); }, nullptr, true, true},
@@ -1402,6 +1495,7 @@ const Action kActions[] = {
     {"Navigate Back", {A(ImGuiKey_LeftArrow), 0}, [](App& a) { navigate(a, *active_tab(a), false); }, can_back, false, true},
     {"Navigate Forward", {A(ImGuiKey_RightArrow), 0}, [](App& a) { navigate(a, *active_tab(a), true); }, can_forward, false, true},
     {"Follow Pointer at Cursor", {C(ImGuiKey_Enter), C(ImGuiKey_KeypadEnter)}, follow_at_cursor, has_doc, false, false},
+    {"XOR / ADD / ROL Search...", {0, 0}, show_xor, nullptr, true, false},
     // View
     // "+" is Shift+= on US layouts and keeps the US "]" key code on e.g. German ones (GLFW backend).
     {"Zoom In", {C(ImGuiKey_Equal), C(ImGuiKey_KeypadAdd), CS(ImGuiKey_Equal), C(ImGuiKey_RightBracket)}, [](App& a) { zoom(a, +1.0f); }, nullptr, true, true},
@@ -1417,11 +1511,19 @@ const Action kActions[] = {
     {"Toggle Hashes", {0, 0}, [](App& a) { a.show_hashes = !a.show_hashes; }, nullptr, true, false},
     {"Toggle Bitmap", {0, 0}, [](App& a) { toggle_panel(a.show_bitmap, a.focus_bitmap); }, nullptr, true, false},
     {"Toggle Packets", {0, 0}, [](App& a) { toggle_panel(a.show_packets, a.focus_packets); }, nullptr, true, false},
+    {"Toggle History", {0, 0}, [](App& a) { toggle_panel(a.show_history, a.focus_history); }, nullptr, true, false},
+    {"Show History", {0, 0}, show_history, nullptr, true, false},
+    {"Toggle XOR Search", {0, 0}, [](App& a) { toggle_panel(a.show_xor, a.focus_xor); }, nullptr, true, false},
+    {"Toggle Regions", {0, 0}, [](App& a) { toggle_panel(a.show_regions, a.focus_regions); }, nullptr, true, false},
     {"Minimap: Off", {0, 0}, [](App& a) { set_minimap(a, 0); }, nullptr, true, false},
     {"Minimap: Entropy", {0, 0}, [](App& a) { set_minimap(a, 1); }, nullptr, true, false},
     {"Minimap: Byte Classes", {0, 0}, [](App& a) { set_minimap(a, 2); }, nullptr, true, false},
     {"Color Bytes by Class", {0, 0}, toggle_byte_class_colors, nullptr, true, false},
     {"Toggle Live Tail", {0, 0}, toggle_live_tail, has_file, true, false},
+    {"Toggle Split View", {C(ImGuiKey_Backslash), 0}, toggle_split, has_tab, false, false},
+    {"Split Horizontally", {0, 0}, [](App& a) { split_orientation(a, false); }, has_tab, true, false},
+    {"Split Vertically", {0, 0}, [](App& a) { split_orientation(a, true); }, has_tab, true, false},
+    {"Split View: Switch Pane", {ImGuiKey_F6, 0}, switch_pane, has_split, false, false},
     {"Reset Layout", {0, 0}, [](App& a) {
          a.build_layout = true;
          a.show_inspector = a.show_structure = a.show_console = a.show_results = a.show_bookmarks = true;
@@ -1440,13 +1542,17 @@ const Action kActions[] = {
          a.hash_panel.whole_file = true;
          a.hash_panel.request_compute();
      }, has_doc, true, false},
+    {"XOR: Scan File", {0, 0}, [](App& a) { show_xor(a); a.xor_panel.request_scan(false); }, has_doc, true, false},
+    {"XOR: Scan Selection", {0, 0}, [](App& a) { show_xor(a); a.xor_panel.request_scan(true); }, has_selection, true, false},
+    {"XOR: Guess Key from Selection", {0, 0}, [](App& a) { show_xor(a); a.xor_panel.request_guess(); }, has_selection, true, false},
     {"Bitmap: Show at Cursor", {0, 0}, bitmap_at_cursor, has_doc, true, false},
     {"Packets: Index Capture", {0, 0}, [](App& a) {
          a.show_packets = a.focus_packets = true;
          a.packets_panel.request_index();
      }, has_capture, true, false},
     // Scripts
-    {"Reparse Structure", {ImGuiKey_F5, 0}, [](App& a) { force_reparse(a); }, has_doc, true, false},
+    // F5 also re-reads a process document's memory (Refresh Memory).
+    {"Reparse Structure", {ImGuiKey_F5, 0}, [](App& a) { force_reparse(a); refresh_memory(a); }, has_doc, true, false},
     {"Structure: Parse at Cursor", {0, 0}, parse_at_cursor, has_doc, true, false},
     {"Structure: Parse Selection", {0, 0}, parse_selection, has_selection, true, false},
     {"Structure: Parse from File Start", {0, 0}, [](App& a) {
@@ -1549,42 +1655,6 @@ void close_popup_on_escape() {
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
 }
 
-// Follow pointer settings, shared by the Search menu and the Settings window. True on change.
-bool pointer_settings(App& app, bool in_menu) {
-    Settings& s = app.settings;
-    bool changed = false;
-    if (in_menu) {
-        if (ImGui::BeginMenu("Pointer Width")) {
-            for (int w : {1, 2, 4, 8}) {
-                const std::string label = std::to_string(w) + (w == 1 ? " byte" : " bytes") + " (u" + std::to_string(w * 8) + ")";
-                if (ImGui::MenuItem(label.c_str(), nullptr, s.pointer_width == w)) {
-                    changed |= s.pointer_width != w;
-                    s.pointer_width = w;
-                }
-            }
-            ImGui::EndMenu();
-        }
-        changed |= ImGui::MenuItem("Big Endian (same as the Inspector)", nullptr, &s.big_endian_inspector);
-    } else {
-        ImGui::SetNextItemWidth(200.0f * app.ui_scale);
-        if (ImGui::BeginCombo("Pointer width", (std::to_string(s.pointer_width * 8) + " bit").c_str())) {
-            for (int w : {1, 2, 4, 8})
-                if (ImGui::Selectable((std::to_string(w * 8) + " bit").c_str(), s.pointer_width == w)) {
-                    changed |= s.pointer_width != w;
-                    s.pointer_width = w;
-                }
-            ImGui::EndCombo();
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(byte order: the Inspector's, %s)", s.big_endian_inspector ? "BE" : "LE");
-    }
-    ImGui::SetNextItemWidth((in_menu ? 140.0f : 200.0f) * app.ui_scale);
-    changed |= ImGui::InputScalar("Pointer base (hex)", ImGuiDataType_U64, &s.pointer_base, nullptr, nullptr, "%llX",
-                                  ImGuiInputTextFlags_CharsHexadecimal);
-    ImGui::SetItemTooltip("Subtracted from the value: target offset = value - base (e.g. the load address of an image)");
-    return changed;
-}
-
 void draw_edit_menu(App& app) {
     Document* d = usable_doc(app);
     std::string undo = "Undo", redo = "Redo";
@@ -1654,6 +1724,9 @@ void draw_view_menu(App& app) {
     ImGui::MenuItem(kWinHashes, nullptr, &app.show_hashes);
     if (ImGui::MenuItem(kWinBitmap, nullptr, &app.show_bitmap)) app.focus_bitmap = app.show_bitmap;
     if (ImGui::MenuItem(kWinPackets, nullptr, &app.show_packets)) app.focus_packets = app.show_packets;
+    if (ImGui::MenuItem(kWinHistory, nullptr, &app.show_history)) app.focus_history = app.show_history;
+    if (ImGui::MenuItem(kWinXor, nullptr, &app.show_xor)) app.focus_xor = app.show_xor;
+    if (ImGui::MenuItem(kWinRegions, nullptr, &app.show_regions)) app.focus_regions = app.show_regions;
     ImGui::Separator();
     if (ImGui::BeginMenu("Minimap")) {
         menu_action(app, "Minimap: Off", "Off", app.settings.minimap == 0);
@@ -1665,6 +1738,11 @@ void draw_view_menu(App& app) {
     {
         Tab* t = active_tab(app);
         menu_action(app, "Toggle Live Tail", "Live Tail", t && t->tail.enabled);
+        ImGui::Separator();
+        menu_action(app, "Toggle Split View", "Split View", t && t->split);
+        menu_action(app, "Split Horizontally", "Split Horizontally (Top / Bottom)", t && t->split && !t->split_vertical);
+        menu_action(app, "Split Vertically", "Split Vertically (Side by Side)", t && t->split && t->split_vertical);
+        menu_action(app, "Split View: Switch Pane", "Switch Pane");
     }
     ImGui::Separator();
     menu_action(app, "Command Palette");
@@ -1736,7 +1814,7 @@ void draw_navigate_items(App& app) {
     menu_action(app, "Navigate Forward", "Forward");
     menu_action(app, "Follow Pointer at Cursor");
     if (ImGui::BeginMenu("Follow Pointer Settings")) {
-        if (pointer_settings(app, true)) mark_settings_dirty(app);
+        if (draw_pointer_settings(app, true)) mark_settings_dirty(app);
         ImGui::Separator();
         ImGui::TextDisabled("Ctrl+hover a byte to preview the target, Ctrl+click to follow it");
         ImGui::EndMenu();
@@ -1776,10 +1854,13 @@ void draw_main_menu(App& app) {
         menu_action(app, "New");
         menu_action(app, "Open...");
         draw_recent_menu(app);
+        menu_action(app, "Open Process...");
+        menu_action(app, "Open Disk...");
         ImGui::Separator();
         menu_action(app, "Save");
         menu_action(app, "Save As...");
         menu_action(app, "Reload from Disk");
+        if (has_process(app)) menu_action(app, "Refresh Memory");
         ImGui::Separator();
         if (ImGui::BeginMenu("Compare With", has_doc(app))) {
             draw_compare_menu(app);
@@ -1804,6 +1885,8 @@ void draw_main_menu(App& app) {
         menu_action(app, "Find All");
         ImGui::Separator();
         menu_action(app, "Go to Offset...");
+        ImGui::Separator();
+        menu_action(app, "XOR / ADD / ROL Search...");
         ImGui::Separator();
         draw_navigate_items(app);
         ImGui::EndMenu();
@@ -2012,16 +2095,16 @@ HexViewConfig make_view_config(App& app, const Tab& t) {
     cfg.group_size = app.settings.group_size;
     cfg.uppercase = app.settings.uppercase_hex;
     cfg.show_ascii = app.settings.show_ascii;
-    cfg.insert_mode = t.insert_mode;
+    cfg.insert_mode = t.insert_mode && !t.doc->fixed_size();
     cfg.highlight_modified = app.settings.highlight_modified;
     cfg.byte_class_colors = app.settings.byte_class_colors;
     cfg.mono = app.fonts.mono;
     // Whole pixels: a fractional size (e.g. 16 px at 125 %) would rasterise blurrier glyphs.
     cfg.font_size = std::round(app.settings.font_size * app.ui_scale);
     if (!t.hits.offsets.empty()) cfg.tick_offsets = &t.hits.offsets;
-    cfg.pointer_width = app.settings.pointer_width;
-    cfg.pointer_big_endian = app.settings.big_endian_inspector;  // follows the Inspector's LE / BE
-    cfg.pointer_base = app.settings.pointer_base;
+    // Width / signedness / relative / base; byte order = the Inspector's LE / BE.
+    cfg.set_pointer_type(app.settings.pointer_type());
+    inspector_mark(app, t, cfg.mark_offset, cfg.mark_length);  // outlines the Inspector row's bytes
     return cfg;
 }
 
@@ -2097,9 +2180,10 @@ void update_entropy(App& app, Tab& t) {
     }
 }
 
-// The entropy / byte-class strip right of the hex view (HexViewConfig::reserve_right). A click or
-// drag scrolls the view there, like the scrollbar: the caret stays and no history entry is made.
-void draw_minimap(App& app, Tab& t, float width) {
+// The entropy / byte-class strip right of a hex view pane (HexViewConfig::reserve_right). A click
+// or drag scrolls that pane there, like the scrollbar: the caret stays and no history entry is made.
+// `ev` = the pane's events of this frame; doc.view().top_row is the pane's while it is drawn.
+void draw_minimap(App& app, Tab& t, Minimap& mm, HexView& view, const HexViewEvents& ev, float width) {
     Document& d = *t.doc;
     update_entropy(app, t);
     std::shared_ptr<const EntropyResult> r = t.entropy.result();
@@ -2110,15 +2194,120 @@ void draw_minimap(App& app, Tab& t, float width) {
     if (t.entropy.running()) app.wants_poll = true;  // progressive map
 
     const uint64_t size = d.size();
-    const uint64_t bpr = uint64_t(std::max(1, t.ev.bytes_per_row));
+    const uint64_t bpr = uint64_t(std::max(1, ev.bytes_per_row));
     const uint64_t top = d.view().top_row;
     const uint64_t vb = top > size / bpr ? size : top * bpr;
-    const uint64_t ve = vb + std::min(size - vb, uint64_t(std::max(1, t.ev.visible_rows)) * bpr);
+    const uint64_t ve = vb + std::min(size - vb, uint64_t(std::max(1, ev.visible_rows)) * bpr);
     ImGui::SameLine(0.0f, 0.0f);
     MinimapEvents mev;
-    t.minimap.draw("##minimap", width, 0.0f, t.entropy_shown.get(), size, vb, ve,
-                   app.settings.minimap == 2 ? MinimapMode::ByteClass : MinimapMode::Entropy, mev);
-    if (mev.jump_requested) t.view.request_scroll_to(mev.jump_offset, true);
+    mm.draw("##minimap", width, 0.0f, t.entropy_shown.get(), size, vb, ve,
+            app.settings.minimap == 2 ? MinimapMode::ByteClass : MinimapMode::Entropy, mev);
+    if (mev.jump_requested) view.request_scroll_to(mev.jump_offset, true);
+}
+
+// One pane: `view` (+ its minimap when mm_w > 0) filling the current content region.
+void draw_pane(App& app, Tab& t, HexView& view, Minimap& mm, const std::vector<const HighlightSet*>& layers,
+               const HexViewConfig& cfg, float mm_w, HexViewEvents& ev) {
+    ev = HexViewEvents{};
+    view.draw("##hex", *t.doc, layers, cfg, ev);
+    if (mm_w > 0.0f) draw_minimap(app, t, mm, view, ev, mm_w);
+}
+
+// The two panes of a split tab with a draggable splitter between them. The active pane draws with
+// the document's top_row; the other one with split_top swapped in. Clicking (focusing) the other
+// pane activates it; until then its wheel / scrollbar / minimap only scroll it.
+void draw_split_panes(App& app, Tab& t, const std::vector<const HighlightSet*>& layers, HexViewConfig cfg,
+                      float mm_w) {
+    ViewState& v = t.doc->view();
+    // Side by side, each pane is narrow: auto-fit like the Compare tab (a fixed width would scroll).
+    if (t.split_vertical) cfg.bytes_per_row = 0;
+    // A HexView takes focus when its host window gets focused (e.g. the tab was clicked); here its
+    // host is a pane child, so do the same for the editor window.
+    if (GImGui->NavWindow == ImGui::GetCurrentWindow() && !ImGui::IsAnyItemActive()) t.view.request_focus();
+
+    const bool vert = t.split_vertical;
+    const float thick = std::max(4.0f, std::round(6.0f * app.ui_scale));
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float total = std::max(0.0f, (vert ? avail.x : avail.y) - thick);
+    const float min_pane = std::min(total * 0.5f, std::round(48.0f * app.ui_scale));
+    const float first = std::round(std::clamp(total * t.split_ratio, min_pane, total - min_pane));
+    const ImGuiWindowFlags pane_flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    HexViewEvents other_ev;
+    for (int pos = 0; pos < 2; ++pos) {
+        if (pos == 1) {
+            // Splitter: drag to resize, double-click to reset to half / half.
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const ImVec2 sz = vert ? ImVec2(thick, avail.y) : ImVec2(avail.x, thick);
+            ImGui::InvisibleButton("##splitter", ImVec2(std::max(1.0f, sz.x), std::max(1.0f, sz.y)));
+            const bool hovered = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+            if (hovered || held) ImGui::SetMouseCursor(vert ? ImGuiMouseCursor_ResizeEW : ImGuiMouseCursor_ResizeNS);
+            if (held && total > 0.0f) {
+                const float delta = vert ? ImGui::GetIO().MouseDelta.x : ImGui::GetIO().MouseDelta.y;
+                t.split_ratio = std::clamp((first + delta) / total, 0.05f, 0.95f);
+            }
+            if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) t.split_ratio = 0.5f;
+            const ImU32 col = ImGui::GetColorU32(held      ? ImGuiCol_SeparatorActive
+                                                 : hovered ? ImGuiCol_SeparatorHovered
+                                                           : ImGuiCol_Separator);
+            const float line = held || hovered ? std::max(2.0f, std::round(2.0f * app.ui_scale)) : 1.0f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            if (vert) {
+                const float x = std::floor(p0.x + (thick - line) * 0.5f);
+                dl->AddRectFilled(ImVec2(x, p0.y), ImVec2(x + line, p0.y + sz.y), col);
+                ImGui::SameLine(0.0f, 0.0f);
+            } else {
+                const float y = std::floor(p0.y + (thick - line) * 0.5f);
+                dl->AddRectFilled(ImVec2(p0.x, y), ImVec2(p0.x + sz.x, y + line), col);
+            }
+        }
+        const float len = std::max(1.0f, pos == 0 ? first : total - first);
+        ImGui::BeginChild(pos == 0 ? "##pane0" : "##pane1", vert ? ImVec2(len, avail.y) : ImVec2(avail.x, len),
+                          ImGuiChildFlags_None, pane_flags);
+        if (pos == t.split_active_pos) {
+            adopt_top_units(t, t.view.geometry().valid ? t.view.geometry().bpr : 0);
+            draw_pane(app, t, t.view, t.minimap, layers, cfg, mm_w, t.ev);
+            if (t.view.geometry().valid) t.top_bpr = t.view.geometry().bpr;
+        } else {
+            if (t.split_restore != UINT64_MAX) {  // session restore: needs the pane's row width
+                if (t.split_view.geometry().valid) {
+                    t.split_bpr = std::max(1, t.split_view.geometry().bpr);
+                    t.split_top = t.split_restore / uint64_t(t.split_bpr);
+                    t.split_restore = UINT64_MAX;
+                } else {
+                    app.wants_poll = true;
+                }
+            }
+            const uint64_t active_top = v.top_row;
+            const bool had_layout = t.split_view.geometry().valid;
+            v.top_row = t.split_top;
+            draw_pane(app, t, t.split_view, t.split_minimap, layers, cfg, mm_w, other_ev);
+            t.split_top = v.top_row;
+            v.top_row = active_top;
+            if (t.split_view.geometry().valid) {
+                // First layout: the view read split_top (written in the active pane's row width) as
+                // its own; re-express it (later frames the view keeps it stable itself).
+                const int bpr = t.split_view.geometry().bpr;
+                if (!had_layout && t.split_bpr > 0 && t.split_bpr != bpr)
+                    t.split_top = t.split_top * uint64_t(t.split_bpr) / uint64_t(bpr);
+                t.split_bpr = bpr;
+            }
+        }
+        ImGui::EndChild();
+        if (pos == 0 && vert) ImGui::SameLine(0.0f, 0.0f);
+    }
+    ImGui::PopStyleVar();
+
+    // Working in the other pane makes it the active one; its events are handled as the tab's.
+    if (other_ev.focused || other_ev.cursor_moved || other_ev.follow_requested || other_ev.open_context_menu ||
+        other_ev.nav_back || other_ev.nav_forward) {
+        activate_other_pane(t);
+        t.ev = other_ev;
+    } else if (other_ev.has_hover && !t.ev.has_hover) {
+        t.ev.has_hover = true;  // the panels' hover info works over both panes
+        t.ev.hover_offset = other_ev.hover_offset;
+    }
 }
 
 void draw_hex_view(App& app, Tab& t) {
@@ -2134,19 +2323,21 @@ void draw_hex_view(App& app, Tab& t) {
     HexViewConfig cfg = make_view_config(app, t);
     const float mm_w = app.settings.minimap ? std::round(14.0f * app.ui_scale) : 0.0f;
     cfg.reserve_right = mm_w;
-    adopt_top_units(t, t.view.geometry().valid ? t.view.geometry().bpr : 0);
-    t.ev = HexViewEvents{};
-    t.view.draw("##hex", d, layers, cfg, t.ev);
-    if (t.view.geometry().valid) t.top_bpr = t.view.geometry().bpr;
-    if (mm_w > 0.0f) draw_minimap(app, t, mm_w);
+    if (t.split) {
+        draw_split_panes(app, t, layers, cfg, mm_w);
+    } else {
+        adopt_top_units(t, t.view.geometry().valid ? t.view.geometry().bpr : 0);
+        draw_pane(app, t, t.view, t.minimap, layers, cfg, mm_w, t.ev);
+        if (t.view.geometry().valid) t.top_bpr = t.view.geometry().bpr;
+    }
     if (t.ev.cursor_moved || d.view().top_row != t.last_top_row) {
         t.last_top_row = d.view().top_row;
         d.view_generation++;
     }
     if (t.ev.follow_requested) {
         reveal_range(app, t, t.ev.follow_target, 0, true);
-        set_status(app, "Followed " + pointer_desc(app, app.settings.pointer_width, app.settings.big_endian_inspector) +
-                            " at " + fmt_offset(t.ev.follow_from) + " -> " + fmt_offset(t.ev.follow_target) +
+        set_status(app, "Followed " + pointer_type_name(app.settings.pointer_type()) + " at " +
+                            fmt_offset(t.ev.follow_from) + " -> " + fmt_offset(t.ev.follow_target) +
                             "  (Alt+Left / mouse back returns)", 6.0);
     }
     if (t.ev.nav_back) navigate(app, t, false);
@@ -2192,7 +2383,10 @@ void draw_compare(App& app, Tab& ta, Tab& tb) {
     cb.config.tick_offsets = nullptr;
     cb.config.bytes_per_row = 0;  // auto-fit: each half is narrow, a fixed width would scroll sideways
     cb.config_for = [&app](const Document& d, HexViewConfig& c) {
-        if (Tab* t = find_tab(app, d.id())) c.insert_mode = t->insert_mode;
+        if (Tab* t = find_tab(app, d.id())) {
+            c.insert_mode = t->insert_mode && !d.fixed_size();
+            inspector_mark(app, *t, c.mark_offset, c.mark_length);  // only the active side's
+        }
     };
     cb.layers = [&app](const Document& d, std::vector<const HighlightSet*>& layers) {
         if (Tab* t = find_tab(app, d.id())) collect_layers(app, *t, layers);
@@ -2212,7 +2406,8 @@ void draw_compare(App& app, Tab& ta, Tab& tb) {
         if (ev.cursor_moved) d.view_generation++;
         if (ev.follow_requested) {
             reveal_range(app, *t, ev.follow_target, 0, false);
-            set_status(app, "Followed pointer at " + fmt_offset(ev.follow_from) + " -> " + fmt_offset(ev.follow_target), 6.0);
+            set_status(app, "Followed " + pointer_type_name(app.settings.pointer_type()) + " at " +
+                                fmt_offset(ev.follow_from) + " -> " + fmt_offset(ev.follow_target), 6.0);
         }
         if (ev.nav_back) navigate(app, *t, false);
         if (ev.nav_forward) navigate(app, *t, true);
@@ -2299,6 +2494,7 @@ void draw_editor(App& app) {
             if (!open) close_id = t.doc->id();
         }
         bool close_compare = false;
+        app.diff_shown = false;
         if (app.diff) {
             Tab* ta = find_tab(app, app.diff_a);
             Tab* tb = find_tab(app, app.diff_b);
@@ -2311,6 +2507,7 @@ void draw_editor(App& app) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
                     ImGui::SetTooltip("A: %s\nB: %s", ta->path.empty() ? ta->label.c_str() : ta->path.c_str(),
                                       tb->path.empty() ? tb->label.c_str() : tb->path.c_str());
+                app.diff_shown = selected;
                 if (selected) {
                     // The panels follow a compared document (A until a side is focused).
                     if (Tab* cur = active_tab(app); cur != ta && cur != tb && app.select_request < 0)
@@ -3030,7 +3227,7 @@ void draw_settings_window(App& app) {
     help_marker("A typing run longer than this many bytes starts a new undo step (0 = no limit).");
 
     ImGui::SeparatorText("Follow pointer (Ctrl+click, Ctrl+Enter)");
-    changed |= pointer_settings(app, false);
+    changed |= draw_pointer_settings(app, false);
 
     ImGui::SeparatorText("Saving");
     if (ImGui::Checkbox("Keep the original as <file>.backup on the first save", &st.backup_on_save))
@@ -3221,8 +3418,109 @@ uint64_t session_signature(App& app) {
         mix(t->doc->state_id());
         mix(t->doc->view_generation);
         mix(t->doc->read_only() ? 1 : 0);
+        mix(t->doc->persist_generation());  // includes the doc extras (save_tab_extras)
     }
+    mix(app.diff ? app.diff_a : 0);
+    mix(app.diff ? app.diff_b : 0);
+    mix(app.diff ? uint64_t(app.diff->shift) : 0);
+    mix(app.diff_shown ? 1 : 0);
     return h;
+}
+
+// ---- session extras: per-tab view state (core/document.h PersistedDoc::extras) and the Compare
+// tab (core/session.h Session::set_extra). Written before every session save; set_extra is free
+// when a value did not change.
+
+std::string u64_text(uint64_t v) { return std::to_string(v); }
+
+uint64_t text_u64(const std::string& s, uint64_t fallback) {
+    if (s.empty()) return fallback;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+    return (end && *end == '\0') ? uint64_t(v) : fallback;
+}
+
+void save_tab_extras(Tab& t) {
+    Document& d = *t.doc;
+    if (d.busy()) return;
+    const bool parse_at = t.st.base != 0 || t.st.length != UINT64_MAX;  // Parse at offset / range
+    d.set_extra("parse.base", parse_at ? u64_text(t.st.base) : "");
+    d.set_extra("parse.length", parse_at && t.st.length != UINT64_MAX ? u64_text(t.st.length) : "");
+    d.set_extra("tail.enabled", t.tail.enabled ? "1" : "");
+    d.set_extra("split.on", t.split ? "1" : "");
+    d.set_extra("split.vertical", t.split && t.split_vertical ? "1" : "");
+    d.set_extra("split.active", t.split && t.split_active_pos ? "1" : "");
+    std::string ratio;
+    if (t.split && t.split_ratio != 0.5f) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.3f", double(t.split_ratio));
+        ratio = buf;
+    }
+    d.set_extra("split.ratio", ratio);
+    // The inactive pane's first visible byte (a byte offset survives a bytes-per-row change).
+    uint64_t top2 = t.split_restore;
+    if (top2 == UINT64_MAX) top2 = t.split_bpr > 0 ? t.split_top * uint64_t(t.split_bpr) : 0;
+    d.set_extra("split.top2", t.split && top2 ? u64_text(top2) : "");
+}
+
+void restore_tab_extras(App& app, Tab& t) {
+    Document& d = *t.doc;
+    const uint64_t base = text_u64(d.extra("parse.base"), 0);
+    const uint64_t length = text_u64(d.extra("parse.length"), UINT64_MAX);
+    if (base != 0 || length != UINT64_MAX) {
+        t.st.base = std::min(base, d.size());
+        t.st.length = length;
+        t.st.base_input = t.st.base ? fmt_offset(t.st.base) : std::string();
+    }
+    if (d.extra("split.on") == "1") {
+        set_split(t, true, d.extra("split.vertical") == "1");
+        const std::string r = d.extra("split.ratio");
+        const float ratio = r.empty() ? 0.5f : float(std::strtod(r.c_str(), nullptr));
+        t.split_ratio = ratio >= 0.05f && ratio <= 0.95f ? ratio : 0.5f;  // also rejects "nan" / "inf"
+        t.split_active_pos = d.extra("split.active") == "1" ? 1 : 0;
+        t.split_restore = std::min(text_u64(d.extra("split.top2"), 0), d.size());
+    }
+    if (d.extra("tail.enabled") == "1") start_live_tail(app, t, false);
+}
+
+// The Compare tab as session extras "compare.0" = "<docidA>|<docidB>|<shift>" and "active" =
+// "compare.0" while it is the selected tab. Process documents are not in the session: a compare
+// with one is dropped.
+void save_session_extras(App& app) {
+    Session& s = *app.session;
+    std::vector<std::string> stale;
+    for (const auto& kv : s.extras())
+        if (kv.first.rfind("compare.", 0) == 0 && kv.first != "compare.0") stale.push_back(kv.first);
+    for (const std::string& k : stale) s.set_extra(k, "");
+    std::string cmp;
+    Tab* ta = app.diff ? find_tab(app, app.diff_a) : nullptr;
+    Tab* tb = app.diff ? find_tab(app, app.diff_b) : nullptr;
+    if (ta && tb && ta->doc->persistable() && tb->doc->persistable())
+        cmp = u64_text(app.diff_a) + "|" + u64_text(app.diff_b) + "|" + std::to_string(app.diff->shift);
+    s.set_extra("compare.0", cmp);
+    s.set_extra("active", !cmp.empty() && app.diff_shown ? "compare.0" : "");
+}
+
+// After the tabs are restored: reopen the Compare tab. `ids` maps a saved Document::id() to the
+// restored document's id.
+void restore_session_extras(App& app, const std::vector<std::pair<uint64_t, uint64_t>>& ids) {
+    const std::string cmp = app.session->extra("compare.0");
+    if (cmp.empty()) return;
+    auto map_id = [&](uint64_t saved) -> uint64_t {
+        for (const auto& p : ids)
+            if (saved && p.first == saved) return p.second;
+        return 0;
+    };
+    const size_t a = cmp.find('|'), b = a == std::string::npos ? a : cmp.find('|', a + 1);
+    if (b == std::string::npos) return;
+    const uint64_t ida = map_id(text_u64(cmp.substr(0, a), 0));
+    const uint64_t idb = map_id(text_u64(cmp.substr(a + 1, b - a - 1), 0));
+    if (!ida || !idb || ida == idb) return;
+    app.diff = std::make_unique<DiffView>();
+    app.diff_a = ida;
+    app.diff_b = idb;
+    app.diff->shift = std::strtoll(cmp.c_str() + b + 1, nullptr, 10);
+    app.diff_select = app.session->extra("active") == "compare.0";
 }
 
 // Returns false only if a session write was attempted (or impossible because a save is running)
@@ -3233,12 +3531,20 @@ bool save_session(App& app, bool force, std::string* err_out) {
         if (err_out) *err_out = "a document is being saved";
         return false;
     }
+    for (auto& t : app.tabs) save_tab_extras(*t);
     const uint64_t sig = session_signature(app);
     if (!force && sig == app.session_sig) return true;
+    save_session_extras(app);
+    // Process memory is not persisted (pids are ephemeral): hot exit drops those tabs.
     std::vector<Document*> docs;
-    for (auto& t : app.tabs) docs.push_back(t->doc.get());
+    int active = 0;
+    for (size_t i = 0; i < app.tabs.size(); ++i) {
+        if (!app.tabs[i]->doc->persistable()) continue;
+        if (int(i) == app.active) active = int(docs.size());
+        docs.push_back(app.tabs[i]->doc.get());
+    }
     std::string err;
-    if (!app.session->save(docs, std::max(app.active, 0), &err)) {
+    if (!app.session->save(docs, active, &err)) {
         if (err != app.last_session_err) log_console(app, ConsoleLine::Warn, "Session save failed: " + err);
         app.last_session_err = err;
         if (err_out) *err_out = err.empty() ? std::string("unknown error") : err;
@@ -3291,6 +3597,9 @@ void build_default_layout(ImGuiID dock_id) {
     ImGui::DockBuilderDockWindow(kWinBookmarks, bottom);
     ImGui::DockBuilderDockWindow(kWinStrings, bottom);
     ImGui::DockBuilderDockWindow(kWinPackets, bottom);
+    ImGui::DockBuilderDockWindow(kWinHistory, bottom);
+    ImGui::DockBuilderDockWindow(kWinXor, bottom);
+    ImGui::DockBuilderDockWindow(kWinRegions, bottom);
     ImGui::DockBuilderFinish(dock_id);
 }
 
@@ -3326,6 +3635,33 @@ void draw_cstruct_dialog(App& app) {
         return apply_parser_at_cursor(app, lua, name, err);
     };
     app.cstruct_dlg.draw(kWinCStruct, app.fonts.mono, app.ui_scale, cb);
+}
+
+// File > Open Process... / Open Disk... pickers (draw nothing while closed).
+void draw_targets_dialog(App& app) {
+    if (!app.targets.process_picker_open() && !app.targets.disk_picker_open()) return;
+    TargetsDialogCallbacks cb;
+    cb.open_process = [&app](uint32_t pid, bool writable, std::string* err) {
+        std::unique_ptr<Document> d = Document::open_process(pid, writable, err);
+        if (!d) return false;
+        add_tab(app, std::move(d));  // shows the Regions panel; not a recent file (pids are ephemeral)
+        set_status(app, "Opened process " + std::to_string(pid) +
+                            (writable ? "" : " read-only (Edit > Read-only makes it writable)"), 6.0);
+        return true;
+    };
+    cb.open_device = [&app](const std::string& path, bool writable, std::string* err) {
+        if (int i = tab_for_path(app, path); i >= 0) {
+            app.select_request = app.active = i;
+            return true;
+        }
+        std::unique_ptr<Document> d = Document::open_device(path, writable, err);
+        if (!d) return false;
+        add_tab(app, std::move(d));
+        app.settings.push_recent(path);
+        mark_settings_dirty(app);
+        return true;
+    };
+    app.targets.draw(app.fonts.mono, app.ui_scale, cb);
 }
 
 void draw_panels(App& app) {
@@ -3392,7 +3728,29 @@ void draw_panels(App& app) {
         }
         draw_packets_panel(app);
     }
+    if (app.show_history) {
+        if (app.focus_history) {
+            ImGui::SetNextWindowFocus();
+            app.focus_history = false;
+        }
+        draw_history_panel(app);
+    }
+    if (app.show_xor) {
+        if (app.focus_xor) {
+            ImGui::SetNextWindowFocus();
+            app.focus_xor = false;
+        }
+        draw_xor_panel(app);
+    }
+    if (app.show_regions) {
+        if (app.focus_regions && ImGui::GetFrameCount() > 1 && app.layout_focus_step == 0) {
+            ImGui::SetNextWindowFocus();
+            app.focus_regions = false;
+        }
+        draw_regions_panel(app);
+    }
     draw_cstruct_dialog(app);
+    draw_targets_dialog(app);
     // New windows take focus when they first appear, so on the first frame the last panel drawn
     // (Bookmarks) would steal its dock node's selected tab from the one saved in the layout.
     if (ImGui::GetFrameCount() == 1) ImGui::SetWindowFocus(kWinEditor);
@@ -3479,7 +3837,9 @@ void on_glfw_error(int code, const char* desc) {
 void restore_session(App& app) {
     Session::Restored r = app.session->load();
     const bool any = !r.docs.empty();
-    for (auto& d : r.docs) {
+    std::vector<std::pair<uint64_t, uint64_t>> ids;  // saved Document::id() -> restored id
+    for (size_t i = 0; i < r.docs.size(); ++i) {
+        std::unique_ptr<Document>& d = r.docs[i];
         if (!d) continue;
         // Continue the "Untitled N" numbering after restored untitled tabs.
         const std::string name = d->display_name();
@@ -3491,11 +3851,14 @@ void restore_session(App& app) {
         // top_row is a row index; with another bytes-per-row (auto-fit, window size) it would show
         // another region, so make sure the caret is on screen (no-op when it already is).
         t.view.request_scroll_to(t.doc->view().cursor, false);
+        if (i < r.saved_ids.size()) ids.emplace_back(r.saved_ids[i], t.doc->id());
+        restore_tab_extras(app, t);
     }
     if (any && !app.tabs.empty()) {
         app.active = std::clamp(r.active_index, 0, int(app.tabs.size()) - 1);
         app.select_request = app.active;
     }
+    restore_session_extras(app, ids);
     for (const std::string& w : r.warnings) log_console(app, ConsoleLine::Warn, "Session: " + w);
     if (r.warnings.size() == 1)
         notify(app, r.warnings.front(), false);
@@ -3558,21 +3921,24 @@ void startup(App& app) {
         bp.width = std::clamp(app.settings.bitmap_width, 1, BitmapPanel::kMaxWidth);
         bp.zoom = std::clamp(app.settings.bitmap_zoom, 1, BitmapPanel::kMaxZoom);
     }
+    // The Inspector starts with the follow-pointer type's row selected (and its bytes outlined).
+    if (InspType ft = insp_type_of_int(app.settings.pointer_width, app.settings.pointer_signed); ft != InspType::Count)
+        app.insp_sel = int(ft);
     for (const std::string& f : app.opts.files) open_path(app, f);
     app.next_autosave = now_s() + std::max(1, app.settings.session_autosave_seconds);
 }
 
 void shutdown(App& app) {
     app.find.job.cancel();
-    end_compare(app);
     if (app.save.running) {
         app.save.thread.join();  // only reachable with --frames; normal exits wait for the save
         app.save.running = false;
     }
     if (app.hot_exit)
-        save_session(app, true);
+        save_session(app, true);  // before end_compare: the Compare tab is in the session
     else if (app.session && !app.settings.restore_session)
         app.session->clear();  // hot exit disabled: don't resurrect stale edits later
+    end_compare(app);
     app.settings.save(paths::settings_file());
     app.engine.reset();  // before documents: the Lua state may still reference them
     app.tabs.clear();

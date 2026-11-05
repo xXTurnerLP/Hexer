@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,6 +56,12 @@ public:
     // Like read() (unreadable bytes are zero-filled), but returns only how many bytes before the
     // first unreadable one (I/O error) are valid.
     size_t read_valid(uint64_t offset, uint8_t* dst, size_t len) const;
+    // First offset >= offset that may hold readable data: `offset` itself unless it lies in a
+    // hole of a sparse source (unmapped / inaccessible process memory); size() if none follows.
+    // Background scans skip holes with it instead of stopping: after read_valid() came back
+    // short at `at`, next_readable(at) > at means "a hole, continue there"; == at means a real
+    // I/O error (stop and report as today).
+    uint64_t next_readable(uint64_t offset) const;
 
     // Implementation detail, public for Document/Session code.
     std::vector<std::shared_ptr<FileSource>> sources;      // file versions (Original piece .chunk)
@@ -122,6 +129,16 @@ struct PersistedDoc {
     // Targets this document already backed up (or created) on its first save: a restored tab does
     // not replace "<file>.backup" (the original) again.
     std::vector<std::string> backup_done;
+    // Opaque per-document UI state (Document::set_extra): the core never interprets it. Values are
+    // binary-safe. Keys the app uses (all values are plain text; unset = default):
+    //   "parse.base", "parse.length"  Parse at offset / range (decimal uint64; the parser itself is
+    //                                 ViewState::parser)
+    //   "tail.enabled"   "1" live tail             "split.on", "split.vertical", "split.active"  "1"
+    //   "split.ratio"    first pane share, e.g. "0.300"   "split.top2"  first visible byte of the
+    //                                 inactive pane (decimal byte offset)
+    // Stored in an optional extension block of the session file (format v3; files without extras
+    // are still written as v2, so an older Hexer can read them).
+    std::map<std::string, std::string> extras;
 };
 
 struct Progress {
@@ -165,7 +182,19 @@ struct TailState {
 class Document {
 public:
     // Opens a file for streaming access. Fails only if the file cannot be opened for reading.
+    // Also accepts "process://<pid>" (= open_process(pid, false): read-only), so a process target
+    // from the recent-files list or the command line reopens. Device paths ("\\.\PhysicalDrive0",
+    // "/dev/sda") open like files here (writable unless set_read_only, as before); the Open Disk
+    // picker uses open_device(), which is read-only unless asked otherwise.
     static std::unique_ptr<Document> open_file(const std::string& path, std::string* err = nullptr);
+    // The live address space of process `pid` (offset = virtual address; see core/procmem.h).
+    // path() is "process://<pid>", the name "notepad.exe (1234)". Read-only unless `writable`.
+    // Fixed size: only overwrites can be saved, written straight into the process memory (no
+    // backup). Unmapped addresses read as unreadable ("??") holes. Not persistable (hot exit).
+    static std::unique_ptr<Document> open_process(uint32_t pid, bool writable, std::string* err = nullptr);
+    // A raw disk / volume / block device. Read-only unless `writable`; fixed size, in-place saves
+    // only, never backed up. Named "PhysicalDrive0 (931.51 GiB)".
+    static std::unique_ptr<Document> open_device(const std::string& path, bool writable, std::string* err = nullptr);
     // New, untitled, empty document ("Untitled 1"...).
     static std::unique_ptr<Document> create_empty(const std::string& display_name);
     // New untitled document pre-filled with bytes (e.g. produced by a script serializer).
@@ -178,6 +207,23 @@ public:
     bool has_path() const { return !path_.empty(); }
     std::string display_name() const;                     // file name or untitled name
     void set_display_name(const std::string& n) { display_name_ = n; }
+
+    // ---- target kind ---------------------------------------------------------------------------
+    // What the document's current version reads from (untitled documents report File).
+    SourceKind target() const;
+    uint32_t process_id() const;      // process documents: the pid; else 0
+    // Device / process: the size cannot change. Inserts and deletes are still accepted as edits
+    // (undoable), but save() refuses them with a clear message; the UI should keep such
+    // documents in overwrite mode.
+    bool fixed_size() const;
+    // False for process documents (pids are ephemeral): the session must not persist them and a
+    // hot exit simply drops them (their unsaved edits are lost; the app may ask first).
+    bool persistable() const;
+    // Process documents: re-read the region map and drop cached bytes so the view shows the
+    // current memory (cached blocks also expire on their own after ~1 s). No-op for files.
+    void refresh_target();
+    // Process documents: false once the process has exited (every byte then reads as unreadable).
+    bool target_alive() const;
 
     // ---- reading -----------------------------------------------------------------------------
     uint64_t size() const { return table_.size(); }
@@ -225,6 +271,15 @@ public:
     bool redo();
     const std::vector<UndoEntry>& undo_stack() const { return undo_; }   // for a History panel
     const std::vector<UndoEntry>& redo_stack() const { return redo_; }
+    // The history exactly as the next undo()/redo() will see it (a finished save may have rewritten
+    // it without installing it yet). UI thread only, and only while !busy().
+    const std::vector<UndoEntry>& history_undo() const { return eff_undo(); }
+    const std::vector<UndoEntry>& history_redo() const { return eff_redo(); }
+    // state_id() of the last saved/opened state (0 = never saved): that history entry is "Saved".
+    uint64_t saved_state_id() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return saved_state_id_;
+    }
     static constexpr size_t kMaxUndo = 10000;
 
     // Typing-run limits (app-wide; the app sets them from Settings). A coalesced edit starts a new
@@ -328,6 +383,11 @@ public:
     // Bumps whenever anything persist() exports may have changed (content, history, bookmarks,
     // saves, reload). Thread-safe; the session uses it to skip unchanged docs.
     uint64_t persist_generation() const { return persist_gen_.load(); }
+    // Opaque per-document UI state persisted with the session (see PersistedDoc::extras for the
+    // keys). Not part of undo history. set_extra("k", "") erases; a change bumps persist_generation.
+    const std::map<std::string, std::string>& extras() const { return extras_; }
+    std::string extra(const std::string& key) const;  // "" if unset
+    void set_extra(const std::string& key, const std::string& value);
 
 private:
     Document();
@@ -375,6 +435,7 @@ private:
     uint32_t base_chunks_ = 0;            // untitled docs: add bytes that count as "original"
     uint64_t base_last_used_ = 0;
     std::atomic<uint64_t> persist_gen_{0};
+    std::map<std::string, std::string> extras_;  // see set_extra(); written under mu_
     size_t trims_since_reclaim_ = 0;      // history entries dropped by kMaxUndo since reclaim_add()
 
     uint64_t id_ = 0;

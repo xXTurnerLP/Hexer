@@ -19,27 +19,33 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
 
 ## Layout
 ```
-src/core/    no UI, no Lua — os_file, file_source, piece_table, highlight, document (edits, undo,
-             save), session (hot exit), search, inspector, util (goto exprs, copy-as, paste parse),
-             settings (+ paths), nav (follow pointer + jump history), strings_scan (StringsJob),
-             hash (16 algorithms + HashJob), cstruct (C struct definitions -> Lua parser source),
+src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device / process memory),
+             procmem (process memory backend, "process://<pid>" URLs), devices (process / disk /
+             memory region lists), piece_table, highlight, document (edits, undo, save, targets,
+             extras), session (hot exit + per-doc / session extras), search, inspector, util (goto
+             exprs, copy-as, paste parse), settings (+ paths), nav (PointerType, follow pointer +
+             jump history), xorscan (XorScanJob, key_guess, undoable apply_transform),
+             strings_scan (StringsJob), hash (16 algorithms + HashJob), cstruct (C struct
+             definitions -> Lua parser source),
              entropy (ByteClass + EntropyJob: sampled per-bucket entropy for the minimap), bitmap
              (bytes -> pixels), diff (DiffJob: compare two Snapshots with a shift), pcap (pcap/pcapng
              PcapIndexJob + packet dissector); document also has refresh_appended() (live tail)
 src/script/  script_engine.h (Lua API contract — the header comment is the API spec),
              script_engine.cpp, lua_api.cpp
 src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
-             menus, shortcuts, tabs, Compare tab, live tail, minimap wiring, ScriptHost impl);
-             self-contained feature UIs without App dependency: panel_strings, panel_hash,
-             dialog_cstruct, panel_bitmap, panel_packets (App owns one of each), minimap (one per
-             tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare)
+             menus, shortcuts, tabs, Compare tab, live tail, split view, minimap wiring, session
+             extras, ScriptHost impl); self-contained feature UIs without App dependency:
+             panel_strings, panel_hash, dialog_cstruct, panel_bitmap, panel_packets, panel_history,
+             panel_xor, dialog_targets (Open Process / Open Disk + RegionsPanel) (App owns one of
+             each), minimap (one per tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare)
 src/main.cpp
 scripts/     bundled Lua scripts (examples/ parsers + commands); user scripts live in
              <config>/scripts and override bundled ones by name
 tests/       doctest; one exe per module: test_core, test_util, test_script, test_search,
              test_ui (headless ImGui: drives HexView + Minimap with simulated mouse/keyboard),
              test_nav, test_strings, test_hash, test_cstruct, test_entropy, test_bitmap,
-             test_diff, test_pcap, test_tail (growing files)
+             test_diff, test_pcap, test_tail (growing files), test_procmem (reads and writes the
+             test process's own memory), test_history, test_xorscan, test_session
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
              make_pcap.py (demo pcapng with HXP packets for the Packets panel)
@@ -74,10 +80,13 @@ Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`
 `"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`, `"Minimap: Byte Classes"`,
 `"Color Bytes by Class"`, `"Toggle Bitmap"`, `"Bitmap: Show at Cursor"`, `"Toggle Packets"`,
 `"Structure: Parse Selection"`, `"Toggle Live Tail"`, `"Compare with: <tab name>"`,
-`"Compare: Align at Cursors"`; any palette
+`"Compare: Align at Cursors"`, `"Show History"`, `"XOR: Scan File"`, `"XOR: Guess Key from
+Selection"`, `"Open Process..."`, `"Open Disk..."`, `"Toggle Regions"`, `"Split Horizontally"`,
+`"Split Vertically"`, `"Split View: Switch Pane"`, `"Undo"`; any palette
 label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable; all
 actions of one run execute in the same frame, so e.g. "Compare: Next Difference" right after
-"Compare with: ..." finds no result yet).
+"Compare with: ..." finds no result yet). A process opens from the command line as
+`"process://<pid>"` (read-only); `settings.ini` `pointer_width = 2` preselects the uint16 Inspector row.
 Settings drive what actions cannot: put e.g. `bitmap_format = RGB 24-bit` or `minimap = classes`
 in `<config-dir>/settings.ini` before a screenshot run. The real mouse cursor is not hidden: if it
 sits over the window, its hover tooltip shows up in the screenshot.
@@ -91,6 +100,15 @@ mods)`, `ui.drag(a, b)`, `ui.key(ImGuiKey_X, mods)`, `ui.type("ab")` queue io ev
 and `ui.hex(off)` / `ui.txt(off)` give the screen position of a drawn byte (`HexView::cell_pos`).
 Every change to input handling or hit testing in `ui/hex_view.cpp` gets a case there.
 Use `Document::set_clock_for_tests` for undo-merge timing.
+
+Follow pointer type: `Settings::pointer_type()` (width / signed / relative / base + the Inspector's
+LE/BE) is the one source; clicking an integer Inspector row sets it, `follow_pointer_as()`
+(panels.h) follows it, `inspector_mark()` outlines the Inspector row's bytes in the hex view.
+
+Session extras: per-tab view state (Parse at, live tail, split) goes to `Document::set_extra` in
+`save_tab_extras()` (app.cpp) and comes back in `restore_tab_extras()`; state spanning tabs (the
+Compare tab) goes to `Session::set_extra`. Process documents are not persistable: the session
+skips them (hot exit drops them with a console line).
 
 Jump history: `reveal_range()` (app_internal.h) is the one "big jump" helper: it pushes the
 position it leaves onto the tab's `NavHistory`. Use it for new jump sources (not for caret moves).

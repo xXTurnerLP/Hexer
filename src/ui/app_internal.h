@@ -1,7 +1,7 @@
 #pragma once
 // Private to the UI module: the one App struct shared by app.cpp (main loop, menus, shortcuts,
 // tabs, popups, ScriptHost) and panels.cpp (Inspector, Structure, Console, Search Results,
-// Bookmarks, Strings, Hashes, Bitmap, Packets, status bar). Plain data + a few helper functions;
+// Bookmarks, Strings, Hashes, Bitmap, Packets, History, XOR Search, Regions, status bar). Plain data + a few helper functions;
 // no class hierarchy.
 #include <atomic>
 #include <cstdint>
@@ -19,12 +19,15 @@
 #include "script/script_engine.h"
 #include "ui/app.h"
 #include "ui/dialog_cstruct.h"
+#include "ui/dialog_targets.h"
 #include "ui/hex_view.h"
 #include "ui/minimap.h"
 #include "ui/panel_bitmap.h"
 #include "ui/panel_hash.h"
+#include "ui/panel_history.h"
 #include "ui/panel_packets.h"
 #include "ui/panel_strings.h"
+#include "ui/panel_xor.h"
 #include "ui/theme.h"
 #include "ui/view_diff.h"
 
@@ -44,6 +47,9 @@ inline constexpr const char* kWinHashes = "Hashes";
 inline constexpr const char* kWinCStruct = "C Struct to Parser";
 inline constexpr const char* kWinBitmap = "Bitmap";
 inline constexpr const char* kWinPackets = "Packets";
+inline constexpr const char* kWinHistory = "History";
+inline constexpr const char* kWinXor = "XOR Search";
+inline constexpr const char* kWinRegions = "Regions";
 
 // ---- per-tab state -------------------------------------------------------------------------
 
@@ -72,7 +78,8 @@ struct StructureState {
     uint64_t clicked_cursor = 0;
     // Parse at offset: the parser runs over [base, base + length) (base 0 + UINT64_MAX = the whole
     // file; UINT64_MAX = to EOF). Needs a chosen parser (detect() looks at the file start). Kept
-    // per tab, not in the session. A length comes from the Packets panel (one packet's bytes).
+    // per tab and in the session (doc extras parse.base / parse.length). A length comes from the
+    // Packets panel (one packet's bytes).
     uint64_t base = 0;
     uint64_t length = UINT64_MAX;
     uint64_t parsed_base = 0;         // base / length of `result`
@@ -125,12 +132,31 @@ struct Tab {
     double entropy_first_change = 0.0, entropy_last_change = 0.0;
     std::shared_ptr<const EntropyResult> entropy_shown;  // what the minimap draws (old map while rescanning)
 
-    TailState tail;                   // View > Live Tail (not persisted)
+    TailState tail;                   // View > Live Tail (session: doc extra tail.enabled)
 
     // doc.view().top_row is a row index; the tab's HexView and a Compare side may use different
     // bytes per row. top_bpr = the row width top_row is currently expressed in (0 = unknown).
     int top_bpr = 0;
     int compare_bpr = 0;              // bytes per row of this document's side in the Compare tab
+
+    // View > Split View: the tab shows two panes of this document, each with its own scroll.
+    // Caret and selection are shared (one ViewState). `view`, `minimap`, `ev` and
+    // doc.view().top_row (rows of top_bpr bytes) always belong to the ACTIVE pane - the one
+    // clicked last - so jumps, caret follow, live tail, panels and the session work on it
+    // unchanged; the other pane keeps its scroll in split_top (rows of split_bpr bytes).
+    // Activating the other pane swaps the two sets (activate_other_pane). Persisted as doc extras
+    // split.on / split.vertical / split.ratio / split.active / split.top2 (see save_tab_extras).
+    bool split = false;
+    bool split_vertical = false;      // false: panes stacked top / bottom; true: side by side
+    float split_ratio = 0.5f;         // share of the first (top / left) pane
+    int split_active_pos = 0;         // where `view` is drawn: 0 = top / left, 1 = bottom / right
+    HexView split_view;               // the inactive pane
+    Minimap split_minimap;
+    uint64_t split_top = 0;
+    int split_bpr = 0;                // row width split_top is expressed in (0 = unknown)
+    // Session restore: the inactive pane's first visible byte, applied once that pane has a layout
+    // (its row width is only known then). UINT64_MAX = nothing pending.
+    uint64_t split_restore = UINT64_MAX;
 };
 
 // ---- app-level state -----------------------------------------------------------------------
@@ -231,8 +257,9 @@ struct App final : ScriptHost {
     bool show_inspector = true, show_structure = true, show_console = true, show_results = true,
          show_bookmarks = true, show_strings = true, show_hashes = true;
     bool show_bitmap = false, show_packets = false;  // opened on demand (Packets: for captures)
+    bool show_history = false, show_xor = false;
+    bool show_regions = false;        // auto-shown when a process document is opened
     bool show_settings = false;       // Settings window (Edit > Settings..., Ctrl+,)
-    bool bm_all_files = false;        // Bookmarks panel lists every open file
     bool focus_bookmarks = false;     // bring the Bookmarks panel to the front next frame
     bool build_layout = false;        // (re)build the default dock layout this frame
     int layout_focus_step = 0;        // after a layout build: front the Console tab, then the Editor
@@ -240,6 +267,7 @@ struct App final : ScriptHost {
     bool focus_console_input = false;
     bool focus_structure = false, focus_strings = false, focus_hashes = false;
     bool focus_bitmap = false, focus_packets = false;
+    bool focus_history = false, focus_xor = false, focus_regions = false;
 
     // Feature panels (self-contained; App members so their worker threads are joined before exit).
     StringsPanel strings_panel;
@@ -247,12 +275,17 @@ struct App final : ScriptHost {
     CStructDialog cstruct_dlg;
     BitmapPanel bitmap_panel;
     PacketsPanel packets_panel;
+    HistoryPanel history_panel;
+    XorPanel xor_panel;
+    TargetsDialog targets;            // File > Open Process... / Open Disk...
+    RegionsPanel regions_panel;
 
     // Compare (File > Compare With...): a "Compare" tab in the editor's tab bar showing two open
     // documents side by side. Closing either document ends it.
     std::unique_ptr<DiffView> diff;
     uint64_t diff_a = 0, diff_b = 0;  // Document::id() of the two sides
     bool diff_select = false;         // select the Compare tab next frame
+    bool diff_shown = false;          // the Compare tab was the selected tab last frame (session)
 
     FindState find;
     SaveTask save;
@@ -339,9 +372,6 @@ Document* usable_doc(App& app);
 // Select [offset, offset+len) with the caret at `offset`, scroll it into view, optionally focus.
 // A "big jump": the position it leaves is pushed onto the tab's NavHistory (Back returns to it).
 void reveal_range(App& app, Tab& tab, uint64_t offset, uint64_t len, bool focus_view);
-// Follow pointer: decode the `width`-byte pointer at `at` (byte order `big_endian`, minus
-// settings.pointer_base) and jump there (recorded in the history). Reports failures in the status bar.
-bool follow_pointer(App& app, Tab& tab, uint64_t at, int width, bool big_endian);
 void set_status(App& app, const std::string& text, double seconds = 4.0);
 void notify(App& app, const std::string& text, bool error);
 void show_message(App& app, const std::string& title, const std::string& text);

@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+
+#include "core/devices.h"
+#include "core/procmem.h"
+#include "core/util.h"
 
 namespace hx {
 
@@ -165,10 +170,10 @@ size_t read_pieces(const std::vector<std::shared_ptr<FileSource>>& sources,
                 got += s ? s->read(pos + got, dst + done + got, n - got) : 0;
                 if (got >= n) break;
                 bad_at(done + got);
-                // Unreadable: zero-fill up to the next cache block boundary and continue after it.
+                // Unreadable: zero-fill up to the next cache block boundary (files) or the end of
+                // the hole (process memory) and continue after it.
                 uint64_t at = pos + got;
-                size_t skip = s ? size_t(std::min<uint64_t>(n - got, FileSource::kBlockSize - at % FileSource::kBlockSize))
-                                : n - got;
+                size_t skip = s ? size_t(s->unreadable_run(at, n - got)) : n - got;
                 std::memset(dst + done + got, 0, skip);
                 mark(done + got, skip);
                 got += skip;
@@ -281,6 +286,20 @@ size_t Snapshot::read_valid(uint64_t offset, uint8_t* dst, size_t len) const {
     return valid;
 }
 
+uint64_t Snapshot::next_readable(uint64_t offset) const {
+    if (offset >= size_) return size_;
+    auto it = std::upper_bound(starts.begin(), starts.end(), offset);
+    size_t i = size_t(it - starts.begin()) - 1;
+    for (uint64_t off = offset - starts[i]; i < pieces.size(); ++i, off = 0) {
+        const Piece& p = pieces[i];
+        const FileSource* s = p.src == Piece::Original && p.chunk < sources.size() ? sources[p.chunk].get() : nullptr;
+        if (!s || !s->sparse()) return starts[i] + off;
+        const uint64_t r = s->next_readable(p.start + off);
+        if (r < p.start + p.len) return starts[i] + (r - p.start);
+    }
+    return size_;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------------------------
@@ -288,6 +307,8 @@ Document::Document() : id_(g_next_doc_id++) { sources_.reserve(16); }
 Document::~Document() = default;
 
 std::unique_ptr<Document> Document::open_file(const std::string& path, std::string* err) {
+    uint32_t pid = 0;
+    if (parse_process_url(path, &pid)) return open_process(pid, false, err);
     std::string abs = os_absolute_path(path);
     auto src = FileSource::open(abs, err);
     if (!src) return nullptr;
@@ -296,6 +317,38 @@ std::unique_ptr<Document> Document::open_file(const std::string& path, std::stri
     d->sources_.push_back(src);
     d->table_.reset(0, src->size());
     d->disk_stat_ = src->stat_at_open();
+    d->state_id_ = d->saved_state_id_ = d->next_state_id_++;
+    return d;
+}
+
+std::unique_ptr<Document> Document::open_device(const std::string& path, bool writable, std::string* err) {
+    if (!os_stat(path).is_device) {
+        fail(err, path + " is not a disk, volume or block device (or it cannot be accessed)");
+        return nullptr;
+    }
+    std::string e;
+    auto d = open_file(path, &e);
+    if (!d) {
+        if (e.find("denied") != std::string::npos)
+            e += " (raw disk access needs administrator rights on Windows, root or the disk group on Linux)";
+        fail(err, e);
+        return nullptr;
+    }
+    d->read_only_ = !writable;
+    return d;
+}
+
+std::unique_ptr<Document> Document::open_process(uint32_t pid, bool writable, std::string* err) {
+    auto src = FileSource::open_process(pid, err);
+    if (!src) return nullptr;
+    std::unique_ptr<Document> d(new Document());
+    d->path_ = process_url(pid);
+    std::string name = process_name(pid);
+    d->display_name_ = (name.empty() ? std::string("process") : name) + " (" + std::to_string(pid) + ")";
+    d->sources_.push_back(src);
+    d->table_.reset(0, src->size());
+    d->disk_stat_ = src->stat_at_open();
+    d->read_only_ = !writable;
     d->state_id_ = d->saved_state_id_ = d->next_state_id_++;
     return d;
 }
@@ -321,7 +374,40 @@ std::unique_ptr<Document> Document::create_from_bytes(const std::string& display
 }
 
 std::string Document::name_locked() const {
-    return display_name_.empty() ? path_filename(path_) : display_name_;
+    if (!display_name_.empty()) return display_name_;
+    const auto& src = sources_.back();
+    if (src && src->kind() == SourceKind::Device) return path_filename(path_) + " (" + fmt_size(src->size()) + ")";
+    return path_filename(path_);
+}
+
+SourceKind Document::target() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return sources_.back() ? sources_.back()->kind() : SourceKind::File;
+}
+
+uint32_t Document::process_id() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return sources_.back() ? sources_.back()->pid() : 0;
+}
+
+bool Document::fixed_size() const { return target() != SourceKind::File; }
+
+bool Document::persistable() const { return target() != SourceKind::Process; }
+
+void Document::refresh_target() {
+    std::shared_ptr<FileSource> src;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        src = sources_.back();
+    }
+    if (!src || src->kind() != SourceKind::Process) return;
+    src->refresh();
+    generation_++;  // the bytes may differ now (views / parsers re-read)
+}
+
+bool Document::target_alive() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return !sources_.back() || sources_.back()->alive();
 }
 
 std::string Document::display_name() const {
@@ -794,10 +880,14 @@ bool Document::save(Progress* progress, std::string* err, bool force) {
     lk.unlock();
 
     if (known.is_device || (src && src->stat_at_open().is_device)) {
-        // Devices have no meaningful size/mtime and cannot be replaced by a rewritten copy.
+        // Devices (and process memory) have no meaningful size/mtime and cannot be replaced by a
+        // rewritten copy.
         if (!inplace)
-            return fail(err, "Size-changing edits cannot be saved to a device (" + name +
-                                 "); only overwrites can. Use Save As to write an image file.");
+            return fail(err, src && src->kind() == SourceKind::Process
+                                 ? "Size-changing edits (insert / delete) cannot be saved to process memory (" + name +
+                                       "); only overwrites can. Undo them first."
+                                 : "Size-changing edits (insert / delete) cannot be saved to a device (" + name +
+                                       "); only overwrites can. Undo them, or use Save As to write an image file.");
         return save_inplace(path, src, cur, *snap, progress, err);
     }
     FileStat now = os_stat(path);
@@ -858,6 +948,9 @@ bool Document::save_as(const std::string& path, Progress* progress, std::string*
         same = !path_.empty() && (path_ == target || os_same_file(path_, target));
     }
     if (same) return save(progress, err, true);  // explicitly chosen to overwrite this file
+    if (this->target() == SourceKind::Process)
+        return fail(err, "A process address space cannot be saved as a file (it spans " + fmt_size(size()) +
+                             " of mostly unmapped memory); copy or export a selected range instead");
     if (os_stat(target).is_device)
         return fail(err, "Cannot Save As onto a device; open the device and overwrite bytes instead");
 
@@ -904,9 +997,11 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
     for (const Range& r : w) write_bytes += r.len;
     bool trim = need_bytes > kMaxPreserve;
 
-    const std::string real = os_resolve_symlinks(path);
-    FileStat disk = os_stat(path);
-    if (src->stat_at_open().is_device) disk.is_device = true;
+    // Process memory: no file, no backup (need_backup_locked() ignores a non-existing target).
+    const bool proc = src->kind() == SourceKind::Process;
+    const std::string real = proc ? path : os_resolve_symlinks(path);
+    FileStat disk = proc ? FileStat{} : os_stat(path);
+    if (src->stat_at_open().is_device && !proc) disk.is_device = true;
     bool backup;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -925,8 +1020,8 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
     }
 
     std::string e;
-    auto out = OsFile::open(path, OsFile::Mode::ReadWrite, &e);
-    if (!out) return fail(err, "Cannot open " + path + " for writing: " + e);
+    auto out = proc ? src->open_writer(&e) : open_file_backend(path, true, &e);
+    if (!out) return fail(err, proc ? e : "Cannot open " + path + " for writing: " + e);
     if (out->size() != src->size()) return fail(err, "File size changed on disk; save aborted");
 
     bool history_changed = false;
@@ -978,14 +1073,16 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
     commit.begin();
     bool ok = true;
     uint64_t done = progress ? progress->done.load() : 0;
+    uint64_t failed_at = 0;
     for (size_t i = 0; i < snap.pieces.size() && ok; ++i) {
         const Piece& p = snap.pieces[i];
         if (p.src != Piece::Add) continue;
         const uint8_t* data = snap.chunks[p.chunk]->data.get() + p.start;
         for (uint64_t o = 0; o < p.len;) {
             size_t n = size_t(std::min<uint64_t>(kSaveBlock, p.len - o));
-            if (!out->write_at(snap.starts[i] + o, data + o, n)) {
+            if (!out->write(snap.starts[i] + o, data + o, n)) {
                 ok = false;
+                failed_at = snap.starts[i] + o;
                 break;
             }
             o += n;
@@ -996,12 +1093,19 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
     if (ok) ok = out->flush();
     out.reset();
     src->invalidate();
+    if (!ok && proc) {
+        char at[32];
+        std::snprintf(at, sizeof at, "0x%llX", static_cast<unsigned long long>(failed_at));
+        return fail(err, std::string("Cannot write process memory at ") + at +
+                             " (read-only or unmapped page, or the process exited); earlier ranges may already be "
+                             "written. Your edits are still in the document.");
+    }
     if (!ok)
         return fail(err, "Write error while saving " + path +
                              " in place; the file may be partially written. Your edits are still in the "
                              "document - try Save As.");
 
-    FileStat st = os_stat(path);
+    FileStat st = proc ? src->stat_at_open() : os_stat(path);
     {
         std::lock_guard<std::mutex> lk(mu_);
         table_.reset(cur, src->size());
@@ -1204,7 +1308,8 @@ bool Document::reload(std::string* err) {
     apply_pending();
     if (busy_) return fail(err, "A save is in progress");
     if (path_.empty()) return fail(err, "Untitled document has no file to reload");
-    auto src = FileSource::open(path_, err);
+    uint32_t pid = 0;
+    auto src = parse_process_url(path_, &pid) ? FileSource::open_process(pid, err) : FileSource::open(path_, err);
     if (!src) return false;
     sources_.clear();
     sources_.push_back(src);
@@ -1334,10 +1439,29 @@ GrowResult Document::refresh_appended(uint64_t* added, std::string* err) {
 // ---------------------------------------------------------------------------------------------
 // Session support
 // ---------------------------------------------------------------------------------------------
+std::string Document::extra(const std::string& key) const {
+    auto it = extras_.find(key);
+    return it == extras_.end() ? std::string() : it->second;
+}
+
+void Document::set_extra(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = extras_.find(key);
+    if (value.empty()) {
+        if (it == extras_.end()) return;
+        extras_.erase(it);
+    } else {
+        if (it != extras_.end() && it->second == value) return;
+        extras_[key] = value;
+    }
+    persist_gen_++;
+}
+
 PersistedDoc Document::persist() const {
     std::lock_guard<std::mutex> lk(mu_);
     PersistedDoc d;
     d.path = path_;
+    d.extras = extras_;
     d.display_name = name_locked();
     d.file_stat = disk_stat_;
     d.view = view_;
@@ -1443,6 +1567,7 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
     d->read_only_ = st.read_only;
     d->view_ = st.view;
     d->backup_done_ = st.backup_done;
+    d->extras_ = st.extras;
     for (const auto& c : st.add_chunks) d->add_.push_chunk(c.data(), c.size());
 
     bool has_original = false;

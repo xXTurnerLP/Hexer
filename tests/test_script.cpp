@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/os_file.h"
 #include "script/script_engine.h"
 
 using namespace hx;
@@ -461,6 +462,26 @@ TEST_CASE("Doc API: read, numbers, edits, transaction undo, find") {
     d->set_read_only(true);
     fx.eng.exec("doc:write(0, 'x')");
     CHECK(fx.console_has("document is read-only", ConsoleLine::Error));
+}
+
+TEST_CASE("Doc API: target kind and pid") {
+    Fixture fx;
+    fx.load("");
+    fx.host.add("abc");
+    fx.eng.exec("return doc:target(), doc:pid()");
+    CHECK(fx.console_has("\"file\"", ConsoleLine::Result));
+    CHECK(fx.console_has("nil", ConsoleLine::Result));
+    // This test process's own memory.
+    std::string err;
+    std::unique_ptr<Document> p = Document::open_process(uint32_t(os_process_id()), false, &err);
+    REQUIRE_MESSAGE(p, err);
+    fx.host.docs.push_back(std::move(p));
+    fx.host.active = fx.host.docs.back().get();
+    fx.eng.exec("return doc:target()");
+    CHECK(fx.last_result() == "\"process\"");
+    fx.eng.exec("return doc:pid() == " + std::to_string(uint32_t(os_process_id())));
+    CHECK(fx.last_result() == "true");
+    CHECK(fx.errors() == 0);
 }
 
 TEST_CASE("Doc API: closed document raises") {
