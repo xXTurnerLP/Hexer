@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++,     matcher: gcc-matcher.json,  owner: hexer-gcc,  package: true }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++, matcher: gcc-matcher.json,  owner: hexer-gcc,  package: false }
+          - { name: windows-msvc, os: windows-2025, cc: '',    cxx: '',      matcher: msvc-matcher.json, owner: hexer-msvc, package: true }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install meson + ninja
+        run: python -m pip install --upgrade meson ninja
+
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
+            libgl-dev libwayland-dev libxkbcommon-dev wayland-protocols libgtk-3-dev \
+            xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl-mesa0
+
+      - name: Cache subproject downloads
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: wraps-${{ hashFiles('subprojects/*.wrap') }}
+
+      - name: Setup
+        run: |
+          if [ -n "${{ matrix.cc }}" ]; then export CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}; fi
+          args="--buildtype=release -Dwerror=false --force-fallback-for=lua"
+          if [ "$RUNNER_OS" = "Windows" ]; then args="$args --vsenv"; else args="$args --prefix=/usr"; fi
+          set +e
+          meson setup build $args 2>&1 | tee setup.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            bash .github/ci/annotate.sh tail error "meson setup failed" setup.log 40
+            bash .github/ci/annotate.sh tail error "meson-log.txt (tail)" build/meson-logs/meson-log.txt 40
+          fi
+          exit $rc
+
+      - name: Compile
+        run: |
+          echo "::add-matcher::.github/ci/${{ matrix.matcher }}"
+          set +e
+          meson compile -C build 2>&1 | tee compile.log
+          rc=${PIPESTATUS[0]}
+          echo "::remove-matcher owner=${{ matrix.owner }}::"
+          bash .github/ci/annotate.sh warnings compile.log
+          if [ $rc -ne 0 ]; then
+            bash .github/ci/annotate.sh grep error "Compile errors" compile.log \
+              'error:|error [A-Z]+[0-9]+|FAILED:|undefined reference|multiple definition|ld returned|fatal'
+          fi
+          exit $rc
+
+      - name: Test
+        run: |
+          set +e
+          meson test -C build --print-errorlogs 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            bash .github/ci/annotate.sh grep error "Failed tests" test.log \
+              'TEST CASE:|ERROR:|FATAL|values:|logged:|FAIL|TIMEOUT|SIG[A-Z]+|Segmentation'
+            bash .github/ci/annotate.sh tail error "testlog.txt (tail)" build/meson-logs/testlog.txt 40
+          fi
+          exit $rc
+
+      - name: Smoke run (Xvfb + Mesa)
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          mkdir -p smoke
+          xvfb=(xvfb-run -a -s "-screen 0 1600x1000x24")
+          set +e
+          "${xvfb[@]}" build/src/hexer --no-session --config-dir /tmp/hx --frames 10 > smoke/run.log 2>&1
+          rc1=$?
+          "${xvfb[@]}" build/src/hexer --no-session --config-dir /tmp/hx --screenshot smoke/shot.ppm \
+            --frames 30 build/src/hexer > smoke/shot.log 2>&1
+          rc2=$?
+          [ $rc2 -eq 0 ] && python3 tools/ppm2png.py smoke/shot.ppm smoke/shot.png && rm -f smoke/shot.ppm
+          for f in run shot; do
+            if [ -s smoke/$f.log ]; then bash .github/ci/annotate.sh tail notice "smoke $f output" smoke/$f.log 30; fi
+          done
+          echo "frames run exit=$rc1, screenshot run exit=$rc2"
+          if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
+            echo "::error title=Smoke run failed::frames run exit=$rc1, screenshot run exit=$rc2"
+            exit 1
+          fi
+
+      - name: Upload screenshot
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ matrix.name }}
+          path: smoke/
+          if-no-files-found: ignore
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux' && matrix.package
+        run: |
+          meson install -C build --destdir "$PWD/stage"
+          tar -C stage -czf hexer-linux-x86_64.tar.gz .
+          tar -tzf hexer-linux-x86_64.tar.gz
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows' && matrix.package
+        run: |
+          mkdir -p dist/hexer
+          cp build/src/hexer.exe dist/hexer/
+          cp -r scripts dist/hexer/
+          cp README.md dist/hexer/
+          cd dist && 7z a ../hexer-windows-x64.zip hexer
+
+      - name: Upload package
+        if: matrix.package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hexer-${{ matrix.name }}
+          path: hexer-*.*
+          if-no-files-found: error
