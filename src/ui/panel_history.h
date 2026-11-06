@@ -113,7 +113,7 @@ inline std::string history_time_text(int64_t ms, int64_t now_ms) {
     a.tm_isdst = b.tm_isdst = -1;
     const double days = std::difftime(std::mktime(&b), std::mktime(&a)) / 86400.0;
     const int day = int(days + (days < 0 ? -0.5 : 0.5));
-    char hm[16];
+    char hm[32];
     std::snprintf(hm, sizeof hm, "%02d:%02d", t.tm_hour, t.tm_min);
     if (day == 0) return std::string("today ") + hm;
     if (day == 1) return std::string("yesterday ") + hm;
@@ -121,7 +121,7 @@ inline std::string history_time_text(int64_t ms, int64_t now_ms) {
         static const char* kDays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
         return std::string(kDays[t.tm_wday % 7]) + " " + hm;
     }
-    char buf[32];
+    char buf[96];  // roomy: GCC -Wformat-truncation cannot bound the int fields
     std::snprintf(buf, sizeof buf, "%04d-%02d-%02d %s", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, hm);
     return buf;
 }
@@ -130,7 +130,7 @@ inline std::string history_time_text(int64_t ms, int64_t now_ms) {
 inline std::string history_time_full(int64_t ms) {
     std::tm t{};
     if (ms <= 0 || !history_local_time(ms, t)) return {};
-    char buf[40];
+    char buf[96];
     std::snprintf(buf, sizeof buf, "%04d-%02d-%02d %02d:%02d:%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
     return buf;

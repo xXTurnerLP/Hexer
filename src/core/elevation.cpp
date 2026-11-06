@@ -134,7 +134,8 @@ std::string win_command_line(const std::vector<std::string>& args) {
 
 std::vector<std::string> restart_args(const std::string& config_dir, uint64_t wait_pid,
                                       const std::vector<std::string>& targets, bool no_session) {
-    std::vector<std::string> a = {"--new-instance"};
+    std::vector<std::string> a;  // push_back, not an init list: GCC 13 -Warray-bounds false positive
+    a.push_back("--new-instance");
     if (no_session) a.push_back("--no-session");
     a.push_back("--wait-pid");
     a.push_back(std::to_string(wait_pid));
