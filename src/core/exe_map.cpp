@@ -8,6 +8,7 @@
 
 #include "core/devices.h"
 #include "core/document.h"
+#include "core/procmem.h"
 #include "core/util.h"
 
 namespace hx {
@@ -100,6 +101,23 @@ AddressMap process_map(const Document& doc) {
         r.file_size = r.mem_size = mod.size;
         r.name = mod.name;
         m.names.push_back(std::move(r));
+    }
+    // Entry point: the main module's AddressOfEntryPoint, read from its PE headers in memory.
+    const uint64_t main_base = process_start_address(pid);
+    for (const MappedRegion& r : m.names) {
+        if (r.address != main_base) continue;
+        uint8_t dos[64], oh[24 + 20];
+        if (!read_exact(doc, main_base, dos, sizeof dos) || dos[0] != 'M' || dos[1] != 'Z') break;
+        const uint64_t pe = get_le(dos + 0x3C, 4);
+        if (pe < 4 || pe + sizeof oh > r.mem_size || !read_exact(doc, main_base + pe, oh, sizeof oh) ||
+            std::memcmp(oh, "PE\0\0", 4) != 0)
+            break;
+        const uint64_t rva = get_le(oh + 24 + 16, 4);
+        if (rva && rva < r.mem_size) {
+            m.has_entry = true;
+            m.entry = main_base + rva;
+        }
+        break;
     }
     if (m.bits) m.format += ", " + std::to_string(m.bits) + "-bit";
     m.format += ", " + std::to_string(m.names.size()) + " modules";

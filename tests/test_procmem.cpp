@@ -659,6 +659,18 @@ TEST_CASE("procmem: a process document's address map names its modules and its p
     uint64_t va = 0;
     CHECK(map.offset_to_va(code, va));  // still the identity
     CHECK(va == code);
+#ifdef _WIN32
+    // Go to Entry Point: the main module's (this test exe's) entry point, from its in-memory headers.
+    REQUIRE(map.has_entry);
+    CHECK(map.entry > exe->base);
+    CHECK(map.entry < exe->base + exe->size);
+    AddressMap img;
+    REQUIRE(detect_pe_image(*doc->snapshot(), exe->base, img, &err));
+    CHECK(map.entry == img.entry);
+    uint64_t off = 0;
+    CHECK(map.entry_offset(off));
+    CHECK(off == map.entry);
+#endif
 }
 
 TEST_CASE("procmem: detect_pe_image maps a loaded image by RVA and ignores the raw pointers") {

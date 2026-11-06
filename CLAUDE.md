@@ -93,6 +93,10 @@ tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              Packets panel / Follow TCP Stream)
 assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file,
              linux/*.metainfo.xml (AppStream; meson installs it to share/metainfo)
+docs/        scripting.md (Lua guide + API), features.md (the full feature reference, hot exit,
+             every shortcut, command line: README.md stays a short overview - put details here),
+             screenshots/ (the README's 3 shots, 1600x1000 via --screenshot with the mouse cursor
+             moved off the window; keep them dense, regenerate when the UI changes visibly)
 .github/     CI (workflows/ci.yml): release builds + tests on GCC / Clang / MSVC; packages
              (Windows zip, Linux AppImage + tar.gz on ubuntu-22.04, x86_64 + an experimental
              aarch64 leg; metainfo checked by appstreamcli, warnings only) as 7-day artifacts, smoke-tested
