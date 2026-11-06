@@ -64,7 +64,7 @@ src/ui/      theme (dark theme, fonts + live reload_fonts, palette), hex_view (t
              extras, ScriptHost impl); self-contained feature UIs without App dependency:
              panel_strings, panel_hash, dialog_cstruct, panel_bitmap, panel_packets, panel_history,
              panel_xor, dialog_targets (Open Process / Open Disk + RegionsPanel) (App owns one of
-             each), minimap (one per tab, in hexer_ui_view), input (shortcut routing policy,
+             each), window_frame (dark Windows title bar in the theme's kThemePanel / kThemeText), minimap (one per tab, in hexer_ui_view), input (shortcut routing policy,
              InlineEdit row editor, Ctrl+wheel steps; in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
              panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly);
              panel_bitmap / panel_packets / view_diff / panel_strings / panel_xor are in

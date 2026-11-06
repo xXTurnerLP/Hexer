@@ -218,12 +218,12 @@ void apply_dark_theme(float ui_scale) {
     s.ScaleAllSizes(ui_scale);
 
     const uint32_t bg = rgba(0x1e, 0x1f, 0x22);        // editor background
-    const uint32_t panel = rgba(0x2b, 0x2d, 0x30);     // tool windows / menus
+    const uint32_t panel = kThemePanel;                // tool windows / menus
     const uint32_t raised = rgba(0x39, 0x3b, 0x40);    // buttons, hovered tabs
     const uint32_t raised_hi = rgba(0x43, 0x45, 0x4a);
     const uint32_t raised_hi2 = rgba(0x4e, 0x51, 0x57);
     const uint32_t border = rgba(0x39, 0x3b, 0x40);
-    const uint32_t text = rgba(0xdf, 0xe1, 0xe5);
+    const uint32_t text = kThemeText;
     const uint32_t text_dim = rgba(0x8c, 0x8f, 0x94);
     const uint32_t accent = rgba(0x35, 0x74, 0xf0);
     const uint32_t accent_hi = rgba(0x4a, 0x85, 0xf5);

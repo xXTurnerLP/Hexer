@@ -86,6 +86,7 @@ ui_lib = static_library('hexer_ui',
   'ui/dialog_cstruct.cpp',
   'ui/dialog_targets.cpp',
   'ui/panel_history.cpp',
+  'ui/window_frame.cpp',     # dark OS title bar (Windows DWM)
   include_directories : inc,
   cpp_args : conf_args,
   link_with : ui_view_lib,

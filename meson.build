@@ -1,5 +1,5 @@
 project('hexer', ['c', 'cpp'],
-  version : '1.0.0',
+  version : '1.1.0',
   meson_version : '>=1.3.0',
   default_options : [
     'cpp_std=c++20',
@@ -74,7 +74,7 @@ doctest_dep = dependency('doctest', required : get_option('tests'))
 
 sys_deps = []
 if host_machine.system() == 'windows'
-  foreach l : ['shell32', 'ole32', 'uuid', 'user32', 'comdlg32']
+  foreach l : ['shell32', 'ole32', 'uuid', 'user32', 'comdlg32', 'dwmapi']
     sys_deps += cpp.find_library(l)
   endforeach
 endif

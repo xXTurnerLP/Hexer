@@ -36,6 +36,7 @@
 #include "core/util.h"
 #include "ui/app_internal.h"
 #include "ui/panels.h"
+#include "ui/window_frame.h"
 #ifndef _WIN32
 #include "ui/icon_data.h"
 #endif
@@ -4941,6 +4942,7 @@ int run_app(const AppOptions& opts) {
         return 1;
     }
     set_window_icon(app.window);
+    apply_window_frame_colors(app.window, kThemePanel, kThemeText);  // before it is shown
     place_window(app.window, app.settings);
     glfwMakeContextCurrent(app.window);
     glfwSwapInterval(1);

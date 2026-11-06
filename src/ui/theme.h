@@ -3,7 +3,8 @@
 #include <cstdint>
 #include <string>
 
-#include "core/entropy.h"  // ByteClass
+#include "core/entropy.h"    // ByteClass
+#include "core/highlight.h"  // rgba
 
 struct ImFont;
 
@@ -37,6 +38,10 @@ Fonts reload_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt)
 inline bool same_font_options(const FontOptions& a, const FontOptions& b) {
     return a.ui_path == b.ui_path && a.mono_path == b.mono_path && a.hinting == b.hinting;
 }
+// The dark theme's tool window / menu bar background and its text color (apply_dark_theme uses
+// them; so does the OS title bar, ui/window_frame.h).
+inline constexpr uint32_t kThemePanel = rgba(0x2b, 0x2d, 0x30);
+inline constexpr uint32_t kThemeText = rgba(0xdf, 0xe1, 0xe5);
 void apply_dark_theme(float ui_scale);
 
 // Colors used by the hex view (packed IM_COL32 / core rgba()).
