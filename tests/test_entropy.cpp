@@ -339,7 +339,8 @@ TEST_CASE("entropy: >4 GiB sparse file is sampled quickly") {
     CHECK(r->done == 256);
     CHECK(secs < 20.0);
     uint64_t db = 0, de = 0;
-    const auto& src = doc->snapshot()->sources.at(0);
+    const auto snap = doc->snapshot();  // keep it alive: snapshot() builds a new one per call
+    const auto& src = snap->sources.at(0);
     if (src->data_range(0, db, de) && db == size) {  // the OS reports the holes: nothing is read
         CHECK(r->bytes_read == sizeof(tag));
         CHECK_FALSE(r->buckets[0].sampled);
