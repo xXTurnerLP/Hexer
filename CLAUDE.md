@@ -90,7 +90,11 @@ tests/       doctest; one exe per module: test_core, test_util, test_script, tes
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
              make_pcap.py (demo pcapng with HXP packets + an HTTP-over-TCP connection for the
-             Packets panel / Follow TCP Stream)
+             Packets panel / Follow TCP Stream), make_notices.py (regenerates
+             THIRD_PARTY_NOTICES.md from the wraps' license files: rerun after bumping a wrap or
+             adding a shipped dependency)
+LICENSE      MIT; LICENSE + THIRD_PARTY_NOTICES.md ship in every package (zip, tar.gz,
+             share/doc/hexer via meson install)
 assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file,
              linux/*.metainfo.xml (AppStream; meson installs it to share/metainfo)
 docs/        scripting.md (Lua guide + API), features.md (the full feature reference, hot exit,
@@ -276,6 +280,12 @@ extra ranges beside that primary selection, which keeps every rule above. Operat
 tools that need one contiguous range keep using the primary selection. Hex view: Alt+click /
 Alt+drag adds, Alt+click on a selected byte removes, a plain click / Esc clears (Esc is claimed
 with a focused `ImGui::Shortcut` only while extras exist, so the app's global Esc keeps working).
+
+## Releasing
+Bump `version` in meson.build (HEXER_VERSION / `hx.version` / the About box come from it; keep the
+fallback in lua_api.cpp, the script_engine.h comment and docs/scripting.md in step), add a
+`<release>` entry to assets/linux/*.metainfo.xml (newest first), commit, wait for a green CI on
+main, then push a `vX.Y.Z` tag: the `release` job publishes the packages as a GitHub Release.
 
 ## Conventions
 - namespace `hx`; 4-space indent; `snake_case` functions/vars, `PascalCase` types, `trailing_` members.

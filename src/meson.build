@@ -120,6 +120,7 @@ hexer_exe = executable('hexer',
 )
 
 install_subdir(meson.project_source_root() / 'scripts', install_dir : get_option('bindir'))
+install_data('../LICENSE', '../THIRD_PARTY_NOTICES.md', install_dir : get_option('datadir') / 'doc' / 'hexer')
 
 # Linux desktop integration: launcher entry + hicolor theme icons.
 if host_machine.system() == 'linux'

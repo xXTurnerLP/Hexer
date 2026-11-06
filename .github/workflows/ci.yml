@@ -116,14 +116,15 @@ jobs:
           fi
 
       # Windows portable zip from this build (release, static CRT via the project default
-      # b_vscrt=static_from_buildtype): hexer/{hexer.exe, scripts/, README.md}. The app finds its
+      # b_vscrt=static_from_buildtype): hexer/{hexer.exe, scripts/, README.md, LICENSE,
+      # THIRD_PARTY_NOTICES.md}. The app finds its
       # bundled scripts in <exe dir>/scripts.
       - name: Package (Windows)
         id: package
         if: runner.os == 'Windows' && steps.compile.outcome == 'success'
         run: |
           rm -rf dist && mkdir -p dist/hexer
-          cp build/src/hexer.exe README.md dist/hexer/
+          cp build/src/hexer.exe README.md LICENSE THIRD_PARTY_NOTICES.md dist/hexer/
           cp -r scripts dist/hexer/
           (cd dist && 7z a -bso0 ../hexer-windows-x64.zip hexer)
           7z l hexer-windows-x64.zip
@@ -254,9 +255,10 @@ jobs:
           fi
           exit $rc
 
-      # tar.gz: hexer-linux-ARCH/{hexer, scripts/, README.md, hexer.desktop, hexer.png}.
+      # tar.gz: hexer-linux-ARCH/{hexer, scripts/, README.md, LICENSE, THIRD_PARTY_NOTICES.md,
+      # hexer.desktop, hexer.png}.
       # AppImage: the meson install tree (usr/bin/hexer + usr/bin/scripts, desktop file, icons,
-      # AppStream metainfo in usr/share/metainfo). Both find their bundled scripts next to the
+      # AppStream metainfo in usr/share/metainfo, LICENSE + notices in usr/share/doc/hexer). Both find their bundled scripts next to the
       # binary (/proc/self/exe). The metainfo check only warns (also without appstreamcli).
       - name: Package
         env:
@@ -272,7 +274,7 @@ jobs:
           done
           d=dist/hexer-linux-$ARCH
           rm -rf dist && mkdir -p $d
-          cp AppDir/usr/bin/hexer README.md assets/hexer.desktop $d/
+          cp AppDir/usr/bin/hexer README.md LICENSE THIRD_PARTY_NOTICES.md assets/hexer.desktop $d/
           cp -r AppDir/usr/bin/scripts $d/
           cp assets/icon/hexer-256.png $d/hexer.png
           tar -C dist -czf hexer-linux-$ARCH.tar.gz hexer-linux-$ARCH

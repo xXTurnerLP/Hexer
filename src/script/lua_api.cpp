@@ -31,7 +31,7 @@
 #include "script/cexport.h"
 
 #ifndef HEXER_VERSION
-#define HEXER_VERSION "0.1.0"
+#define HEXER_VERSION "1.0.0"
 #endif
 
 namespace hx {

@@ -5,6 +5,7 @@
 <component type="desktop-application">
   <id>io.github.xXTurnerLP.Hexer</id>
   <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
   <name>Hexer</name>
   <summary>Hex editor for huge files, process memory and disks</summary>
   <description>
@@ -29,6 +30,6 @@
   <url type="bugtracker">https://github.com/xXTurnerLP/Hexer/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.1.0" date="2026-11-06"/>
+    <release version="1.0.0" date="2026-11-06"/>
   </releases>
 </component>

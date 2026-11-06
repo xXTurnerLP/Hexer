@@ -19,7 +19,9 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/xXTurnerLP/Hexer/releases/latest"><img src="https://img.shields.io/github/v/release/xXTurnerLP/Hexer" alt="Latest release"></a>
   <a href="https://github.com/xXTurnerLP/Hexer/actions/workflows/ci.yml"><img src="https://github.com/xXTurnerLP/Hexer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
 ![Hexer with a PNG file parsed by its bundled Lua parser: the structure tree, colored field highlights in the hex view, the data inspector, the Lua console and the entropy minimap](docs/screenshots/structure.png)
@@ -57,6 +59,7 @@ Nothing to install:
 | Windows 10 / 11 (x64) | `hexer-windows-x64.zip` | Unzip anywhere, run `hexer\hexer.exe` (keep the `scripts` folder next to it) |
 | Linux (x86_64) | `hexer-x86_64.AppImage` | `chmod +x hexer-x86_64.AppImage`, then run it |
 | Linux (x86_64) | `hexer-linux-x86_64.tar.gz` | Unpack, run `hexer-linux-x86_64/hexer` |
+| Linux (ARM64, experimental) | `hexer-aarch64.AppImage`, `hexer-linux-aarch64.tar.gz` | Same as x86_64 |
 
 The Linux builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later); file
 dialogs use xdg-desktop-portal, which GNOME, KDE and most desktops have. Every CI run also keeps
@@ -243,3 +246,9 @@ analysis engines (no UI, no Lua); `src/script` is the Lua engine; `src/ui` is th
 Tests live in `tests/`, one executable per module, including headless UI tests that drive the
 hex view with a simulated mouse and keyboard. [`CLAUDE.md`](CLAUDE.md) has the contributor notes
 and conventions, [`TODO.md`](TODO.md) the roadmap.
+
+## License
+
+Hexer is released under the [MIT License](LICENSE). It is built on Dear ImGui, GLFW, Lua,
+FreeType, Native File Dialog Extended and Zydis; their licenses are collected in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), which ships with every download.

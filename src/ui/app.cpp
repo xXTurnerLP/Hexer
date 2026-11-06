@@ -3577,6 +3577,7 @@ void draw_about(App& app) {
     ImGui::Text("Config: %s", paths::config_dir().c_str());
     ImGui::Text("Scripts: %s", paths::user_scripts_dir().c_str());
     ImGui::Text("Dear ImGui %s", ImGui::GetVersion());
+    ImGui::TextDisabled("MIT License. Third-party licenses: THIRD_PARTY_NOTICES.md");
     ImGui::Spacing();
     ImGui::TextDisabled("Ctrl+Shift+P opens the command palette with every action.");
     if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
