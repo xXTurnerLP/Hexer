@@ -16,7 +16,9 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "core/devices.h"
 #include "core/file_source.h"
 
 namespace hx {
@@ -29,5 +31,17 @@ std::unique_ptr<ByteBackend> open_process_backend(uint32_t pid, bool write, std:
 // holds for a process document (and what Document::open_file accepts).
 bool parse_process_url(const std::string& path, uint32_t* pid);
 std::string process_url(uint32_t pid);
+
+// Where a new process document starts (its caret): the base of the process's main module (the
+// executable, matched by name), else the first readable region below process_address_limit(pid),
+// else 0. Address 0 itself is never mapped, so starting there shows only unreadable "??" rows.
+uint64_t process_start_address(uint32_t pid);
+
+// "Next / Previous Readable Region": `regs` (process_regions order) merged into readable runs
+// (adjacent readable regions joined; regions at or above `limit` ignored). Forward: the first run
+// that starts after `from`; backward: the last run that ends at or before `from` (from inside a
+// run: the run before it). False when there is none; else *base / *size = that run.
+bool readable_run_step(const std::vector<MemRegion>& regs, uint64_t limit, uint64_t from, bool forward,
+                       uint64_t* base, uint64_t* size);
 
 }  // namespace hx

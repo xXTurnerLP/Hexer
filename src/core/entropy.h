@@ -44,7 +44,11 @@ uint32_t entropy_color(float bits);
 struct EntropyOptions {
     uint32_t buckets = 1024;                   // at most this many (fewer for files smaller than this)
     uint64_t sample_per_bucket = 256 << 10;    // bigger buckets are sampled: this many bytes at most,
-                                               // read as evenly spaced 4 KiB chunks (0 = read all)
+                                               // read as evenly spaced 4 KiB chunks (0 = read all).
+                                               // Holes of a sparse file are known zeros, never read:
+                                               // the chunks go to the bucket's data ranges only
+                                               // (snapshot_data_ranges), each range gets at least one,
+                                               // and data that fits the budget is read in full
     int publish_ms = 30;                       // publish partial results at most this often (0 = per bucket)
 };
 
@@ -52,7 +56,13 @@ struct EntropyBucket {
     uint64_t offset = 0, length = 0;           // the bytes this bucket stands for
     float entropy = 0.0f;                      // bits/byte (0..8) of the bytes read
     float class_frac[kByteClassCount] = {};    // fraction of the bytes read in each ByteClass (sum 1)
-    uint64_t bytes_read = 0;                   // < length when sampled or unreadable
+    uint64_t bytes_read = 0;                   // bytes read: < length when sampled, unreadable
+                                               // or with holes
+    uint64_t hole_bytes = 0;                   // holes of a sparse file in this bucket: zeros known
+                                               // without reading, part of entropy / class_frac
+    float peak = 0.0f;                         // highest entropy of one 4 KiB chunk read (bits/byte):
+                                               // a small dense region among zeros shows here
+    bool nonzero = false;                      // some byte read is not 0x00
     bool done = false;                         // computed (false = pending: draw neutral)
     bool sampled = false;                      // only part of the bucket was read
     bool unreadable = false;                   // an I/O error stopped reading this bucket, or it
@@ -86,8 +96,21 @@ EntropyResult entropy_layout(uint64_t size, uint32_t buckets);
 
 // Combines the computed buckets overlapping [begin, end) into one (weighted by length; an empty
 // range uses the bucket holding `begin`). Pending buckets are ignored; done == false if none of
-// them is computed yet. sampled / unreadable are or-ed. offset/length span the buckets used.
+// them is computed yet. sampled / unreadable / nonzero are or-ed, peak is the maximum, bytes_read /
+// hole_bytes are summed. offset/length span the buckets used.
 EntropyBucket entropy_aggregate(const EntropyResult& r, uint64_t begin, uint64_t end);
+
+// A small region stands out of the bucket's average, which the minimap marks separately: some
+// 4 KiB chunk is >= kEntropySpotBits above the average entropy, or the bucket is all but zero
+// (>= 99.9% 0x00) and still has a non-zero byte (a few bytes in a huge empty / sparse area).
+constexpr float kEntropySpotBits = 1.5f;
+bool entropy_spot(const EntropyBucket& b);
+
+// The parts of [lo, hi) of `snap` that may hold non-zero bytes: everything but the holes of sparse
+// files (FileSource::data_range; other sources and edited bytes always count as data), ascending,
+// disjoint, merged. At most `max_ranges`: the last one then extends to hi (a superset is safe). O(pieces + holes) OS queries, never reads bytes.
+std::vector<std::pair<uint64_t, uint64_t>> snapshot_data_ranges(const Snapshot& snap, uint64_t lo, uint64_t hi,
+                                                                size_t max_ranges = 256);
 
 // The byte ranges [first, second) of `after` that may differ from `before` (ascending, disjoint,
 // merged). A byte is unchanged when both snapshots reference the same stored byte at the same

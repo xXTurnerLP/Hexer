@@ -1093,6 +1093,53 @@ TEST_CASE("document: changed on disk and reload") {
     CHECK(!d->changed_on_disk());
 }
 
+// The external-change banner's Reload: the file on disk is the new original. History from before
+// would undo onto bytes that are gone, so it is dropped (undo and redo); bookmarks and the caret
+// are view state and stay (the caret clamped); edits after the reload undo back to the new file.
+TEST_CASE("document: reload makes the file on disk the new original with a fresh history") {
+    TempDir t;
+    std::string p = t.file("r2.bin");
+    write_file(p, str_bytes("0123456789"));
+    auto d = Document::open_file(p);
+    Bookmark b;
+    b.offset = 2;
+    b.length = 3;
+    b.name = "kept";
+    REQUIRE(d->add_bookmark(b));
+    const uint8_t v = 'X';
+    REQUIRE(d->overwrite(1, &v, 1));
+    REQUIRE(d->overwrite(9, &v, 1));
+    REQUIRE(d->undo());  // something to redo as well
+    CHECK(d->can_redo());
+    d->view().cursor = d->view().anchor = 9;
+    const uint64_t gen = d->generation(), pgen = d->persist_generation();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    write_file(p, str_bytes("abcdef"));  // shorter
+    REQUIRE(d->changed_on_disk());
+    std::string err;
+    REQUIRE(d->reload(&err));
+    CHECK(doc_bytes(*d) == str_bytes("abcdef"));
+    CHECK(!d->can_undo());
+    CHECK(!d->can_redo());
+    CHECK(!d->dirty());
+    CHECK(d->generation() != gen);
+    CHECK(d->persist_generation() != pgen);  // the session rewrites it (no stale history)
+    CHECK(d->persist().undo.empty());
+    CHECK(d->persist().redo.empty());
+    REQUIRE(d->view().bookmarks.size() == 1);
+    CHECK(d->view().bookmarks[0].name == "kept");
+    CHECK(d->view().cursor <= d->size());
+    // A new edit is undoable back to the reloaded content, and redoable.
+    REQUIRE(d->overwrite(0, &v, 1));
+    CHECK(d->dirty());
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == str_bytes("abcdef"));
+    CHECK(!d->dirty());
+    CHECK(!d->can_undo());
+    REQUIRE(d->redo());
+    CHECK(doc_bytes(*d) == str_bytes("Xbcdef"));
+}
+
 TEST_CASE("document: >4 GiB sparse file") {
     TempDir t;
     std::string p = t.file("huge.bin");
@@ -2292,8 +2339,10 @@ TEST_CASE("session: single-instance inbox (post, take, withdraw, leftovers)") {
 TEST_CASE("session: version 1 files (bookmarks without notes) still load") {
     TempDir t;
     std::string sdir = t.file("session");
-    // Without bookmarks a version 1 file differs from a version 2 one only in the version field
-    // and the tail (v2: edits_dropped u8 + backed-up target count u32; v1: nothing when false).
+    // Without bookmarks and history a version 1 file differs from the current (v4) one only in
+    // the version field, the Parse at range after the parser (v4: 2 x u64) and the tail (v4:
+    // edits_dropped u8, backed-up target count u32, ref file count u32, extension block u32 len +
+    // u32 count; v1: nothing when false).
     auto a = Document::create_from_bytes("Old", reinterpret_cast<const uint8_t*>("old!"), 4);
     std::string err;
     {
@@ -2304,9 +2353,10 @@ TEST_CASE("session: version 1 files (bookmarks without notes) still load") {
     REQUIRE(files.size() == 1);
     Bytes f = read_file(files[0]);
     REQUIRE(f.size() > 12);
-    CHECK(f[4] == 2);  // current version
+    CHECK(f[4] == 4);  // current version
     f[4] = 1;
-    f.erase(f.end() - 4 - 5, f.end() - 4);
+    f.erase(f.end() - 4 - 17, f.end() - 4);
+    f.erase(f.end() - 4 - 6 - 16, f.end() - 4 - 6);  // before bookmarks u32, dirty u8, read-only u8
     const uint32_t crc = test_crc32(f.data(), f.size() - 4);
     for (int i = 0; i < 4; ++i) f[f.size() - 4 + size_t(i)] = uint8_t(crc >> (8 * i));
     write_file(files[0], f);

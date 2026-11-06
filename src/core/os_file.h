@@ -29,6 +29,12 @@ public:
     bool write_at(uint64_t offset, const void* src, size_t len);    // writes all bytes or returns false
     bool truncate(uint64_t new_size);
     bool flush();                                                   // fsync / FlushFileBuffers
+    // Sparse files: the first data (allocated) range at or after `off`, [begin, end) with
+    // off <= begin < end <= size(); [off, begin) is a hole (reads as zeros). begin == end ==
+    // size() when only a hole follows. False when the OS / filesystem cannot tell (devices, no
+    // support): treat everything as data. Windows FSCTL_QUERY_ALLOCATED_RANGES, POSIX SEEK_DATA /
+    // SEEK_HOLE (the file position is not used by read_at, so moving it is harmless).
+    bool data_range(uint64_t off, uint64_t& begin, uint64_t& end) const;
 
 private:
     OsFile() = default;

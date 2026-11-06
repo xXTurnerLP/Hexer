@@ -27,6 +27,16 @@ struct FontOptions {
 // Linux), then to ImGui's built-in font. The mono font's advances are snapped to whole pixels so
 // cell-based layouts (hex view) land every glyph on the pixel grid.
 Fonts load_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt = {});
+// Live font change (Settings window: font files, hinting): drops every font of the atlas and
+// loads them again with `opt`. Between frames only (after Render, before NewFrame); every ImFont*
+// of the previous Fonts is invalid afterwards. ImGui 1.92 bakes glyphs on demand, so the next
+// frame simply rasterises what it draws (the renderer backend replaces the texture).
+Fonts reload_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt);
+// What the fonts were loaded from / with: a change of any of these needs reload_fonts() (sizes do
+// not: fonts are rasterised at any size).
+inline bool same_font_options(const FontOptions& a, const FontOptions& b) {
+    return a.ui_path == b.ui_path && a.mono_path == b.mono_path && a.hinting == b.hinting;
+}
 void apply_dark_theme(float ui_scale);
 
 // Colors used by the hex view (packed IM_COL32 / core rgba()).

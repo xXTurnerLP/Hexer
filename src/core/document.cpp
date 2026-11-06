@@ -21,11 +21,13 @@ std::atomic<uint64_t> g_merge_max_bytes{32};
 std::atomic<bool> g_backup_enabled{true};
 std::atomic<uint64_t> g_backup_max_bytes{4ull << 30};
 
-int64_t steady_ms() {
+// Wall clock: undo steps show when they happened (History panel); the typing-run pause check only
+// compares two readings a moment apart, so a clock adjustment at worst splits / merges one run.
+int64_t wall_ms() {
     using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
-std::atomic<int64_t (*)()> g_clock{&steady_ms};
+std::atomic<int64_t (*)()> g_clock{&wall_ms};
 
 constexpr size_t kSaveBlock = 4u << 20;              // streaming block for rewrite saves
 constexpr size_t kPreserveBlock = 1u << 20;          // in-place save: copy old bytes in 1 MiB pieces
@@ -132,6 +134,31 @@ bool references_ranges(const std::vector<Piece>& ps, uint32_t cur, const std::ve
         if (!tmp.empty()) return true;
     }
     return false;
+}
+
+// Removes the entries of a history stack (oldest first, top = back) that `bad` rejects, plus every
+// view-only entry whose bytes are those of a removed state (UndoEntry: the next state toward the
+// current one, i.e. stack[i + 1], or the current state for the top; `top_ok` = it is kept). `bad`
+// is never asked about view-only entries and may rewrite the entries it keeps.
+template <class Bad>
+bool drop_entries(std::vector<UndoEntry>& stack, bool top_ok, Bad bad) {
+    bool ok = top_ok;
+    size_t w = stack.size();
+    std::vector<uint8_t> keep(stack.size(), 0);
+    for (size_t i = stack.size(); i-- > 0;) {
+        if (!stack[i].view_only) ok = !bad(stack[i]);
+        keep[i] = ok;
+        if (!ok) --w;
+    }
+    if (w == stack.size()) return false;
+    size_t o = 0;
+    for (size_t i = 0; i < stack.size(); ++i)
+        if (keep[i]) {
+            if (o != i) stack[o] = std::move(stack[i]);
+            ++o;
+        }
+    stack.resize(o);
+    return true;
 }
 
 // Core read loop shared by Document and Snapshot. Starts at piece `i`, `off` bytes into it; the
@@ -381,6 +408,7 @@ std::unique_ptr<Document> Document::open_process(uint32_t pid, bool writable, st
     d->table_.reset(0, src->size());
     d->disk_stat_ = src->stat_at_open();
     d->read_only_ = !writable;
+    d->view_.cursor = d->view_.anchor = std::min(process_start_address(pid), src->size());
     d->state_id_ = d->saved_state_id_ = d->next_state_id_++;
     return d;
 }
@@ -440,6 +468,11 @@ void Document::refresh_target() {
 bool Document::target_alive() const {
     std::lock_guard<std::mutex> lk(mu_);
     return !sources_.back() || sources_.back()->alive();
+}
+
+bool Document::target_read_denied() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return sources_.back() && sources_.back()->read_denied();
 }
 
 std::string Document::display_name() const {
@@ -545,7 +578,9 @@ void Document::set_undo_merge(int ms, uint64_t max_bytes) {
     g_merge_max_bytes = max_bytes;
 }
 
-void Document::set_clock_for_tests(int64_t (*now_ms)()) { g_clock = now_ms ? now_ms : &steady_ms; }
+int64_t Document::now_ms() { return g_clock.load()(); }
+
+void Document::set_clock_for_tests(int64_t (*now_ms)()) { g_clock = now_ms ? now_ms : &wall_ms; }
 
 void Document::set_backup_policy(bool enabled, uint64_t max_bytes) {
     g_backup_enabled = enabled;
@@ -562,6 +597,37 @@ UndoEntry Document::capture() const {
     return e;
 }
 
+ViewOptions Document::view_options_locked() const {
+    ViewOptions o;
+    o.read_only = read_only_;
+    o.parser = view_.parser;
+    o.parse_base = view_.parse_base;
+    o.parse_length = view_.parse_length;
+    return o;
+}
+
+ViewOptions Document::view_options() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return view_options_locked();
+}
+
+UndoEntry Document::capture_view() const {
+    UndoEntry e;
+    e.view_only = e.has_view = true;
+    e.view = view_options_locked();
+    e.cursor = view_.cursor;  // not restored; keeps the entry readable for a History panel
+    e.anchor = view_.anchor;
+    e.state_id = state_id_;   // same bytes as the neighbouring state
+    return e;
+}
+
+bool Document::is_ref_file(const std::shared_ptr<FileSource>& s) const {
+    if (!s) return false;
+    for (const auto& w : ref_files_)
+        if (!w.owner_before(s) && !s.owner_before(w)) return true;
+    return false;
+}
+
 void Document::push_entry(std::vector<UndoEntry>& stack, UndoEntry&& e) {
     stack.push_back(std::move(e));
     if (stack.size() > kMaxUndo) {
@@ -574,7 +640,8 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_end) {
     push_undo(label, coalesce, edit_end, edit_end);
 }
 
-void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, uint64_t edit_end) {
+void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, uint64_t edit_end,
+                         bool view_step) {
     persist_gen_++;
     bool dropped_redo = !redo_.empty();
     if (dropped_redo && group_depth_ > 0 && !group_pushed_) {
@@ -589,16 +656,23 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, 
     // Same for add-buffer chunks (undone pastes/fills, history trimmed by kMaxUndo). Here the
     // current state is still in table_ and every other state on a stack, so nothing live is freed.
     if (dropped_redo || trims_since_reclaim_ >= 1000) reclaim_add();
+    const int64_t now = g_clock.load()();
     if (group_depth_ > 0) {
         coalesce_open_ = false;
-        if (group_pushed_) return;
-        UndoEntry e = capture();
-        e.label = group_label_.empty() ? std::string(label) : group_label_;
-        push_entry(undo_, std::move(e));
-        group_pushed_ = true;
+        if (!group_pushed_) {
+            UndoEntry e = capture();
+            e.label = group_label_.empty() ? std::string(label) : group_label_;
+            push_entry(undo_, std::move(e));
+            group_pushed_ = true;
+        }
+        UndoEntry& top = undo_.back();
+        top.time_ms = now;  // the group's latest action
+        if (view_step && !top.has_view) {  // the group's step also restores the view options
+            top.has_view = true;
+            top.view = view_options_locked();
+        }
         return;
     }
-    const int64_t now = coalesce ? g_clock.load()() : 0;
     if (coalesce && coalesce_open_ && !undo_.empty()) {
         UndoEntry& top = undo_.back();
         const int ms = g_merge_ms.load();
@@ -609,12 +683,14 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, 
         const bool full = cap && edit_end > top.coalesce_end && top.coalesce_end - top.coalesce_begin >= cap;
         if (continues && recent && !full) {
             top.coalesce_end = std::max(top.coalesce_end, edit_end);
+            top.time_ms = now;  // a typing run shows the time of its last edit
             coalesce_last_ms_ = now;
             return;
         }
     }
-    UndoEntry e = capture();
+    UndoEntry e = view_step ? capture_view() : capture();
     e.label = label;
+    e.time_ms = now;
     if (coalesce) {
         e.coalesce_begin = edit_begin;
         e.coalesce_end = edit_end;
@@ -638,12 +714,20 @@ void Document::after_change() {
 }
 
 void Document::apply_entry(const UndoEntry& e) {
-    table_.assign(e.pieces);
-    view_.cursor = e.cursor;
-    view_.anchor = e.anchor;
-    view_.bookmarks = e.bookmarks;
-    state_id_ = e.state_id;
-    generation_++;
+    if (!e.view_only) {  // a view step leaves bytes, caret and bookmarks as they are
+        table_.assign(e.pieces);
+        view_.cursor = e.cursor;
+        view_.anchor = e.anchor;
+        view_.bookmarks = e.bookmarks;
+        state_id_ = e.state_id;
+        generation_++;
+    }
+    if (e.has_view) {
+        read_only_ = e.view.read_only;
+        view_.parser = e.view.parser;
+        view_.parse_base = e.view.parse_base;
+        view_.parse_length = e.view.parse_length;
+    }
     persist_gen_++;
     view_generation++;
     coalesce_open_ = false;
@@ -844,6 +928,8 @@ bool Document::replace_with_file(const std::string& path, const std::string& lab
     for (auto* stack : {&undo_, &redo_, &pend_undo_, &pend_redo_, &group_redo_})
         for (UndoEntry& e : *stack) remap(e.pieces);
     sources_.insert(sources_.end() - 1, src);
+    std::erase_if(ref_files_, [](const std::weak_ptr<FileSource>& w) { return w.expired(); });
+    ref_files_.push_back(src);
     std::vector<Piece> np;
     if (size) np.push_back(Piece{Piece::Original, cur, 0, size});
     table_.assign(std::move(np));
@@ -934,37 +1020,56 @@ bool Document::update_bookmark(size_t index, const Bookmark& b) {
 
 bool Document::can_undo() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return !busy_ && !read_only_ && group_depth_ == 0 && !eff_undo().empty();
+    const auto& u = eff_undo();
+    return !busy_ && group_depth_ == 0 && !u.empty() && (!read_only_ || u.back().view_only);
 }
 
 bool Document::can_redo() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return !busy_ && !read_only_ && group_depth_ == 0 && !eff_redo().empty();
+    const auto& r = eff_redo();
+    return !busy_ && group_depth_ == 0 && !r.empty() && (!read_only_ || r.back().view_only);
+}
+
+// One undo() / redo() step: moves `from.back()` into the document and the current state onto `to`.
+// A read-only document only takes view steps.
+bool Document::step_history(std::vector<UndoEntry>& from, std::vector<UndoEntry>& to) {
+    if (busy_.load() || group_depth_ > 0 || from.empty() || (read_only_ && !from.back().view_only)) return false;
+    UndoEntry target = std::move(from.back());
+    from.pop_back();
+    UndoEntry now = target.view_only ? capture_view() : capture();
+    if (target.has_view && !now.has_view) {
+        now.has_view = true;
+        now.view = view_options_locked();
+    }
+    now.label = target.label;
+    now.time_ms = target.time_ms;
+    push_entry(to, std::move(now));
+    apply_entry(target);
+    return true;
 }
 
 bool Document::undo() {
     std::lock_guard<std::mutex> lk(mu_);
     apply_pending();
-    if (!editable() || group_depth_ > 0 || undo_.empty()) return false;
-    UndoEntry target = std::move(undo_.back());
-    undo_.pop_back();
-    UndoEntry now = capture();
-    now.label = target.label;
-    push_entry(redo_, std::move(now));
-    apply_entry(target);
-    return true;
+    return step_history(undo_, redo_);
 }
 
 bool Document::redo() {
     std::lock_guard<std::mutex> lk(mu_);
     apply_pending();
-    if (!editable() || group_depth_ > 0 || redo_.empty()) return false;
-    UndoEntry target = std::move(redo_.back());
-    redo_.pop_back();
-    UndoEntry now = capture();
-    now.label = target.label;
-    push_entry(undo_, std::move(now));
-    apply_entry(target);
+    return step_history(redo_, undo_);
+}
+
+bool Document::set_view_options(const ViewOptions& o, const std::string& label) {
+    std::lock_guard<std::mutex> lk(mu_);
+    apply_pending();
+    if (busy_.load() || o == view_options_locked()) return false;
+    push_undo(label.empty() ? "View" : label.c_str(), false, 0, 0, true);
+    read_only_ = o.read_only;
+    view_.parser = o.parser;
+    view_.parse_base = o.parse_base;
+    view_.parse_length = o.parse_length;
+    view_generation++;
     return true;
 }
 
@@ -1170,13 +1275,10 @@ bool Document::save_inplace(const std::string& path, const std::shared_ptr<FileS
             for (UndoEntry& u : *stack) history_changed |= remap_pieces(u.pieces, cur, map);
     } else {
         if (progress && progress->cancel) return fail(err, "Save cancelled");
-        for (auto* stack : {&undo, &redo}) {
-            size_t before = stack->size();
-            stack->erase(std::remove_if(stack->begin(), stack->end(),
-                                        [&](const UndoEntry& u) { return references_ranges(u.pieces, cur, w); }),
-                         stack->end());
-            history_changed |= stack->size() != before;
-        }
+        for (auto* stack : {&undo, &redo})
+            history_changed |= drop_entries(*stack, true, [&](const UndoEntry& u) {
+                return references_ranges(u.pieces, cur, w);
+            });
     }
     // Commit the rewritten history BEFORE touching the file: it is valid either way (the copies
     // equal the current disk bytes), so a failed write below cannot corrupt undo.
@@ -1387,8 +1489,8 @@ bool Document::save_rewrite(const std::string& target, bool same_file, const Sna
                 return false;
             };
             std::vector<UndoEntry> undo = eff_undo(), redo = eff_redo();
-            undo.erase(std::remove_if(undo.begin(), undo.end(), refs_bad), undo.end());
-            redo.erase(std::remove_if(redo.begin(), redo.end(), refs_bad), redo.end());
+            drop_entries(undo, true, refs_bad);
+            drop_entries(redo, true, refs_bad);
             pend_undo_ = std::move(undo);
             pend_redo_ = std::move(redo);
             pend_ = true;
@@ -1550,7 +1652,8 @@ GrowResult Document::refresh_appended(uint64_t* added, std::string* err) {
         ps.push_back(tail);
     };
     for (auto* stack : {&undo_, &redo_})
-        for (UndoEntry& u : *stack) append(u.pieces);
+        for (UndoEntry& u : *stack)
+            if (!u.view_only) append(u.pieces);  // a view step has no piece list of its own
     disk_stat_ = now;
     set_ref(new_size, now, std::move(ref));
     generation_++;
@@ -1595,14 +1698,29 @@ PersistedDoc Document::persist() const {
     const uint32_t cur = current_source();
     const bool has_src = sources_.back() != nullptr;
     const auto& chunks = add_.chunks();
-    auto usable = [&](const std::vector<Piece>& ps) {
-        for (const Piece& p : ps)
-            if (p.src == Piece::Original && (!has_src || p.chunk != cur)) return false;
-        return true;
+    // Original pieces the session can reference: the current file (chunk 0) and the files of
+    // replace_with_file (by path: chunk 1.., numbered in order of first use). Older versions of
+    // our own file (rewrite saves of this run) have no path of their own.
+    auto by_ref = [&](uint32_t c) { return c < cur && sources_[c] && is_ref_file(sources_[c]); };
+    auto exportable = [&](const Piece& p) {
+        return p.src != Piece::Original || (p.chunk == cur ? has_src : by_ref(p.chunk));
     };
-    auto renumber = [](std::vector<Piece> ps) {
-        for (Piece& p : ps)
-            if (p.src == Piece::Original) p.chunk = 0;
+    auto usable = [&](const std::vector<Piece>& ps) { return std::all_of(ps.begin(), ps.end(), exportable); };
+    std::vector<uint32_t> ref_num(sources_.size(), 0);  // 0 = not numbered yet
+    auto renumber = [&](std::vector<Piece> ps) {
+        for (Piece& p : ps) {
+            if (p.src != Piece::Original) continue;
+            if (p.chunk == cur) {
+                p.chunk = 0;
+                continue;
+            }
+            uint32_t& n = ref_num[p.chunk];
+            if (!n) {
+                d.ref_files.push_back({sources_[p.chunk]->path(), sources_[p.chunk]->stat_at_open()});
+                n = uint32_t(d.ref_files.size());
+            }
+            p.chunk = n;
+        }
         return ps;
     };
     // The saved state is exported as id 1 (restore() relies on that); others shift by one.
@@ -1614,21 +1732,26 @@ PersistedDoc Document::persist() const {
     } else {
         uint64_t old_bytes = 0;
         for (const Piece& p : table_.pieces())
-            if (p.src == Piece::Original && p.chunk != cur) old_bytes += p.len;
+            if (!exportable(p)) old_bytes += p.len;
         if (old_bytes <= kMaxMaterialize) {
+            std::vector<Piece> keep;  // runs of exportable pieces between the inlined ones
+            auto flush = [&] {
+                for (const Piece& q : renumber(std::move(keep))) d.pieces.push_back(q);
+                keep.clear();
+            };
             for (const Piece& p : table_.pieces()) {
-                if (p.src == Piece::Original && p.chunk != cur) {
+                if (!exportable(p)) {
+                    flush();
                     std::vector<uint8_t> bytes(size_t(p.len), 0);
                     const FileSource* s = p.chunk < sources_.size() ? sources_[p.chunk].get() : nullptr;
                     if (s) s->read(p.start, bytes.data(), bytes.size());
                     d.pieces.push_back(Piece{Piece::Add, uint32_t(chunks.size() + extra.size()), 0, p.len});
                     extra.push_back(std::move(bytes));
                 } else {
-                    Piece q = p;
-                    if (q.src == Piece::Original) q.chunk = 0;
-                    d.pieces.push_back(q);
+                    keep.push_back(p);
                 }
             }
+            flush();
         } else {
             // Too large to inline: fall back to the last saved state of the current version.
             // The session warns about this on restore; hot_exit_safe() lets the UI ask first.
@@ -1638,20 +1761,16 @@ PersistedDoc Document::persist() const {
             d.edits_dropped = true;
         }
     }
-    for (const UndoEntry& u : eff_undo())
-        if (usable(u.pieces)) {
-            UndoEntry c = u;
-            c.pieces = renumber(u.pieces);
-            c.state_id = map_id(u.state_id);
-            d.undo.push_back(std::move(c));
+    // A view step is only kept with the state its bytes come from (drop_entries).
+    d.undo = eff_undo();
+    d.redo = eff_redo();
+    for (auto* stack : {&d.undo, &d.redo}) {
+        drop_entries(*stack, !d.edits_dropped, [&](const UndoEntry& u) { return !usable(u.pieces); });
+        for (UndoEntry& u : *stack) {
+            u.pieces = renumber(std::move(u.pieces));
+            u.state_id = map_id(u.state_id);
         }
-    for (const UndoEntry& u : eff_redo())
-        if (usable(u.pieces)) {
-            UndoEntry c = u;
-            c.pieces = renumber(u.pieces);
-            c.state_id = map_id(u.state_id);
-            d.redo.push_back(std::move(c));
-        }
+    }
 
     // Export only the referenced prefix of each add chunk (old typing garbage stays behind).
     std::vector<uint64_t> need(chunks.size(), 0);
@@ -1675,9 +1794,10 @@ bool Document::hot_exit_safe() const {
     std::lock_guard<std::mutex> lk(mu_);
     if (state_id_ == saved_state_id_) return true;
     const uint32_t cur = current_source();
-    uint64_t old_bytes = 0;
+    uint64_t old_bytes = 0;  // persist() inlines these (files of replace_with_file go by path)
     for (const Piece& p : table_.pieces())
-        if (p.src == Piece::Original && p.chunk != cur) old_bytes += p.len;
+        if (p.src == Piece::Original && p.chunk != cur && !(p.chunk < cur && is_ref_file(sources_[p.chunk])))
+            old_bytes += p.len;
     return old_bytes <= kMaxMaterialize;
 }
 
@@ -1693,8 +1813,19 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
     d->extras_ = st.extras;
     for (const auto& c : st.add_chunks) d->add_.push_chunk(c.data(), c.size());
 
-    bool has_original = false;
-    for (const Piece& p : st.pieces) has_original |= p.src == Piece::Original;
+    bool has_original = false;  // the current state needs the file at `path`
+    for (const Piece& p : st.pieces) has_original |= p.src == Piece::Original && p.chunk == 0;
+
+    // Files referenced by path (chunk k >= 1 = st.ref_files[k - 1], e.g. the .backup of Revert to
+    // Backup): usable only while they are what the session saw (size + mtime); else null.
+    std::vector<std::shared_ptr<FileSource>> refs(st.ref_files.size());
+    for (size_t k = 0; k < refs.size(); ++k) {
+        const PersistedDoc::RefFile& rf = st.ref_files[k];
+        auto s = FileSource::open(rf.path);
+        if (!s || s->kind() != SourceKind::File) continue;
+        const FileStat now = s->stat_at_open();
+        if (!now.is_device && now.size == rf.stat.size && now.mtime_ns == rf.stat.mtime_ns) refs[k] = std::move(s);
+    }
 
     bool file_changed = false;
     bool recovered = false;
@@ -1717,13 +1848,20 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
             d->disk_stat_ = now;
         }
     }
+    for (const auto& r : refs) {
+        d->sources_.push_back(r);  // index k - 1; prune_sources() below releases unused ones
+        if (r) d->ref_files_.push_back(r);
+    }
     d->sources_.push_back(src);
+    const uint32_t cur = d->current_source();
     const uint64_t src_size = src ? src->size() : 0;
     const auto& chunks = d->add_.chunks();
 
-    // Validates a stored piece list; Original pieces are clamped to the (possibly changed) file.
-    auto fix = [&](const std::vector<Piece>& in, std::vector<Piece>& out) {
+    // Validates a stored piece list; Original pieces of the document's file are clamped to the
+    // (possibly changed) file. False if corrupt, or if it needs an unusable ref file (*missing).
+    auto fix = [&](const std::vector<Piece>& in, std::vector<Piece>& out, bool* missing) {
         out.clear();
+        *missing = false;
         for (const Piece& p : in) {
             if (p.len == 0) continue;
             if (p.src == Piece::Add) {
@@ -1731,28 +1869,52 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
                 uint64_t used = chunks[p.chunk]->used;
                 if (p.start > used || p.len > used - p.start) return false;
                 out.push_back(p);
-            } else if (p.src == Piece::Original) {
+            } else if (p.src == Piece::Original && p.chunk == 0) {
                 if (!src) return false;
                 if (p.start >= src_size) continue;
                 Piece q = p;
-                q.chunk = 0;
+                q.chunk = cur;
                 q.len = std::min(q.len, src_size - q.start);
+                out.push_back(q);
+            } else if (p.src == Piece::Original && p.chunk <= refs.size()) {
+                const FileSource* r = refs[p.chunk - 1].get();
+                if (!r) {
+                    *missing = true;
+                    continue;
+                }
+                if (p.start > r->size() || p.len > r->size() - p.start) return false;
+                Piece q = p;
+                q.chunk = p.chunk - 1;
                 out.push_back(q);
             } else {
                 return false;
             }
         }
-        return true;
+        return !*missing;
+    };
+    // The current state: a changed / vanished ref file loses it (as when persist() could not keep
+    // the unsaved state, the file on disk opens); anything else that does not fit is corrupt.
+    std::vector<Piece> cur_pieces;
+    bool lost = false;
+    if (!fix(st.pieces, cur_pieces, &lost) && !lost) {
+        fail(err, "Session data for " + (st.display_name.empty() ? st.path : st.display_name) + " is corrupt");
+        return nullptr;
+    }
+    const bool st_dirty = st.dirty && !lost;
+    const std::string doc_name = st.display_name.empty() ? path_filename(st.path) : st.display_name;
+    auto add_note = [&](const std::string& n) {
+        if (note) *note += (note->empty() ? "" : ". ") + n;
     };
 
     // Our own save already wrote this exact content (the process ended before the session was
     // rewritten): replaying the pieces on top of it would corrupt it. Size plus every added byte
-    // (up to a budget) at its offset must match; Original bytes cannot be checked (old version).
+    // and every byte of a ref file (up to a budget) at its offset must match; Original bytes of
+    // the document's file cannot be checked (old version).
     bool already_saved = false;
-    if (file_changed && st.dirty && src && pieces_size(st.pieces) == src_size) {
+    if (file_changed && st_dirty && src && pieces_size(st.pieces) == src_size) {
         already_saved = true;
         uint64_t at = 0, budget = 64ull << 20;
-        std::vector<uint8_t> buf;
+        std::vector<uint8_t> buf, ref_buf;
         for (const Piece& p : st.pieces) {
             if (p.src == Piece::Add && budget) {
                 if (p.chunk >= chunks.size() || p.start > chunks[p.chunk]->used ||
@@ -1768,43 +1930,71 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
                     break;
                 }
                 budget -= n;
+            } else if (p.src == Piece::Original && p.chunk >= 1 && p.chunk <= refs.size() && refs[p.chunk - 1] &&
+                       budget) {
+                // A ref file (Revert to Backup) is what the session saw: its bytes can be compared.
+                const FileSource& r = *refs[p.chunk - 1];
+                const uint64_t n = std::min(p.len, budget);
+                for (uint64_t done = 0; done < n && already_saved;) {
+                    const size_t k = size_t(std::min<uint64_t>(n - done, kPreserveBlock));
+                    buf.resize(k);
+                    ref_buf.resize(k);
+                    already_saved = src->read(at + done, buf.data(), k) == k &&
+                                    r.read(p.start + done, ref_buf.data(), k) == k &&
+                                    std::memcmp(buf.data(), ref_buf.data(), k) == 0;
+                    done += k;
+                }
+                if (!already_saved) break;
+                budget -= n;
             }
             at += p.len;
         }
-        if (already_saved && note)
-            *note = (st.display_name.empty() ? path_filename(st.path) : st.display_name) +
-                    " was saved just before the last session ended; it was opened from disk and undo history "
-                    "from before that save was dropped";
+        if (already_saved)
+            add_note(doc_name + " was saved just before the last session ended; it was opened from disk and undo "
+                                "history from before that save was dropped");
     }
+    const std::string ref_name =
+        st.ref_files.empty() ? std::string("a file it referenced") : path_filename(st.ref_files[0].path);
+    if (lost)
+        add_note(doc_name + ": " + ref_name + " changed or is missing since the last session, so the unsaved " +
+                 "content taken from it could not be restored; the file on disk was opened");
 
-    const bool clean_but_changed = file_changed && (!st.dirty || already_saved);
-    if (clean_but_changed) {
-        d->table_.reset(0, src_size);  // nothing of ours to keep: show the new contents
+    const bool clean_but_changed = file_changed && (!st_dirty || already_saved);
+    if (clean_but_changed || lost) {
+        d->table_.reset(cur, src ? src_size : 0);  // nothing of ours to keep: show the file's contents
     } else {
-        std::vector<Piece> ps;
-        if (!fix(st.pieces, ps)) {
-            fail(err, "Session data for " + (st.display_name.empty() ? st.path : st.display_name) + " is corrupt");
-            return nullptr;
-        }
-        d->table_.assign(std::move(ps));
+        d->table_.assign(std::move(cur_pieces));
     }
 
     uint64_t max_id = 1;
+    bool dropped = false;  // history states that needed an unusable ref file
     auto load_stack = [&](const std::vector<UndoEntry>& in, std::vector<UndoEntry>& out) {
-        for (const UndoEntry& e : in) {
-            UndoEntry u = e;
-            if (!fix(e.pieces, u.pieces)) continue;
-            max_id = std::max(max_id, u.state_id);
-            out.push_back(std::move(u));
-        }
+        out = in;
+        for (UndoEntry& u : out)
+            if (u.view_only) u.pieces.clear();
+        // A view step stays only with the state its bytes come from (the current one: unless lost).
+        drop_entries(out, !lost, [&](UndoEntry& u) {
+            std::vector<Piece> ps;
+            bool missing = false;
+            if (!fix(u.pieces, ps, &missing)) {
+                dropped |= missing;
+                return true;
+            }
+            u.pieces = std::move(ps);
+            return false;
+        });
+        for (const UndoEntry& u : out) max_id = std::max(max_id, u.state_id);
         if (out.size() > kMaxUndo) out.erase(out.begin(), out.begin() + std::ptrdiff_t(out.size() - kMaxUndo));
     };
     if (!clean_but_changed) {
         load_stack(st.undo, d->undo_);
         load_stack(st.redo, d->redo_);
     }
+    if (dropped && !lost)
+        add_note(doc_name + ": undo steps that needed " + ref_name +
+                 " were dropped (it changed or is missing since the last session)");
 
-    if ((!st.dirty || already_saved) && !recovered) {
+    if ((!st_dirty || already_saved) && !recovered) {
         d->state_id_ = d->saved_state_id_ = 1;
     } else {
         d->state_id_ = max_id + 1;
@@ -1816,6 +2006,7 @@ std::unique_ptr<Document> Document::restore(const PersistedDoc& st, bool* change
         d->base_chunks_ = uint32_t(chunks.size());
         d->base_last_used_ = chunks.empty() ? 0 : chunks.back()->used;
     }
+    if (cur > 0) d->prune_sources();  // ref files no restored state needs
     d->clamp_view();
     if (changed_on_disk) *changed_on_disk = file_changed && !already_saved;
     return d;

@@ -264,7 +264,11 @@ runs again for every parse, so keep its top-level code cheap and free of side ef
   Use fields to show things, and commands to change things.
 * `print`, `hx.log`, `hx.warn` output appears in the console when the result arrives.
 
-`detect` still runs on the UI thread in the shared state (keep it to a few reads).
+`detect` runs the same way: each parser's `detect(doc)` in a Lua state of its own over the
+document as it was, so a slow detect shows "Detecting..." instead of blocking the editor; the
+rules above apply (no globals of other scripts; a parser that cannot be rebuilt alone, e.g. one
+defined in the console, detects on the UI thread in its turn). Keep it cheap anyway: it runs
+again after every edit while the parser is on Auto.
 
 ---
 

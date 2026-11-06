@@ -408,6 +408,9 @@ hx.new_doc("t.zip", lfh .. cdh .. eocd)
     for (const Case& c : {Case{img, "PNG image"}, Case{hxp, "HXP packet"}, Case{zip, "ZIP archive"}}) {
         INFO(c.parser);
         CHECK(eng.detect_parser(*c.doc) == c.parser);
+        DetectJob dj(eng, *c.doc);
+        CHECK(dj.background());
+        CHECK(dj.take(eng, *c.doc) == c.parser);
         ParseJob job(eng, *c.doc, c.parser);
         CHECK(job.background());
         REQUIRE(job.wait(-1));
@@ -450,4 +453,138 @@ TEST_CASE("parse job: process memory with holes reads like a synchronous parse")
     CHECK(r.fields[1].value == "process " + std::to_string(hx::os_process_id()));
     CHECK(r.fields[2].value == "90 (0x5A)");
     CHECK(r.fields[2].offset == hm.addr() + 2 * hm.pg);
+}
+
+// ---- DetectJob ------------------------------------------------------------------------------------
+
+TEST_CASE("detect job: a slow detect does not block; the answer arrives later") {
+    Fixture fx;
+    fx.load({{"a.lua", R"LUA(
+hx.parser { name = "slow", detect = function(doc)
+    local t0 = os.clock()
+    while os.clock() - t0 < 0.3 do end
+    return false
+end, parse = function(p) end }
+)LUA"},
+             {"b.lua", "hx.parser { name = 'seven', detect = function(doc) return doc:u8(0) == 7 end, "
+                       "parse = function(p) p:u8('x') end }\n"}});
+    REQUIRE(fx.errors() == 0);
+    Document* d = fx.host.add("\x07rest");
+    const auto t0 = std::chrono::steady_clock::now();
+    DetectJob job(fx.eng, *d);
+    CHECK(ms_since(t0) < 200.0);  // the 300 ms detect runs on the worker
+    CHECK(job.background());
+    CHECK_FALSE(job.done());
+    CHECK(job.current(fx.eng, *d));
+    CHECK(job.wait(-1));
+    CHECK(ms_since(t0) >= 250.0);
+    CHECK(job.take(fx.eng, *d) == "seven");
+    CHECK(fx.eng.detect_parser(*d) == "seven");
+    CHECK(fx.errors() == 0);
+}
+
+TEST_CASE("detect job: detect order, main-engine parsers in their turn, extension fallback") {
+    Fixture fx;
+    // "needs" uses a global of another script at load time: its detect runs in the main engine.
+    fx.load({{"a.lua", "helper_one = 1\n"
+                       "hx.parser { name = 'first', detect = function(doc) return doc:u8(0) == 0 end, parse = function(p) end }\n"},
+             {"b.lua", "local one = assert(helper_one)\n"
+                       "hx.parser { name = 'needs', detect = function(doc) return doc:u8(0) == one end, parse = function(p) end }\n"},
+             {"c.lua", "hx.parser { name = 'plain', parse = function(p) end }\n"
+                       "hx.parser { name = 'byext', extensions = { 'foo' }, detect = function(doc) return doc:u8(0) == 3 end, "
+                       "parse = function(p) end }\n"}});
+    REQUIRE(fx.errors() == 0);
+    fx.eng.exec("hx.parser { name = 'con', detect = function(doc) return doc:u8(0) <= 2 end, parse = function(p) end }");
+    struct Case {
+        const char* bytes;
+        const char* name;
+        const char* want;
+    };
+    for (const Case& c : {Case{"\x01", "t.bin", "needs"}, Case{"\x02", "t.bin", "con"}, Case{"\x03", "t.bin", "byext"},
+                          Case{"\x09", "t.foo", "byext"}, Case{"\x09", "t.bin", ""}}) {
+        INFO(c.want);
+        Document* d = fx.host.add(c.bytes, c.name);
+        DetectJob job(fx.eng, *d);
+        CHECK(job.background());
+        REQUIRE(job.wait(-1));
+        CHECK(job.take(fx.eng, *d) == c.want);
+        CHECK(fx.eng.detect_parser(*d) == c.want);
+    }
+    // Byte 0: the first parser wins although later ones (con) would say yes too.
+    Document* z = fx.host.add(std::string(1, '\0'));
+    DetectJob job(fx.eng, *z);
+    REQUIRE(job.wait(-1));
+    CHECK(job.take(fx.eng, *z) == "first");
+    CHECK(fx.errors() == 0);
+}
+
+TEST_CASE("detect job: stale answers are recognised; output and errors reach the console once") {
+    Fixture fx;
+    fx.load({{"a.lua", "hx.parser { name = 'boom', detect = function(doc) print('looking'); error('bad magic') end, "
+                       "parse = function(p) end }\n"},
+             {"b.lua", "hx.parser { name = 'ok', detect = function(doc) return doc:u8(0) == 0x41 end, parse = function(p) end }\n"}});
+    REQUIRE(fx.errors() == 0);
+    Document* d = fx.host.add("ABC");
+    for (int i = 0; i < 2; ++i) {
+        DetectJob job(fx.eng, *d);
+        REQUIRE(job.wait(-1));
+        CHECK(fx.count("looking") == i);  // buffered until take()
+        CHECK(job.take(fx.eng, *d) == "ok");
+        CHECK(fx.count("looking") == i + 1);
+    }
+    CHECK(fx.count("Parser 'boom' detect: ", ConsoleLine::Error) == 1);  // once per reload
+    CHECK(fx.count("a.lua:1: bad magic", ConsoleLine::Error) == 1);
+
+    // The answer is for the document as it was: an edit or a script reload makes it stale (the
+    // Structure panel then drops it and detects again).
+    DetectJob job(fx.eng, *d);
+    CHECK(job.current(fx.eng, *d));
+    const uint8_t x = 0x42;
+    REQUIRE(d->overwrite(0, &x, 1));
+    CHECK_FALSE(job.current(fx.eng, *d));
+    REQUIRE(job.wait(-1));
+    CHECK(job.take(fx.eng, *d) == "ok");  // what the start state said
+    CHECK(fx.eng.detect_parser(*d).empty());
+    DetectJob again(fx.eng, *d);
+    CHECK(again.current(fx.eng, *d));
+    fx.eng.reload();
+    CHECK_FALSE(again.current(fx.eng, *d));
+    Document* other = fx.host.add("ABC");
+    CHECK_FALSE(again.current(fx.eng, *other));
+}
+
+TEST_CASE("detect job: cancel and the 1 s limit stop a runaway detect") {
+    Fixture fx;
+    fx.load({{"a.lua", "hx.parser { name = 'spin', detect = function(doc) while true do end end, parse = function(p) end }\n"},
+             {"b.lua", "hx.parser { name = 'yes', detect = function(doc) return true end, parse = function(p) end }\n"}});
+    Document* d = fx.host.add("abc");
+    {
+        DetectJob job(fx.eng, *d);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK_FALSE(job.done());
+        const auto t0 = std::chrono::steady_clock::now();
+        job.cancel();
+        CHECK(job.wait(900));
+        CHECK(ms_since(t0) < 800.0);
+        CHECK(job.take(fx.eng, *d).empty());
+        CHECK(fx.errors() == 0);  // a cancellation is not a script error
+    }
+    DetectJob job(fx.eng, *d);
+    REQUIRE(job.wait(5000));
+    CHECK(job.take(fx.eng, *d) == "yes");
+    CHECK(fx.count("time limit exceeded (1000 ms)", ConsoleLine::Error) == 1);
+    // Destroying a running job cancels and joins it quickly.
+    const auto t1 = std::chrono::steady_clock::now();
+    { DetectJob gone(fx.eng, *d); }
+    CHECK(ms_since(t1) < 800.0);
+}
+
+TEST_CASE("detect job: no detect() to run in the background is done at once") {
+    Fixture fx;
+    fx.load("hx.parser { name = 'none', extensions = { 'bin' }, parse = function(p) end }\n");
+    Document* d = fx.host.add("abc", "x.bin");
+    DetectJob job(fx.eng, *d);
+    CHECK_FALSE(job.background());
+    CHECK(job.done());
+    CHECK(job.take(fx.eng, *d) == "none");
 }

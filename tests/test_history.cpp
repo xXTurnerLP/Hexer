@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -470,4 +471,260 @@ TEST_CASE("history_jump and history_diff on random edit sequences") {
             check_twins();
         }
     }
+}
+
+// ---- timestamps ------------------------------------------------------------------------------
+
+TEST_CASE("history: every step records when it happened; a typing run the time of its last edit") {
+    FakeClock clock;
+    TempDir t;
+    auto d = open_sample(t, "time.bin");
+    const uint8_t ab[] = {'A', 'B'};
+    g_fake_ms = 1700000000000;
+    REQUIRE(d->overwrite(0, ab, 2));
+    g_fake_ms += 10000;
+    for (uint64_t i = 0; i < 3; ++i) {  // one merged typing run
+        const uint8_t c = uint8_t('x' + i);
+        REQUIRE(d->overwrite(4 + i, &c, 1, true));
+        g_fake_ms += 100;
+    }
+    const int64_t typed = g_fake_ms - 100;
+    g_fake_ms += 5000;
+    Bookmark b;
+    b.name = "m";
+    REQUIRE(d->add_bookmark(b));
+    REQUIRE(history_count(*d) == 4);
+    CHECK(history_time(*d, 0) == 0);  // the original state: no action
+    CHECK(history_time(*d, 1) == 1700000000000);
+    CHECK(history_label(*d, 2) == "Typing");
+    CHECK(history_time(*d, 2) == typed);
+    CHECK(history_time(*d, 3) == typed + 5100);
+    // The time travels with its step through undo / redo (the redo rows keep theirs).
+    g_fake_ms += 60000;
+    REQUIRE(history_jump(*d, 1));
+    CHECK(history_time(*d, 1) == 1700000000000);
+    CHECK(history_time(*d, 2) == typed);
+    CHECK(history_time(*d, 3) == typed + 5100);
+    REQUIRE(history_jump(*d, 3));
+    CHECK(history_time(*d, 2) == typed);
+    CHECK(history_time(*d, 3) == typed + 5100);
+    // A group (script command) takes the time of its last edit too.
+    d->begin_group("Script: x");
+    REQUIRE(d->overwrite(0, ab, 1));
+    g_fake_ms += 700;
+    REQUIRE(d->overwrite(1, ab, 1));
+    d->end_group();
+    CHECK(history_time(*d, 4) == g_fake_ms);
+}
+
+namespace {
+int64_t local_ms(int year, int mon, int day, int hour, int min, int sec = 0) {
+    std::tm tm{};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = mon - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    tm.tm_isdst = -1;
+    return int64_t(std::mktime(&tm)) * 1000;
+}
+}  // namespace
+
+TEST_CASE("history_time_text: relative times, local clock") {
+    const int64_t now = local_ms(2026, 11, 6, 14, 30);  // a Friday
+    CHECK(history_time_text(0, now) == "");
+    CHECK(history_time_text(now, now) == "just now");
+    CHECK(history_time_text(now - 59000, now) == "just now");
+    CHECK(history_time_text(now + 5000, now) == "just now");  // clock skew
+    CHECK(history_time_text(now - 60000, now) == "1 min ago");
+    CHECK(history_time_text(now - 150000, now) == "2 min ago");
+    CHECK(history_time_text(now - 59 * 60000, now) == "59 min ago");
+    CHECK(history_time_text(local_ms(2026, 11, 6, 9, 5), now) == "today 09:05");
+    CHECK(history_time_text(local_ms(2026, 11, 5, 14, 3), now) == "yesterday 14:03");
+    CHECK(history_time_text(local_ms(2026, 11, 5, 23, 59), now) == "yesterday 23:59");
+    CHECK(history_time_text(local_ms(2026, 11, 2, 8, 0), now) == "Mon 08:00");
+    CHECK(history_time_text(local_ms(2026, 10, 30, 8, 0), now) == "2026-10-30 08:00");
+    CHECK(history_time_text(local_ms(2025, 1, 2, 3, 4), now) == "2025-01-02 03:04");
+    CHECK(history_time_full(local_ms(2026, 11, 6, 14, 3, 12)) == "2026-11-06 14:03:12");
+    CHECK(history_time_full(0) == "");
+}
+
+// ---- view steps (read-only toggle, parser, Parse at) -----------------------------------------
+
+namespace {
+ViewOptions with_ro(const Document& d, bool ro) {
+    ViewOptions o = d.view_options();
+    o.read_only = ro;
+    return o;
+}
+}  // namespace
+
+TEST_CASE("history: the read-only toggle is a cheap undo step that undoes while read-only") {
+    FakeClock clock;
+    TempDir t;
+    auto d = open_sample(t, "ro.bin");
+    const uint8_t ab[] = {'A', 'B'};
+    REQUIRE(d->overwrite(2, ab, 2));
+    const Bytes edited = doc_bytes(*d);
+    const uint64_t gen = d->generation(), sid = d->state_id();
+    set_caret(*d, 7, 9);
+    REQUIRE(d->set_view_options(with_ro(*d, true), "Read-only on"));
+    CHECK(d->read_only());
+    CHECK_FALSE(d->set_view_options(with_ro(*d, true), "Read-only on"));  // no change: no step
+    REQUIRE(d->undo_stack().size() == 2);
+    const UndoEntry& e = d->undo_stack().back();
+    CHECK(e.view_only);
+    CHECK(e.pieces.empty());           // no copy of the piece list
+    CHECK(e.has_view);
+    CHECK_FALSE(e.view.read_only);     // the state before
+    CHECK(e.label == "Read-only on");
+    CHECK(d->generation() == gen);     // not a content change
+    CHECK(d->state_id() == sid);
+    CHECK(d->dirty());                 // still the edit's dirtiness, nothing more
+    // Content steps are refused while read-only, the toggle itself is not.
+    const uint8_t x = 'x';
+    CHECK_FALSE(d->overwrite(0, &x, 1));
+    CHECK(d->can_undo());
+    set_caret(*d, 3, 3);
+    REQUIRE(d->undo());
+    CHECK_FALSE(d->read_only());
+    CHECK(doc_bytes(*d) == edited);
+    CHECK(d->view().cursor == 3);      // a view step leaves the caret alone
+    CHECK(d->generation() == gen);
+    REQUIRE(d->redo_stack().size() == 1);
+    CHECK(d->redo_stack().back().view_only);
+    CHECK(d->redo_stack().back().pieces.empty());
+    REQUIRE(d->redo());
+    CHECK(d->read_only());
+    CHECK(d->can_undo());              // the toggle step
+    CHECK_FALSE(d->can_redo());
+    REQUIRE(d->undo());
+    REQUIRE(d->undo());                // writable again: the edit undoes as usual
+    CHECK(doc_bytes(*d) == str_bytes("0123456789abcdefghij"));
+    // Read-only with a content step on top: nothing undoes.
+    REQUIRE(d->redo());
+    d->set_read_only(true);            // not an undo step (how documents are opened)
+    CHECK_FALSE(d->can_undo());
+    CHECK_FALSE(d->undo());
+    CHECK(d->undo_stack().size() == 1);
+}
+
+TEST_CASE("history: parser and Parse at are view steps; the History rows show the right bytes") {
+    FakeClock clock;
+    TempDir t;
+    auto d = open_sample(t, "parser.bin");
+    const uint8_t ab[] = {'A', 'B'};
+    REQUIRE(d->overwrite(0, ab, 2));
+    ViewOptions o = d->view_options();
+    o.parser = "PNG image";
+    g_fake_ms += 1000;
+    REQUIRE(d->set_view_options(o, "Parser: PNG image"));
+    CHECK(d->undo_stack().back().time_ms == g_fake_ms);
+    o.parse_base = 4;
+    o.parse_length = 8;
+    REQUIRE(d->set_view_options(o, "Parse 0x4..0xB"));
+    CHECK(d->view().parser == "PNG image");
+    CHECK(d->view().parse_base == 4);
+    CHECK(d->view().parse_length == 8);
+    REQUIRE(d->insert(1, ab, 1));
+    // rows: 0 original, 1 overwrite, 2 parser, 3 parse at, 4 insert (current)
+    REQUIRE(history_count(*d) == 5);
+    CHECK(history_label(*d, 2) == "Parser: PNG image");
+    CHECK(history_label(*d, 3) == "Parse 0x4..0xB");
+    CHECK(history_pieces(*d, 2) == history_pieces(*d, 1));  // view rows: the bytes of row 1
+    CHECK(history_pieces(*d, 3) == history_pieces(*d, 1));
+    CHECK(history_row_change(*d, 2).same);
+    CHECK(history_row_change(*d, 3).same);
+    CHECK(history_row_change(*d, 4).new_len == 1);
+    CHECK_FALSE(history_row_change(*d, 4).same);
+    Bytes after_overwrite = str_bytes("0123456789abcdefghij");
+    after_overwrite[0] = 'A';
+    after_overwrite[1] = 'B';
+    REQUIRE(history_jump(*d, 2));  // undo the insert and the Parse at
+    CHECK(doc_bytes(*d) == after_overwrite);
+    CHECK(d->view().parser == "PNG image");
+    CHECK(d->view().parse_base == 0);
+    CHECK(d->view().parse_length == UINT64_MAX);
+    // Redo rows resolve their bytes toward the current row as well.
+    CHECK(history_pieces(*d, 3) == history_pieces(*d, 2));
+    CHECK(history_row_change(*d, 3).same);
+    CHECK(history_row_change(*d, 4).new_len == 1);
+    REQUIRE(history_jump(*d, 0));
+    CHECK(d->view().parser.empty());
+    CHECK(doc_bytes(*d) == str_bytes("0123456789abcdefghij"));
+    REQUIRE(history_jump(*d, 4));
+    CHECK(d->view().parser == "PNG image");
+    CHECK(d->view().parse_base == 4);
+    CHECK(d->size() == 21);
+}
+
+TEST_CASE("history: a view change inside a group is restored by the group's step") {
+    TempDir t;
+    auto d = open_sample(t, "group.bin");
+    const uint8_t ab[] = {'A', 'B'};
+    d->begin_group("Script: demo");
+    REQUIRE(d->overwrite(0, ab, 2));
+    ViewOptions o = d->view_options();
+    o.parser = "ZIP archive";
+    REQUIRE(d->set_view_options(o, "Parser: ZIP archive"));
+    o.parser = "ELF";
+    REQUIRE(d->set_view_options(o, "Parser: ELF"));
+    d->end_group();
+    REQUIRE(d->undo_stack().size() == 1);
+    CHECK_FALSE(d->undo_stack().back().view_only);
+    CHECK(d->undo_stack().back().has_view);
+    CHECK(d->undo_stack().back().label == "Script: demo");
+    REQUIRE(d->undo());
+    CHECK(d->view().parser.empty());
+    CHECK(doc_bytes(*d) == str_bytes("0123456789abcdefghij"));
+    REQUIRE(d->redo());
+    CHECK(d->view().parser == "ELF");
+    CHECK(d->view().parse_base == 0);
+    // An aborted group rolls the view back too.
+    d->begin_group("Script: fails");
+    o.parser = "PNG image";
+    REQUIRE(d->set_view_options(o, "Parser: PNG image"));
+    d->abort_group();
+    CHECK(d->view().parser == "ELF");
+    CHECK(d->undo_stack().size() == 1);
+}
+
+TEST_CASE("history: a view step whose bytes came from a dropped state is dropped with it") {
+    // After a rewrite save the states of the old file version cannot go into the session; a view
+    // step right below one of them has its bytes, so it must not survive alone (it would undo
+    // into the wrong bytes).
+    TempDir t;
+    auto d = open_sample(t, "drop.bin");
+    REQUIRE(d->set_view_options(with_ro(*d, true), "Read-only on"));
+    REQUIRE(d->set_view_options(with_ro(*d, false), "Read-only off"));
+    const uint8_t x = 'x';
+    REQUIRE(d->insert(0, &x, 1));  // a size change: the save rewrites the file
+    std::string err;
+    REQUIRE(d->save(nullptr, &err));
+    REQUIRE(d->undo_stack().size() == 3);
+    PersistedDoc st = d->persist();
+    CHECK(st.undo.empty());  // the insert's state referenced the old version; the view steps go too
+    // In memory the history is whole: undo past the save, then the two toggles.
+    REQUIRE(d->undo());
+    CHECK(doc_bytes(*d) == str_bytes("0123456789abcdefghij"));
+    REQUIRE(d->undo());
+    CHECK(d->read_only());
+    REQUIRE(d->undo());
+    CHECK_FALSE(d->read_only());
+    CHECK(doc_bytes(*d) == str_bytes("0123456789abcdefghij"));
+    // A view step on top of the saved state is exported (its bytes are the current state's).
+    REQUIRE(d->redo());
+    REQUIRE(d->redo());
+    REQUIRE(d->redo());
+    REQUIRE(d->set_view_options(with_ro(*d, true), "Read-only on"));
+    st = d->persist();
+    REQUIRE(st.undo.size() == 1);
+    CHECK(st.undo[0].view_only);
+    auto r = Document::restore(st, nullptr, &err);
+    REQUIRE(r);
+    CHECK(r->read_only());
+    REQUIRE(r->undo());
+    CHECK_FALSE(r->read_only());
+    CHECK(doc_bytes(*r) == doc_bytes(*d));
 }

@@ -609,35 +609,57 @@ void ScriptEngine::exec(const std::string& code_in) {
 
 // ---- parsers ----------------------------------------------------------------------------------------
 
-std::string ScriptEngine::detect_parser(Document& doc) {
+bool ScriptEngine::has_detect(const std::string& parser) const {
     lua_State* L = impl_->L;
-    if (!L) return {};
-    std::vector<ParserInfo> list = parsers_;  // detect() may register parsers
-    for (const ParserInfo& p : list) {
-        auto it = impl_->parser_refs.find(p.name);
-        if (it == impl_->parser_refs.end()) continue;
-        int top = lua_gettop(L);
-        lua_rawgeti(L, LUA_REGISTRYINDEX, it->second);
-        lua_pushliteral(L, "detect");
-        lua_rawget(L, -2);
-        if (!lua_isfunction(L, -1)) {
-            lua_settop(L, top);
-            continue;
-        }
-        push_doc(L, doc.id());
-        std::string err;
-        bool hit = false;
-        if (impl_->pcall(1, 1, kDetectTimeLimitMs, &err)) hit = lua_toboolean(L, -1);
-        else impl_->log_error_once("Parser '" + p.name + "' detect: " + err);
+    auto it = impl_->parser_refs.find(parser);
+    if (!L || it == impl_->parser_refs.end()) return false;
+    const int top = lua_gettop(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, it->second);
+    lua_pushliteral(L, "detect");
+    lua_rawget(L, -2);
+    const bool fn = lua_isfunction(L, -1);
+    lua_settop(L, top);
+    return fn;
+}
+
+int ScriptEngine::run_detect(const std::string& parser, Document& doc, std::string* err) {
+    lua_State* L = impl_->L;
+    auto it = impl_->parser_refs.find(parser);
+    if (!L || it == impl_->parser_refs.end()) return 0;
+    const int top = lua_gettop(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, it->second);
+    lua_pushliteral(L, "detect");
+    lua_rawget(L, -2);
+    if (!lua_isfunction(L, -1)) {
         lua_settop(L, top);
-        if (hit) return p.name;
+        return 0;
     }
+    push_doc(L, doc.id());
+    int r = -1;
+    if (impl_->pcall(1, 1, kDetectTimeLimitMs, err)) r = lua_toboolean(L, -1) ? 1 : 0;
+    lua_settop(L, top);
+    return r;
+}
+
+std::string ScriptEngine::extension_parser(const std::vector<ParserInfo>& list, const Document& doc) {
     std::string ext = path_extension(doc.has_path() ? doc.path() : doc.display_name());
     if (!ext.empty())
         for (const ParserInfo& p : list)
             for (const std::string& e : p.extensions)
                 if (iequals(e, ext)) return p.name;
     return {};
+}
+
+std::string ScriptEngine::detect_parser(Document& doc) {
+    if (!impl_->L) return {};
+    std::vector<ParserInfo> list = parsers_;  // detect() may register parsers
+    for (const ParserInfo& p : list) {
+        std::string err;
+        const int r = run_detect(p.name, doc, &err);
+        if (r < 0) impl_->log_error_once("Parser '" + p.name + "' detect: " + err);
+        if (r > 0) return p.name;
+    }
+    return extension_parser(list, doc);
 }
 
 ParseResult ScriptEngine::parse(Document& doc, const std::string& parser_name) {

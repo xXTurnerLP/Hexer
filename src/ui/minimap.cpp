@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "imgui.h"
 
@@ -36,6 +37,7 @@ constexpr uint32_t kBackground = rgba(0x1a, 0x1b, 0x1e);
 constexpr uint32_t kPending = rgba(0x2b, 0x2d, 0x31);
 constexpr uint32_t kViewFill = rgba(0xff, 0xff, 0xff, 38);
 constexpr uint32_t kViewBorder = rgba(0xff, 0xff, 0xff, 150);
+constexpr float kSpotMinBits = 6.2f;  // spot ticks are at least green (visible on dark rows)
 
 // Pixel row y covers bytes [row_begin, row_end); an empty range (fewer bytes than rows) shows the
 // bucket holding row_begin.
@@ -58,7 +60,7 @@ void tooltip(const EntropyResult* r, uint64_t size, Row row) {
     }
     if (!a.done) {
         ImGui::TextDisabled("%s", r && !r->finished ? "Scanning..." : "Not scanned");
-    } else if (!a.bytes_read) {
+    } else if (!a.bytes_read && !a.hole_bytes) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hex_colors().unreadable_text), "Unreadable");
     } else {
         ImGui::Text("Entropy %.2f bits/byte", double(a.entropy));
@@ -75,7 +77,11 @@ void tooltip(const EntropyResult* r, uint64_t size, Row row) {
             ImGui::SameLine(ImGui::GetFontSize() * 7.0f);
             ImGui::Text("%5.1f%%", double(a.class_frac[c]) * 100.0);
         }
-        if (a.sampled || a.unreadable) ImGui::Separator();
+        if (a.sampled || a.unreadable || a.hole_bytes || entropy_spot(a)) ImGui::Separator();
+        if (entropy_spot(a))  // the tick on the right edge
+            ImGui::Text("Densest 4 KiB: %.2f bits/byte", double(a.peak));
+        if (a.hole_bytes)
+            ImGui::TextDisabled("sparse: %s of holes (zeros, not read)", fmt_size(a.hole_bytes).c_str());
         if (a.sampled)
             ImGui::TextDisabled("sampled (%s of %s read)", fmt_size(a.bytes_read).c_str(), fmt_size(a.length).c_str());
         if (a.unreadable)
@@ -111,13 +117,18 @@ void Minimap::draw(const char* id, float width, float height, const EntropyResul
                 dl->AddRectFilled(ImVec2(p0.x, p0.y + float(run_y)), ImVec2(p1.x, p0.y + float(y_end)), run_c);
         };
         const uint32_t bad = hex_colors().unreadable_text;
+        struct Spot {
+            int y;
+            uint32_t color;
+        };
+        std::vector<Spot> spots;
         for (int y = 0; y < rows; ++y) {
             const Row row = row_range(y, rows, size);
             EntropyBucket a;
             if (r) a = entropy_aggregate(*r, row.begin, row.end);
             uint32_t c = kPending;
-            const bool data = a.done && a.bytes_read > 0;
-            if (a.done && !a.bytes_read) c = (bad & 0x00FFFFFFu) | 0x90000000u;  // unreadable only
+            const bool data = a.done && (a.bytes_read > 0 || a.hole_bytes > 0);
+            if (a.done && !data) c = (bad & 0x00FFFFFFu) | 0x90000000u;  // unreadable only
             else if (data && mode == MinimapMode::Entropy) c = entropy_color(a.entropy);
             if (data && mode == MinimapMode::ByteClass) {
                 flush(y);
@@ -139,8 +150,16 @@ void Minimap::draw(const char* id, float width, float height, const EntropyResul
             }
             if (data && a.unreadable)  // partly unreadable: red tick on the left edge
                 dl->AddRectFilled(ImVec2(p0.x, p0.y + float(y)), ImVec2(p0.x + 2.0f, p0.y + float(y + 1)), bad);
+            if (data && entropy_spot(a))  // a small dense region the average hides: tick on the right
+                spots.push_back({y, entropy_color(std::max(a.peak, kSpotMinBits))});
         }
         flush(rows);
+        // Spot ticks last (over the runs), at least 2 px tall so a single row stays visible.
+        const float tick_w = std::max(2.0f, std::floor(width / 2.0f));
+        for (const Spot& sp : spots) {
+            const float y0 = std::min(p0.y + float(sp.y), p1.y - 2.0f);
+            dl->AddRectFilled(ImVec2(p1.x - tick_w, y0), ImVec2(p1.x, y0 + 2.0f), sp.color);
+        }
 
         // Viewport box.
         const uint64_t vb = std::min(view_begin, size), ve = std::clamp(view_end, vb, size);

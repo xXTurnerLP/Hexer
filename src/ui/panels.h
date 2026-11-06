@@ -16,15 +16,22 @@ class Document;
 // changed; at once after F5, a field edit or Parse at). Called every frame for the active tab,
 // before the hex view is drawn, so the parser highlight layer is current. The parse runs on a
 // worker (script/parse_job.h): a fast one is adopted in the frame that starts it, a slow one
-// leaves the previous tree shown (greyed, "Parsing... N fields [Cancel]") until it finishes. A
-// job whose inputs changed meanwhile is cancelled and its result dropped. Keeps the last result
-// per document.
+// leaves the previous tree shown (greyed, "Parsing... N fields [Cancel]") until it finishes. In
+// Auto mode the parser's detect() calls run first on a worker too (DetectJob, "Detecting..."
+// while slow). A job whose inputs changed meanwhile is cancelled and its result dropped. Keeps
+// the last result per document.
 void update_structure(App& app, Tab& tab);
 // Parse at offset: the Structure panel parses [base, base + length) of the tab's document (base 0
 // and length UINT64_MAX = the whole file; UINT64_MAX = to EOF) and re-parses now. A non-zero base
 // in Auto mode picks the detected parser (detect() only looks at the file start), so set
-// view().parser first to use another one.
+// view().parser first to use another one. One undo step ("Parse at 0x100"; set_parse).
 void set_parse_base(App& app, Tab& tab, uint64_t base, uint64_t length = UINT64_MAX);
+// Parser + Parse at range in one go (ViewState::parser / parse_base / parse_length), then
+// re-parses now. `undoable`: one view undo step (Document::set_view_options); false for the
+// Packets panel, whose parse follows the selected packet like a caret move.
+void set_parse(App& app, Tab& tab, const std::string& parser, uint64_t base, uint64_t length, bool undoable);
+// The parser alone ("" = Auto-detect) as one view undo step "Parser: <name>"; false if unchanged.
+bool choose_parser(Document& d, const std::string& parser);
 // Structure -> C header (script/cexport.h) of the active tab's parse tree; `field` = a struct /
 // array field's index for just that subtree, -1 = the whole tree. Copy puts it on the clipboard
 // (action "Structure: Copy as C Header"); Export asks for a .h file (native dialog).

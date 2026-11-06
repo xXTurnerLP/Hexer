@@ -1,5 +1,6 @@
 #pragma once
 // Application entry: window, main loop, tabs, menus, panels, session, scripting host.
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@ struct AppOptions {
     std::string run_lua;             // --exec "lua code": run in the console after startup (tests / automation)
     std::vector<std::string> actions;  // --action NAME (repeatable): run menu/palette actions after startup
     bool new_instance = false;       // --new-instance   : never hand the files to a running Hexer
+    uint64_t wait_pid = 0;           // --wait-pid PID   : start once PID has exited (Restart as Administrator)
 };
 
 bool parse_args(int argc, char** argv, AppOptions& out, std::string* err);

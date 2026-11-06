@@ -107,6 +107,7 @@ public:
             if (err) *err = "Cannot read the memory map of " + who + ": " + e;
             return false;
         }
+        denied_ = probe_denied();
         return true;
     }
 
@@ -156,6 +157,8 @@ public:
     }
 
     void refresh() override { reload(nullptr); }
+
+    bool read_denied() const override { return denied_; }
 
     bool alive() const override {
 #ifdef _WIN32
@@ -224,6 +227,23 @@ private:
         }
     }
 
+    // True when not one of the first readable regions gives a byte: the memory exists (the map
+    // lists it) but reads are refused, e.g. a protected process or ptrace rules.
+    bool probe_denied() const {
+        std::shared_ptr<const Map> m;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            m = map_;
+        }
+        size_t tried = 0;
+        for (const Span& s : *m) {
+            uint8_t b = 0;
+            if (os_read(s.base, &b, 1) == 1) return false;
+            if (++tried == 16) break;
+        }
+        return tried > 0;
+    }
+
     // Reads a range inside one readable region; on a failure, page by page up to the first bad page.
     size_t os_read(uint64_t pos, uint8_t* dst, size_t n) const {
 #ifdef _WIN32
@@ -252,6 +272,7 @@ private:
 
     uint32_t pid_ = 0;
     bool write_ = false;
+    bool denied_ = false;  // probe_denied() at open
     uint64_t size_ = 0;
 #ifdef _WIN32
     HANDLE h_ = nullptr;
@@ -290,5 +311,59 @@ bool parse_process_url(const std::string& path, uint32_t* pid) {
 }
 
 std::string process_url(uint32_t pid) { return "process://" + std::to_string(pid); }
+
+uint64_t process_start_address(uint32_t pid) {
+    const uint64_t limit = process_address_limit(pid);
+    std::string name = process_name(pid);
+    std::vector<ModuleInfo> mods;
+    if (!name.empty() && process_modules(pid, mods)) {
+        auto lower = [](std::string v) {
+            for (char& c : v)
+                if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+            return v;
+        };
+        name = lower(name);
+        for (const ModuleInfo& m : mods)
+            if (m.base < limit && lower(m.name) == name) return m.base;
+    }
+    std::vector<MemRegion> regs;
+    process_regions(pid, regs, nullptr, false);
+    for (const MemRegion& r : regs)
+        if (r.readable && r.base < limit) return r.base;
+    return 0;
+}
+
+bool readable_run_step(const std::vector<MemRegion>& regs, uint64_t limit, uint64_t from, bool forward,
+                       uint64_t* base, uint64_t* size) {
+    bool found = false;
+    uint64_t rb = 0, re = 0;      // the run being merged
+    uint64_t best_b = 0, best_e = 0;
+    auto consider = [&](uint64_t b, uint64_t e) {
+        // Forward: the first run starting after `from`; backward: the last one ending at or before it.
+        if (forward ? (!found && b > from) : e <= from) {
+            found = true;
+            best_b = b;
+            best_e = e;
+        }
+    };
+    bool open = false;
+    for (const MemRegion& r : regs) {
+        if (!r.readable || r.size == 0 || r.base >= limit) continue;
+        const uint64_t e = std::min(r.end(), limit);
+        if (open && r.base == re) {
+            re = e;
+            continue;
+        }
+        if (open) consider(rb, re);
+        rb = r.base;
+        re = e;
+        open = true;
+    }
+    if (open) consider(rb, re);
+    if (!found) return false;
+    if (base) *base = best_b;
+    if (size) *size = best_e - best_b;
+    return true;
+}
 
 }  // namespace hx

@@ -4,18 +4,23 @@
 //   row 0           the oldest state ("Original"; "Oldest kept state" once kMaxUndo trimmed it)
 //   row k (k >= 1)  the state after action k ("Typing", "Paste", "Fill", "Script: ...")
 //   row current()   the document's current state (highlighted); rows below it are redo states
-//                   (greyed). The row whose state is the last saved one is tagged "saved".
+//                   (greyed). The row whose state is the last saved one is tagged "saved" (the
+//                   first of a run: view steps after it have the same bytes).
 //
 // Clicking a row (or Up/Down/Home/End while the panel is focused) moves the document to that state
 // with one Document::undo()/redo() per step, so it is exactly what repeated Ctrl+Z / Ctrl+Y do.
 // The "Change" column is the byte range an action touched, found by comparing the piece lists of
-// neighbouring states (bounded work, visible rows only, cached).
+// neighbouring states (bounded work, visible rows only, cached). View steps (read-only toggle,
+// parser / Parse at: UndoEntry::view_only) change no byte. The "Time" column says when the action
+// happened ("just now", "5 min ago", "yesterday 14:03"; the full date in a tooltip).
 //
 // Self-contained (no App dependency). The history_* helpers below are core-only (no ImGui) so
 // tests/test_history.cpp can test them; HistoryPanel::draw() lives in panel_history.cpp.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <utility>
@@ -47,9 +52,16 @@ inline uint64_t history_state_id(const Document& d, size_t row) {
     const UndoEntry* e = history_entry(d, row);
     return e ? e->state_id : d.state_id();
 }
+// The bytes of row `row`. A view step stores none: they are those of its neighbour toward the
+// current row (see UndoEntry).
 inline const std::vector<Piece>& history_pieces(const Document& d, size_t row) {
-    const UndoEntry* e = history_entry(d, row);
-    return e ? e->pieces : d.table().pieces();
+    const size_t cur = history_current(d);
+    for (;;) {
+        const UndoEntry* e = history_entry(d, row);
+        if (!e) return d.table().pieces();
+        if (!e->view_only) return e->pieces;
+        row = row < cur ? row + 1 : row - 1;
+    }
 }
 // Name of the action that led to row `row`.
 inline std::string history_label(const Document& d, size_t row) {
@@ -64,6 +76,64 @@ inline std::string history_label(const Document& d, size_t row) {
         if (j < r.size()) l = &r[r.size() - 1 - j].label;
     }
     return l && !l->empty() ? *l : std::string("Edit");
+}
+
+// When the action that led to row `row` happened (UndoEntry::time_ms; 0 = unknown, and for row 0).
+inline int64_t history_time(const Document& d, size_t row) {
+    const auto& u = d.history_undo();
+    const auto& r = d.history_redo();
+    if (row == 0) return 0;
+    if (row <= u.size()) return u[row - 1].time_ms;
+    const size_t j = row - u.size() - 1;
+    return j < r.size() ? r[r.size() - 1 - j].time_ms : 0;
+}
+
+// Local calendar time of `ms` (since the Unix epoch).
+inline bool history_local_time(int64_t ms, std::tm& out) {
+    const std::time_t t = std::time_t(ms / 1000);
+#ifdef _WIN32
+    return localtime_s(&out, &t) == 0;
+#else
+    return localtime_r(&t, &out) != nullptr;
+#endif
+}
+
+// "just now" (under a minute, or a clock in the future), "N min ago" (under an hour), "today 14:03",
+// "yesterday 14:03", "Mon 14:03" (the last week), else "2026-11-02 14:03". Local time; "" for 0.
+inline std::string history_time_text(int64_t ms, int64_t now_ms) {
+    if (ms <= 0) return {};
+    if (now_ms - ms < 60000) return "just now";
+    if (now_ms - ms < 3600000) return std::to_string((now_ms - ms) / 60000) + " min ago";
+    std::tm t{}, n{};
+    if (!history_local_time(ms, t) || !history_local_time(now_ms, n)) return {};
+    // Whole calendar days between the two dates (noon avoids DST edges).
+    std::tm a = t, b = n;
+    a.tm_hour = b.tm_hour = 12;
+    a.tm_min = b.tm_min = a.tm_sec = b.tm_sec = 0;
+    a.tm_isdst = b.tm_isdst = -1;
+    const double days = std::difftime(std::mktime(&b), std::mktime(&a)) / 86400.0;
+    const int day = int(days + (days < 0 ? -0.5 : 0.5));
+    char hm[16];
+    std::snprintf(hm, sizeof hm, "%02d:%02d", t.tm_hour, t.tm_min);
+    if (day == 0) return std::string("today ") + hm;
+    if (day == 1) return std::string("yesterday ") + hm;
+    if (day > 1 && day < 7) {
+        static const char* kDays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+        return std::string(kDays[t.tm_wday % 7]) + " " + hm;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%04d-%02d-%02d %s", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, hm);
+    return buf;
+}
+
+// "2026-11-06 14:03:12" (local time; "" for 0): the tooltip of the Time column.
+inline std::string history_time_full(int64_t ms) {
+    std::tm t{};
+    if (ms <= 0 || !history_local_time(ms, t)) return {};
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%04d-%02d-%02d %02d:%02d:%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec);
+    return buf;
 }
 
 // Moves `d` to row `row` with one undo()/redo() per step. False if a step was refused (busy,

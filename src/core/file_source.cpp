@@ -39,6 +39,9 @@ public:
         int64_t got = f_->read_at(off, dst, n);
         return got < 0 ? 0 : size_t(got);
     }
+    bool data_range(uint64_t off, uint64_t& begin, uint64_t& end) const override {
+        return f_->data_range(off, begin, end);
+    }
     bool writable() const override { return w_; }
     bool write(uint64_t off, const uint8_t* src, size_t n) override { return w_ && f_->write_at(off, src, n); }
     bool flush() override { return !w_ || f_->flush(); }
@@ -212,6 +215,23 @@ const FileStat& FileSource::stat_at_open() const { return impl_->stat; }
 SourceKind FileSource::kind() const { return impl_->kind; }
 uint32_t FileSource::pid() const { return impl_->pid; }
 bool FileSource::sparse() const { return impl_->sparse; }
+
+bool FileSource::data_range(uint64_t offset, uint64_t& begin, uint64_t& end) const {
+    const Impl& im = *impl_;
+    if (im.kind != SourceKind::File) return false;
+    const uint64_t size = im.size.load();
+    if (offset >= size) {
+        begin = end = size;
+        return true;
+    }
+    auto be = im.handle();
+    uint64_t b = 0, e = 0;
+    if (!be || !be->data_range(offset, b, e)) return false;
+    begin = std::clamp(b, offset, size);  // the file may have grown since (live tail)
+    end = std::clamp(e, begin, size);
+    if (b >= size) end = begin = size;    // data only past our size: a hole up to it
+    return end > begin || begin == size;
+}
 bool FileSource::io_error() const { return impl_->io_error.load(); }
 
 uint64_t FileSource::epoch() const {
@@ -222,6 +242,11 @@ uint64_t FileSource::epoch() const {
 bool FileSource::alive() const {
     auto be = impl_->handle();
     return be && be->alive();
+}
+
+bool FileSource::read_denied() const {
+    auto be = impl_->handle();
+    return be && be->read_denied();
 }
 
 size_t FileSource::read(uint64_t offset, uint8_t* dst, size_t len) const {

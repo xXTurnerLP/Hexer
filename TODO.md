@@ -30,9 +30,23 @@
 
 ### v1 still to verify by hand
 Covered by unit tests and screenshot runs, but not yet exercised with real mouse/keyboard input:
-- [ ] Keyboard shortcut routing while text fields have focus (Ctrl+Tab, Ins, F2/F3)
-- [ ] Double-click editing in Inspector / Structure / Bookmarks, tab drag reordering, Ctrl+wheel zoom
-- [ ] Native file dialogs, drag & drop, long saves with Cancel, the external-change banner
+- [x] Keyboard shortcut routing while text fields have focus: one policy in `ui/input.h`
+      (`global_shortcut` / `text_editing_chord`: Ctrl+Z/Y/A/C/V/X, Ins, Del, arrows, Home/End,
+      Enter, Esc, Tab and typing keys stay in the field; Ctrl+Tab, F3, Ctrl+S, Ctrl+W... still
+      fire; caret actions Ctrl+B, F2, Alt+arrows, Ctrl+Enter, F6 do not); headless test_ui cases
+- [x] Double-click editing in Inspector / Structure / Bookmarks: one `InlineEdit` (ui/input.h,
+      headless test_ui cases: double-click, Enter commits as one undo step, Esc cancels, a click
+      elsewhere cancels byte edits / commits bookmark text, rejected values stay open); Enter
+      edits the selected Structure field too; Bookmarks got a row context menu (Edit name / note,
+      Select bytes, Copy offset, Delete)
+- [x] Tab drag reordering (order kept in the session, test_session case), middle-click closes a
+      tab (also the Compare tab), Ctrl+wheel zoom over the hex view / Compare tab with touchpad
+      fractions summed into whole steps (`wheel_steps`)
+- [x] Drag & drop (several files; folders skipped with a notification), long saves with Cancel
+      (disabled past the point of no return), the external-change banner: Reload (drops edits and
+      history: the file is the new original, bookmarks kept; test_core case) / Keep mine (Ignore
+      when clean) / Compare (with the file on disk)
+- [ ] Native file dialogs and OS drag & drop with a real mouse (not drivable headlessly)
 - [x] Linux build (CI compiles and tests linux-gcc + linux-clang on every push, 0 warnings)
 
 ### User feedback fixes
@@ -58,8 +72,13 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 ## Later
 - [x] History panel (View > History: every undo state with its label and changed range; click to
       undo / redo to it; "saved" tag)
-- [ ] History: relative time per entry (UndoEntry has no timestamp yet; needs the session format)
-- [ ] Undo for the remaining view-level actions that benefit from it (read-only toggle, chosen parser)
+- [x] History: relative time per entry ("just now", "5 min ago", "yesterday 14:03"; full date in
+      the tooltip; UndoEntry::time_ms, kept in the session, a typing run has its last edit's time)
+- [x] Undo for view-level actions: the read-only toggle, the chosen parser (Structure combo, palette,
+      C struct) and Parse at are cheap view steps (no piece list copy; undo while read-only works);
+      not scrolling, caret moves or the Packets panel's per-packet parse
+- [ ] History: a "Parse at" step drops the redo states like any step (undo a few edits, pick a
+      parser: the redo is gone); view steps that only rearrange the view could keep them
 - [x] Hashes & checksums of selection (Hashes panel: 16 CRCs/checksums/hashes, background, expected
       value match; `hx.hash` / `doc:hash`)
 - [ ] Custom hash algorithms registered from Lua (`hx.hash_algorithm{...}`)
@@ -68,8 +87,13 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Minimap: rescan only the buckets an edit touched (`EntropyJob::rescan`: the piece lists of
       the last scan and the new snapshot are compared; overwrites rescan their buckets, an insert /
       delete rescans from the edit on, a new bucket layout / process memory / a save rescans all)
-- [ ] Minimap: small regions inside huge sampled buckets can be missed (sampling); rescan
-      process memory incrementally (its bytes change underneath, today it is always rescanned)
+- [x] Minimap: small regions inside huge sampled buckets (sparse files: holes are known zeros via
+      FSCTL_QUERY_ALLOCATED_RANGES / SEEK_DATA, only data ranges are read, each gets a chunk; a
+      4 KiB block in a 1 TiB sparse file shows; `peak` / `nonzero`: a tick on the right edge marks a
+      dense 4 KiB chunk or a lone non-zero byte the bucket average hides)
+- [ ] Minimap: fully allocated huge zero areas (disk images) can still hide a small region between
+      samples; rescan process memory incrementally (its bytes change underneath without edits, so
+      reusing buckets would show stale data: today it is always rescanned)
 - [x] Structure → C header export (Structure panel "C Header" / row context menu: packed typedefs,
       deduped layouts, arrays, enums, bit fields, padding, static_asserts, `// @be`; converts back
       through C struct → parser to the same tree)
@@ -99,6 +123,18 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       the module's file on disk relocated to its base); the Disassembly's module symbols are only
       re-read on Refresh Memory / edits (a DLL loaded later has no labels until then)
 - [x] Compile and test core/procmem.cpp + core/devices.cpp on Linux (/proc/PID/mem, /sys/block)
+- [x] Process memory "all ??": a new process tab opened at address 0, inside the unmapped hole
+      (reads were fine); it now starts at the main module (`process_start_address`), Search > Next /
+      Previous Readable Region (`Alt+PgDn` / `Alt+PgUp`), a tab banner when the process exited or
+      its memory reads are refused (`Document::target_read_denied`). Holes are not collapsed in the
+      hex view (offset = address and the 64-bit row index stay linear); the minimap / scrollbar
+      track and the Regions panel show them
+- [x] Restart as Administrator (Windows; core/elevation): File menu / palette, both pickers, the
+      access-denied banner; hot exit carries the session, process / disk targets go on the
+      command line, the elevated instance waits for the old one (`--wait-pid`); "(Administrator)"
+      in the title
+- [ ] Restart as Administrator: verify the real UAC path by hand (automated runs use
+      `HEXER_TEST_RESTART_VERB=open`); a writable process tab comes back read-only
 - [ ] Verify by hand: Open Process / Open Disk pickers, writable process save, the Regions click
       (screenshots only so far)
 - [x] pcap/pcapng: Packets panel (index in the background, filter, "Parse with" a parser over each
@@ -143,8 +179,9 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       slot), the table is kept when an edit misses the bytes it was read from (SymbolTable::sources,
       compared piece by piece; size changes always rebuild), Go to Symbol filters a precomputed
       lowercase label text (1M symbols: ~10 ms per keystroke), doc:symbols reuses the panel's table
-- [ ] Symbols: keep the table across inserts / deletes after its sources (today any size change
-      rebuilds: some checks depend on the file size)
+- [x] Symbols: keep the table across inserts / deletes after its sources (SymbolTable::size_min /
+      size_max: each range check against the size is recorded; a Pe / Elf map's file_size is not
+      compared, its regions are)
 - [ ] Disassembly: branch arrows; a "Find references to" scan; PDB / DWARF names; i386 PIC PLT
       (jmp [ebx+X]) @plt names; symbols for a Manual base over a PE / ELF image (today: none)
 - [ ] Disassembly: other architectures (ARM / AArch64) only if asked (Zydis is x86 only)
@@ -162,9 +199,11 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] "Restore from .backup" (File menu, when `<file>.backup` exists): Compare with Backup side by
       side, Revert to Backup = one undoable edit referencing the backup file (nothing copied;
       disk untouched until Save; the .backup stays the original)
-- [ ] Revert to Backup: hot exit keeps a revert only up to 16 MiB (the session format has no second
-      file source; above that Hexer asks on exit) - store "whole file = <path>" pieces in the session
-- [ ] Live font reload from the Settings window (font file / hinting changes need a restart now)
+- [x] Revert to Backup across hot exit at any size: the session references the .backup by path
+      (+ size / mtime; a changed or vanished backup drops the states that need it, the current one
+      falls back to the file on disk, with a console line)
+- [x] Live font reload from the Settings window (font files / hinting apply right away; a path is
+      loaded when its field is left)
 - [x] Settings: remember the Bookmarks panel's "All open files" toggle
 - [ ] Headless App-level tests (session extras round trip of split / tail / parse at / Compare,
       the History and XOR panels' clicks): app.cpp is not linked by any test exe yet
@@ -177,7 +216,9 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Run parsers on a worker thread (script/parse_job.h: a Lua state of its own per parse over a
       read-only clone of the document; cancel, progress, stale results dropped; every parse is
       re-run after edits, debounced)
-- [ ] Background detect(): detection still runs on the UI thread (1 s limit per parser)
+- [x] Background detect() (DetectJob: each parser's detect in a state of its own over a clone,
+      "Detecting..." while slow, stale answers dropped; console / non-standalone parsers detect in
+      the main engine in their turn)
 - [x] Lua compiled as C++ (src/script/lua_onelua.cpp over the wrap's sources): a Lua error is a C++
       exception, destructors of live locals in our lua_CFunctions run (no more longjmp over C++
       frames, no HX_NOINLINE workaround); tested in debug / debugoptimized / release on MSVC

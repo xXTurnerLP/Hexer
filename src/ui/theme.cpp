@@ -173,6 +173,11 @@ Fonts load_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt) {
     return f;
 }
 
+Fonts reload_fonts(float ui_size_px, float mono_size_px, const FontOptions& opt) {
+    ImGui::GetIO().Fonts->ClearFonts();  // also unbinds them from the context and its draw lists
+    return load_fonts(ui_size_px, mono_size_px, opt);
+}
+
 void apply_dark_theme(float ui_scale) {
     if (ui_scale <= 0.0f) ui_scale = 1.0f;
     ImGuiStyle& s = ImGui::GetStyle();

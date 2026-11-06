@@ -13,6 +13,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
+#include "core/procmem.h"
 #include "core/util.h"
 
 namespace hx {
@@ -59,6 +60,20 @@ void jump_to_module(const ModuleInfo& m, uint64_t doc_size, const RegionsPanelCa
         return;
     }
     if (cb.jump) cb.jump(m.base, std::min(m.size, doc_size - m.base));
+}
+
+// Right-aligned on the current line: "Restart as Administrator" (only when cb.restart_elevated is set).
+void restart_button(const TargetsDialogCallbacks& cb, const std::string& target) {
+    if (!cb.restart_elevated) return;
+    const char* label = "Restart as Administrator";
+    const float w = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    ImGui::SameLine();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - w);
+    if (ImGui::Button(label)) cb.restart_elevated(target);
+    ImGui::SetItemTooltip("Keeps this session (unsaved edits included), starts Hexer with administrator rights "
+                          "(Windows asks first)%s%s and closes this window.",
+                          target.empty() ? "" : ", opens ", target.c_str());
 }
 
 const ImGuiTableFlags kTableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
@@ -186,6 +201,7 @@ void TargetsDialog::draw_process_picker(ImFont* mono, float s, const TargetsDial
         ImGui::Text("%s (%u)%s", sel->name.c_str(), sel->pid, process_writable ? ", writable" : "");
     else
         ImGui::TextColored(kDimColor, "%zu of %zu processes", rows.size(), procs_.size());
+    restart_button(cb, sel ? process_url(sel->pid) : std::string());
     if (sel && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
         open_now = true;
@@ -281,6 +297,7 @@ void TargetsDialog::draw_disk_picker(ImFont* mono, float s, const TargetsDialogC
     ImGui::BeginDisabled(disk_path.empty() || !cb.open_device);
     if (ImGui::Button("Open")) open_now = true;
     ImGui::EndDisabled();
+    restart_button(cb, disk_path);
     if (open_now && !disk_path.empty() && cb.open_device) {
         std::string err;
         if (cb.open_device(disk_path, disk_writable, &err)) {

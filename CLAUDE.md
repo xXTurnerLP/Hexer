@@ -11,8 +11,14 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
   The hex view scrolls by its own 64-bit row index with a custom scrollbar.
 - **Full undo history** (Ctrl+Z / Ctrl+Y) for every content and bookmark change; it survives saves and
   restarts (session). New mutating features must go through `Document` so they are undoable.
+  View-level settings worth undoing (read-only toggle, parser, Parse at) are cheap view steps via
+  `Document::set_view_options` (no piece list copy; `UndoEntry::view_only`); caret moves and
+  scrolling are not undo steps. Every step has a wall-clock `time_ms` (History panel "Time").
 - **Hot exit** (Sublime-style): no "save changes?" prompts on exit; unsaved edits + history + view
   state persist in the session dir and restore on launch. Only edits are stored, never the original file.
+  Other files a document reads (Revert to Backup's `.backup`) are referenced by path + size + mtime
+  (`PersistedDoc::ref_files`), never copied. A session format change bumps `kVersion` in
+  session.cpp and keeps every older version loading (fixtures in tests/test_session.cpp).
 - **KISS**: plain structs, few abstractions, no new dependencies without a clear reason.
   Prefer one obvious way. UI is immediate-mode; keep state in `Document::view()` / small structs.
 - UTF-8 strings/paths everywhere (`os_file` converts to UTF-16 on Windows).
@@ -20,7 +26,9 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
 ## Layout
 ```
 src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device / process memory),
-             procmem (process memory backend, "process://<pid>" URLs), devices (process / disk /
+             procmem (process memory backend, "process://<pid>" URLs, start address, readable
+             run stepping), elevation (Restart as Administrator: TokenElevation, Windows
+             command-line quoting, the elevated launch + injectable launcher), devices (process / disk /
              memory region / module lists), piece_table, highlight, document (edits, undo, save, targets,
              extras), session (hot exit + per-doc / session extras), search, inspector, util (goto
              exprs, copy-as, paste parse), settings (+ paths), nav (PointerType, follow pointer +
@@ -45,12 +53,13 @@ src/script/  script_engine.h (Lua API contract — the header comment is the API
              C++ TU: Lua errors are C++ exceptions; include "lua.h" etc., never lua.hpp),
              cexport (parse tree -> C header, opts.flags names; no Lua, but on Field so it lives here), parse_job (ParseJob: one parse on a worker
              thread in a ScriptEngine of its own over Document::clone_readonly)
-src/ui/      theme (dark theme, fonts, palette), hex_view (the widget), panels, app (main loop,
+src/ui/      theme (dark theme, fonts + live reload_fonts, palette), hex_view (the widget), panels, app (main loop,
              menus, shortcuts, tabs, Compare tab, live tail, split view, minimap wiring, session
              extras, ScriptHost impl); self-contained feature UIs without App dependency:
              panel_strings, panel_hash, dialog_cstruct, panel_bitmap, panel_packets, panel_history,
              panel_xor, dialog_targets (Open Process / Open Disk + RegionsPanel) (App owns one of
-             each), minimap (one per tab, in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
+             each), minimap (one per tab, in hexer_ui_view), input (shortcut routing policy,
+             InlineEdit row editor, Ctrl+wheel steps; in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
              panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly);
              panel_bitmap / panel_packets / view_diff / panel_strings / panel_xor are in
              hexer_ui_view too (headless tests: test_panels / test_diffview)
@@ -121,7 +130,11 @@ Point"`, `"Disassemble at Cursor"`, `"Disassembly: Follow Target"`, `"Go to Symb
 label works too, e.g. `"Parser: PNG image"` then `"Structure: Parse at Cursor"`; repeatable; all
 actions of one run execute in the same frame, so e.g. "Compare: Next Difference" right after
 "Compare with: ..." finds no result yet). A process opens from the command line as
-`"process://<pid>"` (read-only); `settings.ini` `pointer_width = 2` preselects the uint16 Inspector row.
+`"process://<pid>"` (read-only) and starts at its main module (`process_start_address`);
+`"Next Readable Region"` / `"Previous Readable Region"` step over its holes. `"Restart as
+Administrator"` (Windows, not elevated) with `HEXER_TEST_RESTART_VERB=open` in the environment
+starts the new instance without UAC (ShellExecuteExW verb override), so the handover runs unattended;
+`settings.ini` `pointer_width = 2` preselects the uint16 Inspector row.
 Settings drive what actions cannot: put e.g. `bitmap_format = RGB 24-bit` or `minimap = classes`
 in `<config-dir>/settings.ini` before a screenshot run. The real mouse cursor is not hidden: if it
 sits over the window, its hover tooltip shows up in the screenshot.
@@ -134,12 +147,35 @@ renderer). The `Ui` fixture owns a Document + HexView in a full-size host window
 mods)`, `ui.drag(a, b)`, `ui.key(ImGuiKey_X, mods)`, `ui.type("ab")` queue io events one frame each,
 and `ui.hex(off)` / `ui.txt(off)` give the screen position of a drawn byte (`HexView::cell_pos`).
 Every change to input handling or hit testing in `ui/hex_view.cpp` gets a case there.
-Use `Document::set_clock_for_tests` for undo-merge timing.
+Use `Document::set_clock_for_tests` for undo-merge timing and step times (`Document::now_ms`). The `Form` fixture there drives
+`ui/input.h`: shortcut routing while a text field has focus and the inline row editor.
 
-Structure panel parses: `update_structure()` (panels.cpp) starts a `ParseJob` (detect() stays on
-the UI thread) and adopts its result when it is done and still matches the inputs (generation,
-script reload, parser, Parse at range); a mismatching job is cancelled into `StructureState::retired`.
-Don't call `ScriptEngine::parse` from the UI for the panel; it stays the synchronous API (tests).
+Shortcut routing (`ui/input.h`, the one policy): the action table's `in_text` says whether an
+action may fire while a text field has focus, and `global_shortcut()` never fires a
+text-editing chord then (`text_editing_chord()`: Ctrl+Z/Y/A/C/V/X, Ins, Del, arrows, Home/End,
+Enter, Esc, Tab, typing keys). Global actions (Ctrl+Tab, F3, Ctrl+S...) set `in_text`; actions
+on the document caret (Ctrl+B, F2, Alt+arrows, Ctrl+Enter, F6) do not.
+Inline row edits (Inspector value, Structure field, Bookmark name / note) all use `InlineEdit` +
+`inline_edit_input()`: double-click / context menu "Edit ..." / Enter on the selected row begins,
+Enter commits (one undo step through Document), Esc cancels; a click elsewhere cancels byte edits
+and commits bookmark text. External change: Reload drops edits + history (the file on disk is
+the new original; bookmarks and the view stay), Keep mine hides the banner for that file version.
+
+Structure panel parses: `update_structure()` (panels.cpp) starts a `ParseJob` (in Auto mode a
+`DetectJob` first: detect() on a worker too, "Detecting..." while slow; its answer is used only while
+`DetectJob::current()`) and adopts its result when it is done and still matches the inputs (generation,
+script reload, parser, Parse at range); a mismatching job is cancelled into `StructureState::retired`
+(`retired_detect`). Don't call `ScriptEngine::parse` / `detect_parser` from the UI for the panel;
+they stay the synchronous API (tests, scripts).
+
+Minimap sampling (core/entropy): holes of sparse files are known zeros (`snapshot_data_ranges` over
+`FileSource::data_range`: FSCTL_QUERY_ALLOCATED_RANGES / SEEK_DATA+SEEK_HOLE), only data ranges are
+read and each gets a chunk; `EntropyBucket::peak` / `nonzero` + `entropy_spot()` mark small dense
+regions the average hides (a tick on the minimap's right edge).
+
+Symbol tables survive size changes after every table: `SymbolTable::size_min / size_max` record how
+the build's range checks against the size came out (every check goes through `Reader::fits` /
+`clamp_end`; keep it that way when adding table readers), Pe / Elf map file_size is not compared.
 
 Follow pointer type: `Settings::pointer_type()` (width / signed / relative / base + the Inspector's
 LE/BE) is the one source; clicking an integer Inspector row sets it, `follow_pointer_as()`
@@ -164,8 +200,10 @@ Persistence (every new window / option must land in exactly one of these; nothin
 - **Dock layout, window positions, table columns**: ImGui's `layout.ini` (not panel visibility).
 - **Per-file view state** (only things that belong to one file): `Document::set_extra` in
   `save_tab_extras()` (app.cpp) or the panel's `save_extras(Document&)` (Disassembly, Packets),
-  back in `restore_tab_extras()` / `restore_extras()`. Keys today: parse.*, tail.enabled,
-  split.*, edit.insert, nav.back / nav.fwd, disasm.*, packets.filter / packets.parser.
+  back in `restore_tab_extras()` / `restore_extras()`. Keys today: tail.enabled,
+  split.*, edit.insert, nav.back / nav.fwd, disasm.*, packets.filter / packets.parser. The parser
+  and Parse at range are `ViewState::parser` / `parse_base` / `parse_length` (session format v4;
+  undoable; v3 sessions' parse.* extras are migrated on load).
 - **Session working context spanning tabs**: `Session::set_extra` in `save_session_extras()`,
   restored by `restore_session_extras()` / `restore_context_extras()`, and mixed into
   `session_signature()` so a change triggers a save: compare.0 / active, find.pattern,
@@ -175,7 +213,12 @@ Persistence (every new window / option must land in exactly one of these; nothin
   Selection radios (the actions set them), Writable checkboxes (safety), the Settings window.
 Packets / Regions auto-open when a capture / process is newly opened (`add_tab`), not when the
 session restores one (`App::restoring`): the saved `panel_*` visibility wins. Process documents
-are not persistable: the session skips them (hot exit drops them with a console line). The Disassembly panel keeps its per-doc
+are not persistable: the session skips them (hot exit drops them with a console line). Restart as
+Administrator (`restart_as_admin`, protocol in core/elevation.h) therefore puts them on the elevated
+instance's command line, refuses edits the restart would lose, writes the session, launches, and
+quits only after the launch succeeded; the new instance's `--wait-pid` waits for the old one to exit
+(session lock + last writes) before it loads anything (an instance run with `--no-session` passes
+that on). The Disassembly panel keeps its per-doc
 state ("disasm.map" / "disasm.base" / "disasm.top") itself: `DisasmPanel::save_extras` /
 `restore_extras`, called next to the tab extras.
 

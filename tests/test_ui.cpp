@@ -12,15 +12,18 @@
 
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "imgui.h"
+#include "misc/cpp/imgui_stdlib.h"
 
 #include "core/document.h"
 #include "core/entropy.h"
 #include "core/highlight.h"
 #include "ui/hex_view.h"
+#include "ui/input.h"
 #include "ui/minimap.h"
 #include "ui/theme.h"
 
@@ -1056,4 +1059,409 @@ TEST_CASE("ui: take_scroll_request hands a pending scroll over instead of applyi
     ui.frame();
     CHECK(ui.v().top_row > 0);  // an untaken one still is
     CHECK_FALSE(ui.view.take_scroll_request(off, center));
+}
+
+// =============================================================================================
+// Ctrl+wheel (zoom), shortcut routing while a text field has focus, inline row editing
+// (ui/input.h)
+// =============================================================================================
+
+TEST_CASE("ui: Ctrl+wheel over the hex view does not scroll it (the app zooms); a plain wheel does") {
+    Ui ui(iota_bytes(64 * 1024));
+    ui.move(ui.hex(20));
+    ui.mods(ImGuiMod_Ctrl, true);
+    ImGui::GetIO().AddMouseWheelEvent(0.0f, -1.0f);
+    ui.frame();
+    ui.frame();
+    CHECK(ui.v().top_row == 0);
+    ui.mods(ImGuiMod_Ctrl, false);
+    ImGui::GetIO().AddMouseWheelEvent(0.0f, -1.0f);
+    ui.frame();
+    ui.frame();
+    CHECK(ui.v().top_row > 0);
+}
+
+TEST_CASE("ui: wheel_steps turns wheel notches and touchpad fractions into whole zoom steps") {
+    float acc = 0.0f;
+    CHECK(wheel_steps(acc, 0.0f) == 0);
+    CHECK(wheel_steps(acc, 1.0f) == 1);
+    CHECK(wheel_steps(acc, -1.0f) == -1);
+    CHECK(wheel_steps(acc, 2.0f) == 2);  // a fast flick: two steps at once
+    // A touchpad sends tenths: one step per whole notch, not one per event.
+    int steps = 0;
+    for (int i = 0; i < 10; ++i) steps += wheel_steps(acc, 0.1f);
+    CHECK(steps == 1);
+    for (int i = 0; i < 4; ++i) steps += wheel_steps(acc, 0.1f);
+    CHECK(steps == 1);
+    // Turning back drops the leftover 0.4 instead of first unwinding it.
+    steps = 0;
+    for (int i = 0; i < 10; ++i) steps += wheel_steps(acc, -0.1f);
+    CHECK(steps == -1);
+}
+
+namespace {
+
+ImGuiKeyChord ch(int mods, ImGuiKey k) { return ImGuiKeyChord(mods) | ImGuiKeyChord(k); }
+constexpr int kC = ImGuiMod_Ctrl, kS = ImGuiMod_Shift, kA = ImGuiMod_Alt;
+
+}  // namespace
+
+TEST_CASE("ui: text_editing_chord: the keys a focused text field keeps") {
+    const ImGuiKeyChord field_keys[] = {
+        ch(kC, ImGuiKey_Z), ch(kC, ImGuiKey_Y), ch(kC | kS, ImGuiKey_Z), ch(kC, ImGuiKey_A), ch(kC, ImGuiKey_C),
+        ch(kC, ImGuiKey_V), ch(kC, ImGuiKey_X), ch(0, ImGuiKey_Insert), ch(kS, ImGuiKey_Insert),
+        ch(0, ImGuiKey_Delete), ch(0, ImGuiKey_Backspace), ch(0, ImGuiKey_LeftArrow), ch(kA, ImGuiKey_LeftArrow),
+        ch(kC | kS, ImGuiKey_RightArrow), ch(0, ImGuiKey_Home), ch(0, ImGuiKey_End), ch(0, ImGuiKey_PageDown),
+        ch(0, ImGuiKey_Enter), ch(kC, ImGuiKey_Enter), ch(0, ImGuiKey_Escape), ch(0, ImGuiKey_Tab),
+        ch(kS, ImGuiKey_Tab), ch(0, ImGuiKey_G), ch(kS, ImGuiKey_7), ch(0, ImGuiKey_Space), ch(0, ImGuiKey_Minus),
+        ch(0, ImGuiKey_KeypadAdd),
+        ch(kC | kA, ImGuiKey_Q),  // AltGr+Q types '@' on a German layout
+    };
+    for (ImGuiKeyChord k : field_keys) CHECK_MESSAGE(text_editing_chord(k), "chord " << int(k));
+    const ImGuiKeyChord app_keys[] = {
+        ch(kC, ImGuiKey_Tab), ch(kC | kS, ImGuiKey_Tab), ch(0, ImGuiKey_F3), ch(kS, ImGuiKey_F3), ch(0, ImGuiKey_F2),
+        ch(kC, ImGuiKey_S), ch(kC | kS, ImGuiKey_S), ch(kC, ImGuiKey_W), ch(kC, ImGuiKey_F), ch(kC, ImGuiKey_G),
+        ch(kC, ImGuiKey_B), ch(kC | kS, ImGuiKey_C), ch(kC | kS, ImGuiKey_P), ch(kC, ImGuiKey_Equal),
+        ch(kC, ImGuiKey_Minus), ch(kC, ImGuiKey_KeypadAdd), ch(0, ImGuiKey_F5),
+    };
+    for (ImGuiKeyChord k : app_keys) CHECK_MESSAGE(!text_editing_chord(k), "chord " << int(k));
+}
+
+namespace {
+
+// A host window with a button (somewhere else to click), one list row that edits in place like
+// the Inspector / Structure / Bookmarks rows, a text field, and global shortcuts polled after them
+// like App's handle_shortcuts.
+struct Form {
+    struct Sc {
+        ImGuiKeyChord chord;
+        bool in_text;
+        int fired;
+    };
+    ImGuiContext* ctx = nullptr;
+    std::string field = "abc";
+    bool focus_field = false;
+    InlineEdit edit;
+    std::string row_text = "old";
+    bool commit_on_blur = false;
+    int committed = 0, cancelled = 0;
+    std::string last_commit;
+    std::vector<Sc> shortcuts;
+    ImVec2 other_pos, row_pos, field_pos;
+
+    Form() {
+        ctx = ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.LogFilename = nullptr;
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+        io.Fonts->AddFontDefault();
+        frame();
+        frame();
+    }
+    ~Form() { ImGui::DestroyContext(ctx); }
+
+    static ImVec2 centre() {
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        return ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+    }
+    void frame(float dt = 1.0f / 60.0f) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(600.0f, 400.0f);
+        io.DeltaTime = dt;
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(600.0f, 400.0f));
+        ImGui::Begin("host", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::Button("other");
+        other_pos = centre();
+        if (edit.active(0, 7)) {
+            const int res = inline_edit_input(edit, commit_on_blur);
+            if (res > 0) {
+                committed++;
+                last_commit = edit.buf;
+                row_text = edit.buf;
+            }
+            if (res < 0) cancelled++;
+            if (res != 0) edit.end();
+        } else if (ImGui::Selectable(row_text.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick) &&
+                   ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            edit.begin(0, 7, row_text);
+        }
+        row_pos = centre();
+        if (focus_field) {
+            ImGui::SetKeyboardFocusHere();
+            focus_field = false;
+        }
+        ImGui::InputText("##field", &field);
+        field_pos = centre();
+        for (Sc& s : shortcuts) s.fired += global_shortcut(s.chord, s.in_text, false) ? 1 : 0;
+        ImGui::End();
+        ImGui::Render();
+    }
+    void settle() { frame(1.0f); }
+    void move(ImVec2 p) {
+        ImGui::GetIO().AddMousePosEvent(p.x, p.y);
+        frame();
+    }
+    void button(bool down) {
+        ImGui::GetIO().AddMouseButtonEvent(0, down);
+        frame();
+    }
+    void click(ImVec2 p) {
+        move(p);
+        button(true);
+        button(false);
+        settle();
+    }
+    void double_click(ImVec2 p) {
+        move(p);
+        button(true);
+        button(false);
+        button(true);
+        button(false);
+        frame();
+        frame();
+    }
+    void mods(int m, bool down) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (m & ImGuiMod_Ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, down);
+        if (m & ImGuiMod_Shift) io.AddKeyEvent(ImGuiMod_Shift, down);
+        if (m & ImGuiMod_Alt) io.AddKeyEvent(ImGuiMod_Alt, down);
+        if (m) frame();
+    }
+    void key(ImGuiKeyChord chord) {
+        const int m = int(chord & ImGuiMod_Mask_);
+        const ImGuiKey k = ImGuiKey(chord & ~ImGuiMod_Mask_);
+        mods(m, true);
+        ImGui::GetIO().AddKeyEvent(k, true);
+        frame();
+        ImGui::GetIO().AddKeyEvent(k, false);
+        frame();
+        mods(m, false);
+    }
+    void type(const char* s) {
+        for (; *s; ++s) {
+            ImGui::GetIO().AddInputCharacter(unsigned(uint8_t(*s)));
+            frame();
+        }
+    }
+    size_t add(ImGuiKeyChord chord, bool in_text) {
+        shortcuts.push_back({chord, in_text, 0});
+        return shortcuts.size() - 1;
+    }
+    int fired(size_t i) const { return shortcuts[i].fired; }
+};
+
+}  // namespace
+
+TEST_CASE("ui: shortcuts while a text field has focus: global ones fire, text-editing keys stay in the field") {
+    Form f;
+    const size_t next_tab = f.add(ch(kC, ImGuiKey_Tab), true);
+    const size_t prev_tab = f.add(ch(kC | kS, ImGuiKey_Tab), true);
+    const size_t find_next = f.add(ch(0, ImGuiKey_F3), true);
+    const size_t find_prev = f.add(ch(kS, ImGuiKey_F3), true);
+    const size_t save = f.add(ch(kC, ImGuiKey_S), true);
+    const size_t undo = f.add(ch(kC, ImGuiKey_Z), false);
+    const size_t sel_all = f.add(ch(kC, ImGuiKey_A), false);
+    const size_t ins = f.add(ch(0, ImGuiKey_Insert), true);  // in_text or not: the field's key
+    const size_t bookmark = f.add(ch(kC, ImGuiKey_B), false);
+    const size_t next_bm = f.add(ch(0, ImGuiKey_F2), false);
+    const size_t home = f.add(ch(0, ImGuiKey_Home), true);
+
+    f.focus_field = true;
+    f.frame();
+    f.frame();
+    f.frame();  // io.WantTextInput follows a frame later
+    REQUIRE(ImGui::GetIO().WantTextInput);
+    f.key(ImGuiKey_End);
+    f.type("d");
+    CHECK(f.field == "abcd");
+    const ImGuiKeyChord pressed[] = {ch(kC, ImGuiKey_Tab), ch(kC | kS, ImGuiKey_Tab), ch(0, ImGuiKey_F3),
+                                     ch(kS, ImGuiKey_F3),  ch(kC, ImGuiKey_S),        ch(0, ImGuiKey_Insert),
+                                     ch(kC, ImGuiKey_B),   ch(0, ImGuiKey_F2),        ch(0, ImGuiKey_Home)};
+    for (ImGuiKeyChord k : pressed) f.key(k);
+    CHECK(f.fired(next_tab) == 1);
+    CHECK(f.fired(prev_tab) == 1);
+    CHECK(f.fired(find_next) == 1);
+    CHECK(f.fired(find_prev) == 1);
+    CHECK(f.fired(save) == 1);
+    CHECK(f.fired(ins) == 0);
+    CHECK(f.fired(bookmark) == 0);  // acts on the document caret: not while typing
+    CHECK(f.fired(next_bm) == 0);
+    CHECK(f.fired(home) == 0);
+    REQUIRE(ImGui::GetIO().WantTextInput);  // none of them took the focus away
+    // Ctrl+Z / Ctrl+A edit the field, not the document.
+    f.key(ch(kC, ImGuiKey_Z));
+    CHECK(f.field == "abc");
+    f.key(ch(kC, ImGuiKey_A));
+    f.type("x");
+    CHECK(f.field == "x");
+    CHECK(f.fired(undo) == 0);
+    CHECK(f.fired(sel_all) == 0);
+
+    // Without a focused text field every shortcut fires.
+    f.click(f.other_pos);
+    REQUIRE_FALSE(ImGui::GetIO().WantTextInput);
+    const ImGuiKeyChord pressed2[] = {ch(kC, ImGuiKey_Z),  ch(kC, ImGuiKey_A), ch(0, ImGuiKey_Insert),
+                                      ch(kC, ImGuiKey_B),  ch(0, ImGuiKey_F2), ch(0, ImGuiKey_F3),
+                                      ch(kC, ImGuiKey_Tab)};
+    for (ImGuiKeyChord k : pressed2) f.key(k);
+    CHECK(f.fired(undo) == 1);
+    CHECK(f.fired(sel_all) == 1);
+    CHECK(f.fired(ins) == 1);
+    CHECK(f.fired(bookmark) == 1);
+    CHECK(f.fired(next_bm) == 1);
+    CHECK(f.fired(find_next) == 2);
+    CHECK(f.fired(next_tab) == 2);
+    CHECK(f.field == "x");
+}
+
+TEST_CASE("ui: inline row edit: double-click begins with all selected, Enter commits, Esc cancels") {
+    Form f;
+    f.double_click(f.row_pos);
+    REQUIRE(f.edit.active(0, 7));
+    CHECK(ImGui::GetIO().WantTextInput);
+    f.type("42");  // replaces the selected text
+    CHECK(f.edit.buf == "42");
+    f.key(ImGuiKey_Enter);
+    CHECK(f.committed == 1);
+    CHECK(f.last_commit == "42");
+    CHECK_FALSE(f.edit.active(0, 7));
+    f.frame();
+    CHECK_FALSE(ImGui::GetIO().WantTextInput);
+
+    f.settle();
+    f.double_click(f.row_pos);
+    REQUIRE(f.edit.active(0, 7));
+    f.type("zz");
+    f.key(ImGuiKey_Escape);
+    CHECK(f.cancelled == 1);
+    CHECK(f.committed == 1);
+    CHECK(f.row_text == "42");
+    CHECK_FALSE(f.edit.active(0, 7));
+
+    // A single click only selects the row.
+    f.settle();
+    f.click(f.row_pos);
+    CHECK_FALSE(f.edit.active(0, 7));
+}
+
+TEST_CASE("ui: inline row edit: clicking elsewhere cancels byte edits and commits text edits") {
+    Form f;
+    // Inspector / Structure (commit_on_blur false): the click cancels.
+    f.double_click(f.row_pos);
+    REQUIRE(f.edit.active(0, 7));
+    f.type("9");
+    f.click(f.other_pos);
+    CHECK(f.cancelled == 1);
+    CHECK(f.committed == 0);
+    CHECK(f.row_text == "old");
+
+    // Bookmarks (commit_on_blur true): the click commits an edit...
+    f.commit_on_blur = true;
+    f.settle();
+    f.double_click(f.row_pos);
+    REQUIRE(f.edit.active(0, 7));
+    f.type("new name");
+    f.click(f.field_pos);  // into another text field, say
+    CHECK(f.committed == 1);
+    CHECK(f.row_text == "new name");
+    // ...and cancels when nothing was typed.
+    f.click(f.other_pos);
+    f.double_click(f.row_pos);
+    REQUIRE(f.edit.active(0, 7));
+    f.click(f.other_pos);
+    CHECK(f.committed == 1);
+    CHECK(f.cancelled == 2);
+}
+
+TEST_CASE("ui: inline row edit: a rejected value keeps the editor open with the error") {
+    Form f;
+    f.double_click(f.row_pos);
+    REQUIRE(f.edit.active(0, 7));
+    f.type("bad");
+    // What a panel does when its commit rejects the value: retry instead of ending the edit.
+    f.edit.retry("not a number");
+    for (int i = 0; i < 4; ++i) f.frame();
+    CHECK(f.edit.active(0, 7));
+    CHECK(f.edit.error == "not a number");
+    CHECK(ImGui::GetIO().WantTextInput);
+    f.key(ch(kC, ImGuiKey_A));
+    f.type("1");
+    f.key(ImGuiKey_Enter);
+    CHECK(f.committed == 1);
+    CHECK(f.last_commit == "1");
+}
+
+// ---- live font reload (Settings window) ------------------------------------------------------
+
+namespace {
+
+// Distinct coverage values of glyph `c` as baked at `size` (fonts bake on demand: draw it first).
+std::set<int> glyph_levels(ImFont* font, float size, ImWchar c) {
+    std::set<int> levels;
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    ImFontGlyph* g = font->GetFontBaked(size)->FindGlyph(c);
+    ImFontAtlasRect r;
+    if (!g || g->PackId < 0 || !atlas->GetCustomRect(g->PackId, &r)) return levels;
+    ImTextureData* tex = atlas->TexData;
+    for (int y = r.y; y < r.y + r.h; ++y)
+        for (int x = r.x; x < r.x + r.w; ++x) {
+            const auto* px = static_cast<const unsigned char*>(tex->GetPixelsAt(x, y));
+            levels.insert(tex->Format == ImTextureFormat_Alpha8 ? px[0] : px[3]);
+        }
+    return levels;
+}
+
+void font_frame(ImFont* mono) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(400, 200);
+    io.DeltaTime = 1.0f / 60.0f;
+    ImGui::NewFrame();
+    ImGui::Begin("fonts");
+    ImGui::PushFont(mono, 20.0f);
+    ImGui::TextUnformatted("W0x1F");
+    ImGui::PopFont();
+    ImGui::End();
+    ImGui::Render();
+}
+
+}  // namespace
+
+TEST_CASE("fonts: reload_fonts applies a hinting change live, without leaking fonts") {
+    ImGuiContext* ctx = ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    FontOptions opt;
+    opt.hinting = "normal";
+    Fonts f = load_fonts(16.0f, 16.0f, opt);
+    REQUIRE(f.mono);
+    font_frame(f.mono);
+    const int fonts = io.Fonts->Fonts.Size;
+    const std::set<int> normal = glyph_levels(f.mono, 20.0f, 'W');
+
+    FontOptions mono = opt;
+    mono.hinting = "mono";
+    CHECK_FALSE(same_font_options(opt, mono));
+    CHECK(same_font_options(opt, opt));
+    Fonts g = reload_fonts(16.0f, 16.0f, mono);
+    REQUIRE(g.mono);
+    CHECK(io.Fonts->Fonts.Size == fonts);  // the old fonts are gone, not piled up
+    CHECK(io.FontDefault == g.ui);
+    CHECK(g.mono_path == f.mono_path);
+    font_frame(g.mono);  // the next frame draws with the new fonts
+    font_frame(g.mono);
+    if (g.freetype) {
+        // Anti-aliased before, aliased (coverage 0 / 255 only) after: the glyphs were re-rasterised.
+        CHECK(normal.size() > 2);
+        const std::set<int> aliased = glyph_levels(g.mono, 20.0f, 'W');
+        CHECK_FALSE(aliased.empty());
+        CHECK(aliased.size() <= 2);
+        for (int v : aliased) CHECK((v == 0 || v == 255));
+    }
+    ImGui::DestroyContext(ctx);
 }

@@ -99,8 +99,11 @@ EntropyBucket entropy_aggregate(const EntropyResult& r, uint64_t begin, uint64_t
         out.done = true;
         out.sampled |= b.sampled;
         out.unreadable |= b.unreadable;
+        out.nonzero |= b.nonzero;
+        out.peak = std::max(out.peak, b.peak);
         out.bytes_read += b.bytes_read;
-        if (!b.bytes_read) continue;  // unreadable from its first byte: no data to average
+        out.hole_bytes += b.hole_bytes;
+        if (!b.bytes_read && !b.hole_bytes) continue;  // unreadable from its first byte: no data
         const double bw = double(b.length);
         w += bw;
         h += bw * double(b.entropy);
@@ -109,6 +112,53 @@ EntropyBucket entropy_aggregate(const EntropyResult& r, uint64_t begin, uint64_t
     if (w > 0.0) {
         out.entropy = float(h / w);
         for (int c = 0; c < kByteClassCount; ++c) out.class_frac[c] = float(cls[c] / w);
+    }
+    return out;
+}
+
+bool entropy_spot(const EntropyBucket& b) {
+    if (!b.done) return false;
+    if (b.peak >= b.entropy + kEntropySpotBits) return true;
+    return b.nonzero && b.class_frac[int(ByteClass::Zero)] >= 0.999f;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> snapshot_data_ranges(const Snapshot& snap, uint64_t lo, uint64_t hi,
+                                                                size_t max_ranges) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    hi = std::min(hi, snap.size());
+    if (lo >= hi || snap.pieces.empty() || snap.starts.size() != snap.pieces.size()) {
+        if (lo < hi) out.emplace_back(lo, hi);
+        return out;
+    }
+    auto add = [&out](uint64_t from, uint64_t to) {
+        if (from >= to) return;
+        if (!out.empty() && out.back().second == from) out.back().second = to;
+        else out.emplace_back(from, to);
+    };
+    size_t i = size_t(std::upper_bound(snap.starts.begin(), snap.starts.end(), lo) - snap.starts.begin()) - 1;
+    for (; i < snap.pieces.size() && snap.starts[i] < hi; ++i) {
+        const Piece& p = snap.pieces[i];
+        const uint64_t ps = snap.starts[i];
+        const uint64_t a = std::max(lo, ps), b = std::min(hi, ps + p.len);
+        const FileSource* src =
+            p.src == Piece::Original && p.chunk < snap.sources.size() ? snap.sources[p.chunk].get() : nullptr;
+        for (uint64_t pos = a; pos < b;) {
+            uint64_t db = 0, de = 0;
+            if (out.size() >= max_ranges) {  // enough: the rest counts as data
+                add(pos, hi);
+                return out;
+            }
+            const uint64_t off = p.start + (pos - ps);  // in the source
+            if (!src || !src->data_range(off, db, de) || db < off) {  // unknown: all data
+                add(pos, b);
+                break;
+            }
+            if (db >= de || db - p.start >= b - ps) break;  // only a hole up to b
+            const uint64_t lb = ps + (db - p.start);
+            const uint64_t le = std::min(b, ps + (std::min(de, p.start + p.len) - p.start));
+            add(lb, le);
+            pos = le;
+        }
     }
     return out;
 }
@@ -181,6 +231,8 @@ namespace {
 
 constexpr size_t kSampleChunk = 4096;      // sampled buckets read chunks of this size
 constexpr size_t kReadBlock = size_t(1) << 20;  // full buckets are read in blocks of this size
+constexpr size_t kMaxDataRanges = 64;      // data ranges of a sparse file sampled per bucket (each
+                                           // gets >= 1 chunk: at most 256 KiB over the budget)
 
 std::atomic<void (*)(uint32_t)> g_bucket_hook{nullptr};
 
@@ -189,6 +241,18 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
                     const std::atomic<bool>& cancel, std::vector<uint8_t>& buf, uint64_t& io_at) {
     uint64_t counts[256] = {};
     const uint64_t end = b.offset + b.length;
+    // Counts the bytes, 4 KiB chunk by chunk (peak / nonzero).
+    auto count = [&](const uint8_t* p, size_t n) {
+        for (size_t q = 0; q < n; q += kSampleChunk) {
+            const size_t m = std::min(kSampleChunk, n - q);
+            uint64_t c[256] = {};
+            for (size_t i = 0; i < m; ++i) ++c[p[q + i]];
+            for (int v = 0; v < 256; ++v) counts[v] += c[v];
+            if (c[0] == m) continue;
+            b.nonzero = true;
+            b.peak = std::max(b.peak, shannon_entropy(c));
+        }
+    };
     // Reads the readable bytes of [off, off + len), skipping holes of a sparse source (they mark
     // the bucket unreadable). False (and marks the bucket) at a genuine I/O error.
     auto take = [&](uint64_t off, size_t len) {
@@ -197,8 +261,7 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
         while (off < stop) {
             const size_t want = size_t(stop - off);
             const size_t got = snap.read_valid(off, buf.data(), want);
-            const uint8_t* p = buf.data();
-            for (size_t i = 0; i < got; ++i) ++counts[p[i]];
+            count(buf.data(), got);
             b.bytes_read += got;
             if (got == want) break;
             b.unreadable = true;
@@ -212,6 +275,18 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
         }
         return true;
     };
+    // One chunk at `at` (at most up to `limit`, the next chunk's position, and `rend`, the end of
+    // its data range). A chunk that starts in a hole of process memory moves to the next readable
+    // byte unless that is past `limit`. False at an I/O error.
+    auto chunk_at = [&](uint64_t at, uint64_t limit, uint64_t rend, uint64_t len) {
+        const uint64_t s = snap.next_readable(at);
+        if (s >= limit) {
+            b.unreadable = true;
+            return true;
+        }
+        if (s > at) b.unreadable = true;
+        return take(s, size_t(std::min(len, rend - s)));
+    };
 
     // Fully inside a hole (unmapped process memory): unreadable, nothing to read.
     if (snap.next_readable(b.offset) >= end) {
@@ -220,47 +295,75 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
         return true;
     }
 
+    // Holes of a sparse file are zeros: only the data ranges are read.
+    const auto data = snapshot_data_ranges(snap, b.offset, end, kMaxDataRanges);
+    uint64_t dlen = 0;
+    for (const auto& r : data) dlen += r.second - r.first;
+    b.hole_bytes = b.length - dlen;
+
     const uint64_t sample = opts.sample_per_bucket;
-    if (sample && b.length > sample) {
-        // Evenly spaced chunks; the first starts at the bucket start, the last ends at its end. A
-        // chunk that starts in a hole moves to the next readable byte (unless that is past the
-        // next chunk's position), so sparse buckets sample their mapped parts.
+    if (sample && dlen > sample) {
+        // Evenly spaced chunks over the data (holes left out); the first starts at the first data
+        // byte, the last ends at the last one. A data range no chunk landed in gets one chunk at
+        // its start, so a small region of a sparse file is never skipped.
         b.sampled = true;
         const uint64_t chunk = std::min<uint64_t>(kSampleChunk, sample);
         const uint64_t n = std::max<uint64_t>(1, sample / chunk);
-        const uint64_t stride = n > 1 ? (b.length - chunk) / (n - 1) : 0;
-        for (uint64_t k = 0; k < n; ++k) {
+        const uint64_t stride = n > 1 ? (dlen - chunk) / (n - 1) : 0;
+        std::vector<uint8_t> hit(data.size(), 0);
+        size_t ri = 0;
+        uint64_t rbase = 0;  // data position of data[ri].first
+        bool ok = true;
+        for (uint64_t k = 0; k < n && ok; ++k) {
             if (cancel.load(std::memory_order_relaxed)) return false;
-            const uint64_t at = b.offset + k * stride;
-            const uint64_t limit = k + 1 < n && stride ? at + stride : end;
-            const uint64_t s = snap.next_readable(at);
-            if (s >= limit) {
-                b.unreadable = true;
-                continue;
+            const uint64_t dpos = k * stride;
+            while (ri + 1 < data.size() && dpos >= rbase + (data[ri].second - data[ri].first)) {
+                rbase += data[ri].second - data[ri].first;
+                ++ri;
             }
-            if (s > at) b.unreadable = true;
-            if (!take(s, size_t(std::min<uint64_t>(chunk, end - s)))) break;
+            const uint64_t rend = data[ri].second;
+            uint64_t at = data[ri].first + (dpos - rbase);
+            if (rend - data[ri].first >= chunk) at = std::min(at, rend - chunk);  // a whole chunk
+            const uint64_t limit = k + 1 < n && stride ? std::min(rend, at + stride) : rend;
+            hit[ri] = 1;
+            ok = chunk_at(at, limit, rend, chunk);
+        }
+        for (size_t i = 0; i < data.size() && ok; ++i) {
+            if (cancel.load(std::memory_order_relaxed)) return false;
+            if (!hit[i]) ok = chunk_at(data[i].first, data[i].second, data[i].second, chunk);
+        }
+        // The chunks stand for all `dlen` data bytes; the holes add their zeros.
+        if (b.hole_bytes && b.bytes_read) {
+            const double scale = double(dlen) / double(b.bytes_read);
+            for (uint64_t& c : counts) c = uint64_t(std::llround(double(c) * scale));
         }
     } else {
-        for (uint64_t pos = b.offset; pos < end;) {
-            if (cancel.load(std::memory_order_relaxed)) return false;
-            const uint64_t s = snap.next_readable(pos);
-            if (s >= end) {
-                b.unreadable = true;
-                break;
+        for (const auto& r : data) {
+            bool ok = true;
+            for (uint64_t pos = r.first; pos < r.second && ok;) {
+                if (cancel.load(std::memory_order_relaxed)) return false;
+                const uint64_t s = snap.next_readable(pos);
+                if (s >= r.second) {
+                    b.unreadable = true;
+                    break;
+                }
+                if (s > pos) b.unreadable = true;
+                const size_t len = size_t(std::min<uint64_t>(kReadBlock, r.second - s));
+                ok = take(s, len);
+                pos = s + len;
             }
-            if (s > pos) b.unreadable = true;
-            const size_t len = size_t(std::min<uint64_t>(kReadBlock, end - s));
-            if (!take(s, len)) break;
-            pos = s + len;
+            if (!ok) break;
         }
     }
+    counts[0] += b.hole_bytes;
 
     b.entropy = shannon_entropy(counts);
-    uint64_t cls[kByteClassCount] = {};
-    for (int v = 0; v < 256; ++v) cls[int(byte_class(uint8_t(v)))] += counts[v];
-    for (int c = 0; c < kByteClassCount; ++c)
-        b.class_frac[c] = b.bytes_read ? float(double(cls[c]) / double(b.bytes_read)) : 0.0f;
+    uint64_t cls[kByteClassCount] = {}, total = 0;
+    for (int v = 0; v < 256; ++v) {
+        cls[int(byte_class(uint8_t(v)))] += counts[v];
+        total += counts[v];
+    }
+    for (int c = 0; c < kByteClassCount; ++c) b.class_frac[c] = total ? float(double(cls[c]) / double(total)) : 0.0f;
     b.done = true;
     return true;
 }

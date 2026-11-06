@@ -163,7 +163,10 @@
 //   parsers defined in the console); doc reads see the document as it was when the parse started;
 //   the doc is read-only there (edits raise "document is read-only"; hx.highlight, doc:select /
 //   doc:jump, bookmarks and hx.new_doc have no visible effect); print / hx.log output reaches the
-//   console when the result arrives. detect() still runs on the UI thread in the shared state.
+//   console when the result arrives. detect() runs the same way (script/parse_job.h DetectJob:
+//   a state per script, the document as of the start, output with the answer), so a slow
+//   detect never blocks the UI; parsers that cannot be rebuilt alone detect in the shared
+//   state, in their turn. The same rules hold inside detect() (no globals of other scripts).
 //
 // Console REPL: input is first tried as `return <input>` (results printed), then as a statement.
 // Predefined each time: `doc` (active Doc or nil), `cur` (cursor), `sel` = {start=, len=}.
@@ -171,6 +174,7 @@
 // commands and console lines are stopped after 10 s, detect() after 1 s (same hook as parse).
 // The time limit cannot be caught: once it fires, every further Lua instruction raises again.
 // ===========================================================================================
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -186,6 +190,7 @@ struct lua_State;
 namespace hx {
 
 class ParseJob;
+class DetectJob;
 struct SymbolTable;
 
 struct ConsoleLine {
@@ -340,6 +345,17 @@ public:
 
 private:
     void add_lib_paths();
+    // detect() of one parser on `doc`: 1 = true, 0 = false / no detect function / unknown parser,
+    // -1 = error (*err, with traceback). 1 s limit.
+    int run_detect(const std::string& parser, Document& doc, std::string* err);
+    bool has_detect(const std::string& parser) const;  // the parser's spec has a detect function
+    // detect_parser's fallback: the first parser in `list` with an extension of doc's path / name.
+    static std::string extension_parser(const std::vector<ParserInfo>& list, const Document& doc);
+    // Background jobs (script/parse_job.cpp): turns this fresh engine into a job's Lua state
+    // (script dirs for require, `cancel` stops its Lua code, parse errors left to the job), then
+    // runs one script as reload() would. False if it does not load on its own.
+    bool load_job_script(const std::vector<std::string>& dirs, const std::atomic<bool>* cancel,
+                         const std::string& file, const std::string& chunk, const std::string& text);
 
     ScriptHost* host_;
     std::unique_ptr<Impl> impl_;
@@ -352,6 +368,7 @@ private:
     std::unordered_map<uint64_t, HighlightSet> highlights_;
     friend struct Impl;
     friend class ParseJob;  // script/parse_job.h: background parses in an engine of their own
+    friend class DetectJob; // ... and background detect() calls
 };
 
 }  // namespace hx

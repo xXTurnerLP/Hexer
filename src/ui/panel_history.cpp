@@ -105,11 +105,13 @@ void HistoryPanel::draw(Document* doc, const HistoryPanelCallbacks& cb) {
 
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
-    if (ImGui::BeginTable("##history", 3, flags)) {
+    const int64_t now_ms = Document::now_ms();
+    if (ImGui::BeginTable("##history", 4, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 44.0f * s);
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableSetupColumn("Change", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
         ImGui::TableHeadersRow();
         ImGuiListClipper clip;
         clip.Begin(int(std::min<size_t>(n, size_t(INT_MAX))));
@@ -135,7 +137,9 @@ void HistoryPanel::draw(Document* doc, const HistoryPanelCallbacks& cb) {
                 ImGui::PopID();
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextUnformatted(history_label(*doc, row).c_str());
-                if (saved && history_state_id(*doc, row) == saved) {
+                // View steps keep the bytes (and state id): tag only the first row of such a run.
+                if (saved && history_state_id(*doc, row) == saved &&
+                    (row == 0 || history_state_id(*doc, row - 1) != saved)) {
                     ImGui::SameLine();
                     ImGui::TextColored(kSavedColor, "saved");
                 }
@@ -147,6 +151,10 @@ void HistoryPanel::draw(Document* doc, const HistoryPanelCallbacks& cb) {
                 if (mono) ImGui::PopFont();
                 if (!c.known && ImGui::IsItemHovered())
                     ImGui::SetTooltip("Too many edits in this state to compare cheaply");
+                ImGui::TableSetColumnIndex(3);
+                const int64_t when = history_time(*doc, row);
+                ImGui::TextUnformatted(history_time_text(when, now_ms).c_str());
+                if (when > 0 && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", history_time_full(when).c_str());
                 if (is_redo) ImGui::PopStyleColor();
             }
         }

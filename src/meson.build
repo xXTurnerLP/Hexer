@@ -24,6 +24,7 @@ core_lib = static_library('hexer_core',
   'core/pcap_stream.cpp',    # TCP stream reassembly (Follow TCP Stream)
   'core/procmem.cpp',        # process memory as a byte source
   'core/devices.cpp',        # enumerate processes / disks
+  'core/elevation.cpp',      # Restart as Administrator: elevation check + launch
   'core/xorscan.cpp',        # XOR / ADD / ROL brute force
   'core/exe_map.cpp',        # PE / ELF file offset <-> virtual address
   'core/symbols.cpp',        # PE exports / imports, ELF symtab / PLT names
@@ -60,6 +61,7 @@ ui_view_lib = static_library('hexer_ui_view',
   'ui/theme.cpp',
   'ui/hex_view.cpp',
   'ui/minimap.cpp',
+  'ui/input.cpp',            # shortcut routing policy, inline row editor, Ctrl+wheel steps
   'ui/panel_disasm.cpp',     # Disassembly panel (no App dependency; tests/test_disasm.cpp drives it)
   'ui/panel_bitmap.cpp',     # Bitmap / Packets panels, Compare view: no App dependency either
   'ui/panel_packets.cpp',    # (tests/test_panels.cpp drives them headlessly)

@@ -22,6 +22,7 @@
 #include "ui/dialog_cstruct.h"
 #include "ui/dialog_targets.h"
 #include "ui/hex_view.h"
+#include "ui/input.h"
 #include "ui/minimap.h"
 #include "ui/panel_bitmap.h"
 #include "ui/panel_disasm.h"
@@ -79,15 +80,13 @@ struct StructureState {
     // click put it, although the caret byte belongs to one of its children.
     int clicked_field = -1;
     uint64_t clicked_cursor = 0;
-    // Parse at offset: the parser runs over [base, base + length) (base 0 + UINT64_MAX = the whole
-    // file; UINT64_MAX = to EOF). Needs a chosen parser (detect() looks at the file start). Kept
-    // per tab and in the session (doc extras parse.base / parse.length). A length comes from the
-    // Packets panel (one packet's bytes).
-    uint64_t base = 0;
-    uint64_t length = UINT64_MAX;
+    // Parse at offset / range: the document's ViewState::parse_base / parse_length (undoable with
+    // the parser, kept in the session; set_parse()). Needs a chosen parser (detect() looks at the
+    // file start). A length comes from the Packets panel (one packet's bytes).
     uint64_t parsed_base = 0;         // base / length of `result`
     uint64_t parsed_length = UINT64_MAX;
     std::string base_input;           // the panel's "@" field
+    uint64_t base_input_for = 0;      // the parse base base_input was last set from
     // Wall time of the last detect + parse (start of its job to its result).
     double last_parse_ms = 0.0;
     // The parse runs on a worker (script/parse_job.h); `result` stays shown (greyed after a
@@ -99,6 +98,10 @@ struct StructureState {
     std::string job_requested;
     double job_t0 = 0.0;              // app clock at its start
     std::vector<std::unique_ptr<ParseJob>> retired;
+    // Auto (no parser chosen): the parser is detected first, by a DetectJob on a worker; the
+    // parse job starts once its answer arrives (still current; job_t0 = the detect's start).
+    std::unique_ptr<DetectJob> detect;
+    std::vector<std::unique_ptr<DetectJob>> retired_detect;
 };
 
 struct SearchHits {
@@ -173,18 +176,6 @@ struct Tab {
 // ---- app-level state -----------------------------------------------------------------------
 
 // Single-line in-place editor used by the Inspector, Structure and Bookmarks tables.
-struct InlineEdit {
-    int row = -1;                     // -1 = not editing
-    uint64_t ctx = 0;                 // extra key (e.g. cursor offset / doc id) so edits cancel on change
-    std::string buf;
-    std::string error;
-    int start_frame = 0;
-    bool focus = false;
-    bool active(int r, uint64_t c) const { return row == r && ctx == c; }
-    void begin(int r, uint64_t c, std::string text);
-    void end() { row = -1; }
-};
-
 struct FindState {
     bool open = false;
     bool focus = false;               // focus the input next frame
@@ -245,8 +236,10 @@ struct App final : ScriptHost {
     Settings settings;
     double settings_dirty_at = -1.0;  // >= 0: save settings once this is ~1 s old
     Fonts fonts;
+    FontOptions fonts_loaded;         // what `fonts` came from; a Settings change reloads them
     float ui_scale = 1.0f;            // monitor content scale * settings.ui_scale
     float dpi_scale = 1.0f;           // monitor content scale (GLFW), followed at runtime
+    float zoom_wheel = 0.0f;          // Ctrl+wheel delta not yet a whole zoom step (wheel_steps)
     bool dpi_changed = false;         // content-scale callback fired: re-apply before next frame
     std::string ini_path;
     std::unique_ptr<ScriptEngine> engine;

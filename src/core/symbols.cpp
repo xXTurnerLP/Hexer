@@ -15,11 +15,36 @@ namespace hx {
 namespace {
 
 // Bytes of the snapshot through a small window (names and table entries are mostly adjacent).
-// Records which bytes the build used (SymbolTable::sources).
+// Records which bytes the build used (SymbolTable::sources) and how its checks against the size
+// came out (SymbolTable::size_min / size_max): every check goes through fits() / clamp_end().
 class Reader {
 public:
     explicit Reader(const Snapshot& s) : snap_(s), size_(s.size()) {}
-    uint64_t size() const { return size_; }
+
+    // [off, off + n) lies inside the document.
+    bool fits(uint64_t off, uint64_t n) {
+        const bool ok = off <= size_ && size_ - off >= n;
+        if (ok) need_ = std::max(need_, off + n);
+        else if (n <= UINT64_MAX - off) below_ = std::min(below_, off + n);  // fits from that size on
+        return ok;
+    }
+    // min(end, size).
+    uint64_t clamp_end(uint64_t end) {
+        if (end <= size_) {
+            need_ = std::max(need_, end);
+            return end;
+        }
+        exact();
+        return size_;
+    }
+    // The result depends on the exact size.
+    void exact() {
+        need_ = std::max(need_, size_);
+        below_ = std::min(below_, size_ + 1);
+    }
+    // Every size in [size_min(), size_max()] passes / fails the same checks.
+    uint64_t size_min() const { return need_; }
+    uint64_t size_max() const { return below_ == UINT64_MAX ? UINT64_MAX : below_ - 1; }
 
     // Exactly n bytes at off; false past the end.
     bool read(uint64_t off, void* dst, size_t n) {
@@ -52,6 +77,7 @@ public:
             }
             off += n;
         }
+        if (!nul_seen && s.size() < max && off >= size_) exact();  // cut by the end of the file
         note(start, s.size() + (nul_seen ? 1 : 0));  // the bytes looked at, not the whole chunk
         for (char& c : s)
             if (uint8_t(c) < 0x20 || uint8_t(c) == 0x7F) c = '?';
@@ -92,7 +118,7 @@ private:
     }
     // read() without recording.
     bool fetch(uint64_t off, void* dst, size_t n) {
-        if (off > size_ || size_ - off < n) return false;
+        if (!fits(off, n)) return false;
         if (n > kWindow) return snap_.read(off, static_cast<uint8_t*>(dst), n) == n;
         if (off < win_off_ || off - win_off_ + n > win_len_) {
             win_off_ = off;
@@ -111,6 +137,8 @@ private:
     size_t win_len_ = 0;
     std::vector<std::pair<uint64_t, uint64_t>> spans_;  // [begin, end) read so far
     size_t compact_at_ = 4096;
+    uint64_t need_ = 0;              // checks passed up to here (the size must stay >= it)
+    uint64_t below_ = UINT64_MAX;    // a failed check would pass from this size on (MAX: none)
 };
 
 // Shared build state: caps, time budget, cancellation.
@@ -210,7 +238,7 @@ struct Pe {
         if (!m.va_to_offset(pi.base + rva, off)) return false;
         const MappedRegion* r = m.region_at_offset(off);
         if (!r) return false;
-        avail = std::min(r->offset + r->file_size, c.rd.size()) - off;
+        avail = c.rd.clamp_end(r->offset + r->file_size) - off;
         return true;
     }
     bool off_of(uint64_t rva, uint64_t& off) const {
@@ -380,8 +408,7 @@ struct Elf {
             return false;
         const uint64_t need = is64 ? 64 : 40;
         if (!shnum || shnum > AddressMap::kMaxSections || shentsize < need) return false;
-        const uint64_t size = c.rd.size();
-        if (shoff > size || (size - shoff) / shentsize < shnum) return false;
+        if (!c.rd.fits(shoff, shnum * shentsize)) return false;  // shnum <= 1024: no overflow
         sh.resize(size_t(shnum));
         for (uint64_t i = 0; i < shnum; ++i) {
             const uint64_t at = shoff + i * shentsize;
@@ -401,7 +428,7 @@ struct Elf {
         if (shstrndx < shnum) {
             const Sh& st = sh[size_t(shstrndx)];
             for (Sh& s : sh)
-                if (st.offset <= size && s.name < st.size && st.size <= size - st.offset)
+                if (s.name < st.size && c.rd.fits(st.offset, st.size))
                     s.sname = c.name(st.offset + s.name, size_t(std::min<uint64_t>(64, st.size - s.name)));
         }
         return true;
@@ -409,7 +436,7 @@ struct Elf {
 
     // File bytes of section `s` are inside the file (SHT_NOBITS has none).
     bool in_file(const Sh& s) const {
-        return s.type != 8 && s.offset <= c.rd.size() && s.size <= c.rd.size() - s.offset;
+        return s.type != 8 && c.rd.fits(s.offset, s.size);
     }
     uint64_t sym_size() const { return is64 ? 24 : 16; }
 
@@ -636,7 +663,6 @@ void SymbolTable::match(std::string_view filter, std::vector<uint32_t>& out) con
 }
 
 bool same_bytes(const Snapshot& a, const Snapshot& b, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
-    if (a.size() != b.size()) return false;
     // Where byte `pos` of a snapshot comes from: piece `i`, `o` bytes into it.
     struct Cursor {
         const Snapshot& s;
@@ -668,6 +694,7 @@ bool same_bytes(const Snapshot& a, const Snapshot& b, const std::vector<std::pai
     for (const auto& [begin, range_end] : ranges) {
         const uint64_t end = std::min(range_end, a.size());
         if (begin >= end) continue;
+        if (end > b.size()) return false;  // b has fewer bytes
         Cursor x{a}, y{b};
         x.seek(begin);
         y.seek(begin);
@@ -742,6 +769,8 @@ SymbolTable build_symbols(const Snapshot& snap, const AddressMap& map, const Sym
         out.finalize();
     }
     out.sources = rd->take_sources();
+    out.size_min = rd->size_min();
+    out.size_max = rd->size_max();
     return out;
 }
 
@@ -758,8 +787,13 @@ bool same_regions(const std::vector<MappedRegion>& a, const std::vector<MappedRe
     return std::equal(a.begin(), a.end(), b.begin(), b.end(), same_region);
 }
 
+// For the symbols: a Pe / Elf map's file_size (the document size) is not used by build_symbols
+// (it goes by the regions, which hold the size wherever it cut them); the size window of the
+// table (SymbolTable::size_min / size_max) covers the rest.
 bool same_map(const AddressMap& a, const AddressMap& b) {
-    return a.kind == b.kind && a.base == b.base && a.file_size == b.file_size && a.has_entry == b.has_entry &&
+    const bool by_regions = a.kind == AddressMap::Pe || a.kind == AddressMap::Elf;
+    return a.kind == b.kind && a.base == b.base && (by_regions || a.file_size == b.file_size) &&
+           a.has_entry == b.has_entry &&
            a.entry == b.entry && a.bits == b.bits && a.format == b.format && a.in_memory == b.in_memory &&
            same_regions(a.regions, b.regions) && same_regions(a.names, b.names);
 }
@@ -786,7 +820,8 @@ bool SymbolJob::start(std::shared_ptr<const Snapshot> snap, AddressMap map, Symb
         const bool live = map.kind == AddressMap::Process || map.in_memory;  // bytes change without edits
         if (!live && !has_pending_ && !busy_ && result_ && !result_->truncated && snap && last.snap &&
             lim.max_symbols == last.lim.max_symbols && lim.max_ms == last.lim.max_ms && epochs == last.epochs &&
-            same_map(map, last.map) && same_bytes(*last.snap, *snap, result_->sources)) {
+            snap->size() >= result_->size_min && snap->size() <= result_->size_max && same_map(map, last.map) &&
+            same_bytes(*last.snap, *snap, result_->sources)) {
             result_for_.snap.swap(snap);  // the newer snapshot (the old one is released below, unlocked)
             return false;
         }

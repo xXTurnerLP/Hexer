@@ -280,6 +280,32 @@ bool OsFile::truncate(uint64_t new_size) {
 
 bool OsFile::flush() { return FlushFileBuffers(as_handle(h_)) != 0; }
 
+bool OsFile::data_range(uint64_t off, uint64_t& begin, uint64_t& end) const {
+    if (device_) return false;
+    LARGE_INTEGER li{};
+    if (!GetFileSizeEx(as_handle(h_), &li)) return false;
+    const uint64_t size = uint64_t(li.QuadPart);
+    if (off >= size) {
+        begin = end = size;
+        return true;
+    }
+    FILE_ALLOCATED_RANGE_BUFFER in{}, out[1]{};
+    in.FileOffset.QuadPart = LONGLONG(off);
+    in.Length.QuadPart = LONGLONG(size - off);
+    DWORD got = 0;
+    if (!DeviceIoControl(as_handle(h_), FSCTL_QUERY_ALLOCATED_RANGES, &in, sizeof in, out, sizeof out, &got, nullptr) &&
+        GetLastError() != ERROR_MORE_DATA)  // more ranges follow: the first one is there
+        return false;
+    if (got < sizeof out[0]) {  // no allocated range in [off, size)
+        begin = end = size;
+        return true;
+    }
+    const uint64_t b = uint64_t(out[0].FileOffset.QuadPart), len = uint64_t(out[0].Length.QuadPart);
+    begin = std::clamp(b, off, size);
+    end = std::clamp(b + len, begin, size);
+    return end > begin;  // an empty range would be odd: then everything counts as data
+}
+
 #else  // POSIX
 
 std::unique_ptr<OsFile> OsFile::open(const std::string& path, Mode mode, std::string* err) {
@@ -367,6 +393,32 @@ bool OsFile::flush() {
         r = ::fsync(int(h_));
     } while (r != 0 && errno == EINTR);
     return r == 0;
+}
+
+bool OsFile::data_range(uint64_t off, uint64_t& begin, uint64_t& end) const {
+#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+    struct stat st {};
+    if (fstat(int(h_), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    const uint64_t size = uint64_t(st.st_size);
+    if (off >= size) {
+        begin = end = size;
+        return true;
+    }
+    const off_t d = lseek(int(h_), off_t(off), SEEK_DATA);
+    if (d < 0) {
+        if (errno != ENXIO) return false;  // EINVAL: not supported here
+        begin = end = size;                // only a hole follows
+        return true;
+    }
+    const off_t h = lseek(int(h_), d, SEEK_HOLE);
+    if (h < 0) return false;
+    begin = std::clamp(uint64_t(d), off, size);
+    end = std::clamp(uint64_t(h), begin, size);
+    return end > begin;
+#else
+    (void)off, (void)begin, (void)end;
+    return false;
+#endif
 }
 
 #endif

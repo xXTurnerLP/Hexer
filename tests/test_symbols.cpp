@@ -410,8 +410,14 @@ TEST_CASE("symbols: same_bytes compares where the bytes come from") {
     CHECK_FALSE(same_bytes(*a, *b, {{0, 11}}));
     CHECK_FALSE(same_bytes(*a, *b, {{10, 11}}));
     CHECK(same_bytes(*a, *b, {}));
-    REQUIRE(d->insert(200, &x, 1));  // a size change: never the same
-    CHECK_FALSE(same_bytes(*a, *d->snapshot(), {{0, 5}}));
+    REQUIRE(d->insert(200, &x, 1));  // a size change: the same before the insert, not after
+    CHECK(same_bytes(*a, *d->snapshot(), {{0, 5}, {11, 200}}));
+    CHECK_FALSE(same_bytes(*a, *d->snapshot(), {{0, 5}, {150, 201}}));
+    CHECK_FALSE(same_bytes(*a, *d->snapshot(), {{255, 256}}));
+    REQUIRE(d->erase(100, 156));  // b shorter than a range: not the same
+    CHECK(same_bytes(*a, *d->snapshot(), {{0, 5}, {20, 100}}));
+    CHECK_FALSE(same_bytes(*a, *d->snapshot(), {{0, 101}}));
+    REQUIRE(d->undo());
     REQUIRE(d->undo());
     REQUIRE(d->undo());
     CHECK(same_bytes(*a, *d->snapshot(), {{0, 256}}));  // back to the same pieces
@@ -458,7 +464,7 @@ TEST_CASE("symbols: the job keeps its table when an edit misses the tables") {
     CHECK(find(*job.result(), "test.dll!Alpha"));
     const uint64_t builds = job.builds();
 
-    // Another map or other limits: rebuilt. A size change (insert after every table): rebuilt.
+    // Another map or other limits: rebuilt. An insert after every table: kept.
     CHECK(job.start(d->snapshot(), manual_address_map(*d, 0x1000)));
     job.wait();
     CHECK(job.result()->empty());
@@ -471,10 +477,12 @@ TEST_CASE("symbols: the job keeps its table when an edit misses the tables") {
     CHECK(job.result()->truncated);
     CHECK(job.start(d->snapshot(), detect_address_map(*d)));
     job.wait();
+    const SymbolTable* before = job.result().get();
     REQUIRE(d->insert(d->size(), &nop, 1));
-    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
-    job.wait();
-    CHECK(job.builds() == builds + 5);
+    CHECK_FALSE(job.start(d->snapshot(), detect_address_map(*d)));
+    CHECK(job.current());
+    CHECK(job.result().get() == before);
+    CHECK(job.builds() == builds + 4);
 
     // Process memory always rebuilds (its bytes change without edits).
     AddressMap proc;
@@ -484,7 +492,7 @@ TEST_CASE("symbols: the job keeps its table when an edit misses the tables") {
     job.wait();
     CHECK(job.start(snap, proc));
     job.wait();
-    CHECK(job.builds() == builds + 7);
+    CHECK(job.builds() == builds + 6);
 }
 
 TEST_CASE("symbols: the job rebuilds after an in-place save rewrote the table bytes") {
@@ -623,4 +631,74 @@ TEST_CASE("symbols: Go to Symbol filtering over 1M labels") {
         v.match(f, fast);
         CHECK(slow == fast);
     }
+}
+
+TEST_CASE("symbols: the job keeps its table across inserts / deletes after every table") {
+    const Bytes elf = symfix::make_elf();
+    auto d = doc_of(elf);
+    SymbolJob job;
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    REQUIRE(job.result());
+    const SymbolTable* first = job.result().get();
+    CHECK(first->symbols.size() == 7);
+    // The size window: every passed check ends inside the file, none failed.
+    REQUIRE_FALSE(first->sources.empty());
+    CHECK(first->size_min >= first->sources.back().second);
+    CHECK(first->size_min <= d->size());
+    CHECK(first->size_max == UINT64_MAX);
+
+    // Appended data (the PT_LOAD segment ends at the old end): the same table.
+    const Bytes tail(0x300, 0xCC);
+    REQUIRE(d->insert(d->size(), tail.data(), tail.size()));
+    CHECK_FALSE(job.start(d->snapshot(), detect_address_map(*d)));
+    CHECK(job.current());
+    CHECK(job.result().get() == first);
+    // Part of it deleted again, and an insert inside it: still after every table.
+    REQUIRE(d->erase(elf.size() + 0x100, 0x100));
+    REQUIRE(d->insert(elf.size() + 0x10, tail.data(), 0x20));
+    CHECK_FALSE(job.start(d->snapshot(), detect_address_map(*d)));
+    CHECK(job.result().get() == first);
+    CHECK(job.builds() == 1);
+
+    // An insert before a table (inside .text, before .plt.sec): rebuilt.
+    const uint8_t nop = 0x90;
+    REQUIRE(d->insert(0x250, &nop, 1));
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    CHECK(job.builds() == 2);
+    REQUIRE(d->undo());
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));  // other pieces than the 2nd table's
+    job.wait();
+    CHECK(job.builds() == 3);
+    CHECK(job.result()->symbols.size() == 7);
+
+    // Deleting into the image (the segment gets cut, the map changes): rebuilt.
+    REQUIRE(d->erase(0x1000, d->size() - 0x1000));
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    CHECK(job.builds() == 4);
+}
+
+TEST_CASE("symbols: a failed size check bounds the size window") {
+    // .strtab claims 0x2000 bytes at 0x900, past the end (0x1100): the symtab names are lost.
+    Bytes elf = symfix::make_elf();
+    put(elf, 0xE00 + 8 * 64 + 32, 0x2000, 8);
+    auto d = doc_of(elf);
+    const SymbolTable t = syms_of(*d);
+    CHECK_FALSE(find(t, "helper"));
+    CHECK(t.size_max == 0x900 + 0x2000 - 1);  // from 0x2900 bytes on that check would pass
+    CHECK(t.size_min <= d->size());
+
+    SymbolJob job;
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    const Bytes tail(0x1000, 0);
+    REQUIRE(d->insert(d->size(), tail.data(), tail.size()));  // 0x2100: still too short
+    CHECK_FALSE(job.start(d->snapshot(), detect_address_map(*d)));
+    REQUIRE(d->insert(d->size(), tail.data(), 0x800));        // 0x2900: now it fits
+    CHECK(job.start(d->snapshot(), detect_address_map(*d)));
+    job.wait();
+    CHECK(job.builds() == 2);
+    CHECK(find(*job.result(), "helper"));
 }

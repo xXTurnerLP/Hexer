@@ -1,10 +1,13 @@
 // Entropy overview: byte classes, Shannon entropy, bucket layout, sampling and the background job.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <random>
 #include <string>
@@ -334,9 +337,17 @@ TEST_CASE("entropy: >4 GiB sparse file is sampled quickly") {
     REQUIRE(r->buckets.size() == 256);
     CHECK(r->bucket_size == size / 256);
     CHECK(r->done == 256);
-    CHECK(r->bytes_read == 256u * (32u << 10));  // bounded: 8 MiB of a 6 GiB file
     CHECK(secs < 20.0);
-    CHECK(r->buckets[0].sampled);
+    uint64_t db = 0, de = 0;
+    const auto& src = doc->snapshot()->sources.at(0);
+    if (src->data_range(0, db, de) && db == size) {  // the OS reports the holes: nothing is read
+        CHECK(r->bytes_read == sizeof(tag));
+        CHECK_FALSE(r->buckets[0].sampled);
+        CHECK(r->buckets[0].hole_bytes == r->buckets[0].length);
+    } else {
+        CHECK(r->bytes_read == 256u * (32u << 10));  // bounded: 8 MiB of a 6 GiB file
+        CHECK(r->buckets[0].sampled);
+    }
     CHECK(r->buckets[0].entropy == 0.0f);
     CHECK(frac(r->buckets[0], ByteClass::Zero) == 1.0f);
     const size_t tagged = r->bucket_of(at);
@@ -696,4 +707,167 @@ TEST_CASE("entropy: process memory is always rescanned in full") {
     r = rerun(job, doc->snapshot(), o);
     CHECK(r->reused == 0);
     CHECK(r->done == 16);
+}
+
+namespace {
+
+// A sparse file of `size` bytes whose holes the OS reports (else false: the test is skipped).
+bool make_reported_sparse(const std::string& p, uint64_t size) {
+#ifdef _WIN32
+    HANDLE h = CreateFileW(utf8_to_wide(p).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD got = 0;
+    const bool sparse = DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &got, nullptr) != 0;
+    CloseHandle(h);
+    if (!sparse) return false;
+    auto f = OsFile::open(p, OsFile::Mode::ReadWrite);
+#else
+    auto f = OsFile::open(p, OsFile::Mode::CreateTruncate);
+#endif
+    if (!f || !f->truncate(size)) return false;
+    uint64_t b = 0, e = 0;
+    return f->data_range(0, b, e) && b == size && e == size;
+}
+
+bool write_at(const std::string& p, uint64_t off, const Bytes& b) {
+    auto f = OsFile::open(p, OsFile::Mode::ReadWrite);
+    return f && f->write_at(off, b.data(), b.size());
+}
+
+Bytes random_bytes(size_t n, unsigned seed) {
+    Bytes b(n);
+    std::mt19937 rng(seed);
+    for (auto& v : b) v = uint8_t(1 + rng() % 255);  // never 0
+    return b;
+}
+
+}  // namespace
+
+TEST_CASE("entropy: a 4 KiB block inside a 1 TiB sparse file shows up") {
+    TempDir t;
+    const std::string p = path_join(t.path, "huge.bin");
+    const uint64_t size = 1ull << 40;
+    if (!make_reported_sparse(p, size)) {
+        MESSAGE("skipped: no sparse file support with reported holes here");
+        return;
+    }
+    const uint64_t at = 777ull * (1ull << 30) + 123456;  // inside bucket 777 (1 GiB buckets)
+    REQUIRE(write_at(p, at, random_bytes(4096, 9)));
+    auto doc = Document::open_file(p);
+    REQUIRE(doc);
+    const auto snap = doc->snapshot();
+
+    // The data ranges: just the block (the filesystem may allocate a little around it).
+    const auto ranges = snapshot_data_ranges(*snap, 0, size);
+    REQUIRE(ranges.size() == 1);
+    CHECK(ranges[0].first <= at);
+    CHECK(ranges[0].second >= at + 4096);
+    CHECK(ranges[0].second - ranges[0].first <= (1u << 20));
+    CHECK(snapshot_data_ranges(*snap, 0, at - (1u << 20)).empty());
+
+    EntropyJob job;
+    auto r = run(job, snap);  // default options: 1024 buckets, 256 KiB sample each
+    REQUIRE(r->buckets.size() == 1024);
+    const size_t k = r->bucket_of(at);
+    REQUIRE(k == 777);
+    const EntropyBucket& b = r->buckets[k];
+    CHECK_FALSE(b.sampled);  // its data fits the budget: read in full
+    CHECK(b.nonzero);
+    CHECK(b.peak > 2.9f);    // the densest 4 KiB chunk holds random bytes
+    CHECK(entropy_spot(b));
+    CHECK(b.hole_bytes + b.bytes_read == b.length);
+    CHECK(b.class_frac[int(ByteClass::Zero)] < 1.0f);
+    CHECK(r->bytes_read <= (1u << 20));  // only the allocated range was read
+    for (size_t i : {size_t(0), size_t(776), size_t(778), size_t(1023)}) {
+        INFO(i);
+        CHECK(r->buckets[i].done);
+        CHECK(r->buckets[i].hole_bytes == r->buckets[i].length);
+        CHECK(r->buckets[i].entropy == 0.0f);
+        CHECK(r->buckets[i].class_frac[int(ByteClass::Zero)] == 1.0f);
+        CHECK_FALSE(entropy_spot(r->buckets[i]));
+    }
+    // A minimap row spanning many buckets still sees it.
+    const EntropyBucket a = entropy_aggregate(*r, 512ull << 30, 1024ull << 30);
+    CHECK(entropy_spot(a));
+    CHECK(a.hole_bytes > 0);
+    CHECK(a.peak == b.peak);
+}
+
+TEST_CASE("entropy: sampling covers every data range of a sparse bucket") {
+    TempDir t;
+    const std::string p = path_join(t.path, "spots.bin");
+    const uint64_t size = 64ull << 20;
+    if (!make_reported_sparse(p, size)) {
+        MESSAGE("skipped: no sparse file support with reported holes here");
+        return;
+    }
+    // 40 blocks of 64 KiB, 1 MiB apart: 2.5 MiB of data in one 64 MiB bucket, more than the
+    // budget. Evenly spaced chunks over the data alone would miss some blocks.
+    for (uint64_t i = 0; i < 40; ++i)
+        REQUIRE(write_at(p, i * (1u << 20) + (512u << 10), random_bytes(64u << 10, unsigned(i))));
+    auto doc = Document::open_file(p);
+    REQUIRE(doc);
+    const auto snap = doc->snapshot();
+    const auto ranges = snapshot_data_ranges(*snap, 0, size);
+    REQUIRE(ranges.size() == 40);
+    EntropyOptions o;
+    o.buckets = 1;
+    o.sample_per_bucket = 64 << 10;  // 16 chunks for 40 ranges: every range still gets one
+    EntropyJob job;
+    auto r = run(job, snap, o);
+    REQUIRE(r->buckets.size() == 1);
+    const EntropyBucket& b = r->buckets[0];
+    CHECK(b.sampled);
+    CHECK(b.bytes_read == 40u * 4096u);  // one chunk per range (16 spread + 24 more)
+    CHECK(b.hole_bytes == size - 40u * (64u << 10));
+    // The sampled data stands for 2.5 MiB, the holes for the rest: mostly zeros.
+    CHECK(b.class_frac[int(ByteClass::Zero)] > 0.9f);
+    CHECK(b.class_frac[int(ByteClass::Zero)] < 0.98f);
+    CHECK(b.peak > 7.5f);
+
+    // An edit inside a hole is data too (it lives in the add buffer, not the file).
+    const uint8_t x = 0x55;
+    REQUIRE(doc->overwrite(100, &x, 1));
+    const auto edited = snapshot_data_ranges(*doc->snapshot(), 0, 2u << 20);
+    REQUIRE(edited.size() == 3);
+    CHECK(edited[0] == std::make_pair(uint64_t(100), uint64_t(101)));
+    CHECK(edited[1].first <= (512u << 10));
+    CHECK(edited[2].first >= (1u << 20));
+    // The cap: the last of max_ranges ranges extends to the end (a superset).
+    const auto capped = snapshot_data_ranges(*snap, 0, size, 4);
+    REQUIRE(capped.size() == 4);
+    CHECK(capped[2] == ranges[2]);
+    CHECK(capped[3].first == ranges[3].first);
+    CHECK(capped[3].second == size);
+}
+
+TEST_CASE("entropy: a small dense region in zeros is a spot (peak / nonzero), also without holes") {
+    Bytes d(size_t(1) << 20, 0);
+    const Bytes noise = random_bytes(4096, 3);
+    std::copy(noise.begin(), noise.end(), d.begin() + (300 << 10));
+    d[900 << 10] = 1;  // a lone byte far away
+    EntropyOptions o;
+    o.buckets = 4;  // 256 KiB buckets, read in full
+    o.sample_per_bucket = 0;
+    EntropyJob job;
+    auto r = run(job, snap_of(d), o);
+    REQUIRE(r->buckets.size() == 4);
+    const EntropyBucket& dense = r->buckets[1];
+    CHECK(dense.entropy < 1.0f);  // the average hides it
+    CHECK(dense.peak > 7.5f);
+    CHECK(entropy_spot(dense));
+    CHECK_FALSE(entropy_spot(r->buckets[0]));  // all zero
+    CHECK_FALSE(r->buckets[0].nonzero);
+    CHECK(r->buckets[3].nonzero);  // the lone byte
+    CHECK(entropy_spot(r->buckets[3]));
+    CHECK(r->buckets[3].hole_bytes == 0);
+
+    // Uniform data is no spot, whatever its entropy.
+    const Bytes rnd = random_bytes(size_t(1) << 20, 4);
+    r = run(job, snap_of(rnd), o);
+    for (const EntropyBucket& b : r->buckets) {
+        CHECK(b.peak > 7.9f);
+        CHECK_FALSE(entropy_spot(b));
+    }
 }

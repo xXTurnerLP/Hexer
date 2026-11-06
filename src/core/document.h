@@ -93,6 +93,11 @@ struct ViewState {
     bool ascii_focus = false;  // caret is in the text column
     uint64_t top_row = 0;      // first visible row
     std::string parser;        // forced parser name; "" = auto-detect
+    // Structure panel "Parse at": the parser runs over [parse_base, parse_base + parse_length)
+    // (0 + UINT64_MAX = the whole file; a length of UINT64_MAX = to the end). Undoable together
+    // with `parser` (Document::set_view_options).
+    uint64_t parse_base = 0;
+    uint64_t parse_length = UINT64_MAX;
     std::vector<Bookmark> bookmarks;
 
     uint64_t sel_begin() const { return anchor < cursor ? anchor : cursor; }
@@ -101,8 +106,21 @@ struct ViewState {
     bool has_selection() const { return anchor != cursor; }
 };
 
+// The view-level settings that are undoable (Document::set_view_options): the Edit > Read-only
+// flag, the Structure panel's parser and its Parse at range. Not content: dirty() ignores them.
+struct ViewOptions {
+    bool read_only = false;
+    std::string parser;                  // ViewState::parser
+    uint64_t parse_base = 0;             // ViewState::parse_base / parse_length
+    uint64_t parse_length = UINT64_MAX;
+    bool operator==(const ViewOptions&) const = default;
+};
+
 // One undo/redo step: the full piece list + cursor/selection/bookmarks *before* (undo stack) or
 // *after* (redo stack) an action. Piece lists are small (they describe edits, not data).
+// A view step (view_only, from set_view_options) stores no piece list, caret or bookmarks: the
+// action changed none of them, so its bytes are those of the neighbouring state toward the
+// current one (the next entry up the stack, or the current state for the top entry).
 struct UndoEntry {
     std::vector<Piece> pieces;
     uint64_t cursor = 0, anchor = 0;
@@ -115,6 +133,15 @@ struct UndoEntry {
     uint64_t coalesce_begin = UINT64_MAX;
     uint64_t coalesce_end = UINT64_MAX;
     std::string label;                   // "Typing", "Paste", "Fill", "Add bookmark", "Script: ..."
+    // Wall-clock time of the action (ms since the Unix epoch, Document::now_ms()); a merged typing
+    // run keeps the time of its last edit. Travels with the label between the stacks. 0 = unknown
+    // (a session written before timestamps).
+    int64_t time_ms = 0;
+    bool view_only = false;              // a view step (see above): `pieces` is empty
+    // `view` holds the view options of this state and undo()/redo() restore them. Always set on
+    // view steps; on a content step when a group (script) also changed view options.
+    bool has_view = false;
+    ViewOptions view;
 };
 
 // Everything needed to rebuild a document after a restart (hot exit), including its undo history.
@@ -122,9 +149,18 @@ struct PersistedDoc {
     std::string path;                    // "" = untitled
     std::string display_name;
     FileStat file_stat;                  // stat of the file version the pieces refer to
-    std::vector<Piece> pieces;           // Original pieces: chunk == 0 (= the file at `path`)
+    // Original pieces: chunk 0 = the file at `path`, chunk k >= 1 = ref_files[k - 1].
+    std::vector<Piece> pieces;
     std::vector<std::vector<uint8_t>> add_chunks;  // used bytes of every add chunk, by index
-    std::vector<UndoEntry> undo, redo;   // only entries whose Original pieces have chunk == 0
+    std::vector<UndoEntry> undo, redo;   // only entries whose Original pieces are exportable (above)
+    // Read-only files the pieces reference by path (replace_with_file, e.g. Revert to Backup), with
+    // their stat at the time: restore() only uses one whose size and mtime still match; states
+    // that need a changed / vanished one are dropped (the current one: the file on disk opens).
+    struct RefFile {
+        std::string path;
+        FileStat stat;
+    };
+    std::vector<RefFile> ref_files;
     ViewState view;
     bool dirty = false;
     bool read_only = false;
@@ -136,13 +172,11 @@ struct PersistedDoc {
     std::vector<std::string> backup_done;
     // Opaque per-document UI state (Document::set_extra): the core never interprets it. Values are
     // binary-safe. Keys the app uses (all values are plain text; unset = default):
-    //   "parse.base", "parse.length"  Parse at offset / range (decimal uint64; the parser itself is
-    //                                 ViewState::parser)
     //   "tail.enabled"   "1" live tail             "split.on", "split.vertical", "split.active"  "1"
     //   "split.ratio"    first pane share, e.g. "0.300"   "split.top2"  first visible byte of the
     //                                 inactive pane (decimal byte offset)
-    // Stored in an optional extension block of the session file (format v3; files without extras
-    // are still written as v2, so an older Hexer can read them).
+    // Stored in the extension block of the session file (format v3+). Sessions before v4 kept the
+    // Parse at range as extras "parse.base" / "parse.length"; loading moves them to ViewState.
     std::map<std::string, std::string> extras;
 };
 
@@ -197,6 +231,7 @@ public:
     // path() is "process://<pid>", the name "notepad.exe (1234)". Read-only unless `writable`.
     // Fixed size: only overwrites can be saved, written straight into the process memory (no
     // backup). Unmapped addresses read as unreadable ("??") holes. Not persistable (hot exit).
+    // The caret starts at process_start_address(pid) (the main module), not in the hole at 0.
     static std::unique_ptr<Document> open_process(uint32_t pid, bool writable, std::string* err = nullptr);
     // A raw disk / volume / block device. Read-only unless `writable`; fixed size, in-place saves
     // only, never backed up. Named "PhysicalDrive0 (931.51 GiB)".
@@ -230,6 +265,9 @@ public:
     void refresh_target();
     // Process documents: false once the process has exited (every byte then reads as unreadable).
     bool target_alive() const;
+    // Process documents: the memory map was read but its memory cannot be (reads refused; see
+    // ByteBackend::read_denied). The tab shows a banner instead of a sea of "??".
+    bool target_read_denied() const;
 
     // ---- reading -----------------------------------------------------------------------------
     uint64_t size() const { return table_.size(); }
@@ -268,7 +306,8 @@ public:
     // state or its history needs it). Nothing on disk changes until save() writes the document
     // (a rewrite; an existing "<path>.backup" is never replaced, see save()). Refused for devices /
     // process memory (fixed size), read-only or busy documents, and for the document's own file.
-    // Hot exit: the session inlines at most 16 MiB of such bytes (hot_exit_safe() is false above).
+    // Hot exit: the session references the file by path (+ size / mtime, see PersistedDoc::ref_files),
+    // so a revert of any size survives a restart without copying it.
     bool replace_with_file(const std::string& path, const std::string& label, std::string* err = nullptr);
     // "<file>.backup" that save() keeps for `path` (symlinks resolved like save() does).
     static std::string backup_path_of(const std::string& path);
@@ -293,10 +332,22 @@ public:
     bool update_bookmark(size_t index, const Bookmark& b);
 
     // Full history: undo/redo survive saves (both in-place and rewrite) and restarts (session).
+    // A read-only document only undoes / redoes view steps (e.g. the read-only toggle itself).
     bool can_undo() const;
     bool can_redo() const;
     bool undo();  // restores pieces + cursor/selection/bookmarks at the time of the action
     bool redo();
+
+    // ---- view-level undo steps ---------------------------------------------------------------
+    // The undoable view settings (read-only flag, parser, Parse at range) as they are now.
+    ViewOptions view_options() const;
+    // Changes them as ONE cheap undo step labelled `label` ("Read-only on", "Parser: PNG image",
+    // "Parse at 0x100"): no piece list, caret or bookmarks are stored (UndoEntry::view_only);
+    // undo()/redo() only restore the view options (also on a read-only document); dirty() and
+    // generation() do not change. Inside a group the group's step records them instead. Allowed
+    // on read-only documents (that is how one leaves read-only); false if busy or nothing changes.
+    // Scrolling, caret moves and the other view state are deliberately not undo steps.
+    bool set_view_options(const ViewOptions& o, const std::string& label);
     const std::vector<UndoEntry>& undo_stack() const { return undo_; }   // for a History panel
     const std::vector<UndoEntry>& redo_stack() const { return redo_; }
     // The history exactly as the next undo()/redo() will see it (a finished save may have rewritten
@@ -315,14 +366,18 @@ public:
     // run that already covers `max_bytes` bytes (edits inside the run's bytes, e.g. the low nibble
     // of its last byte, still merge). 0 = no limit. Defaults: 500 ms, 32 bytes.
     static void set_undo_merge(int ms, uint64_t max_bytes);
-    // Test hook: monotonic clock in milliseconds used by typing-run coalescing; null restores
-    // std::chrono::steady_clock.
+    // The clock of undo steps: wall-clock milliseconds since the Unix epoch (UndoEntry::time_ms,
+    // typing-run coalescing). Test hook: set_clock_for_tests replaces it; null restores
+    // std::chrono::system_clock.
+    static int64_t now_ms();
     static void set_clock_for_tests(int64_t (*now_ms)());
 
     // ---- state -------------------------------------------------------------------------------
     bool dirty() const;                // differs from the last saved/opened state
     uint64_t generation() const { return generation_; }  // bumps on every content change (incl. undo)
     bool read_only() const { return read_only_; }
+    // Not an undo step (how a document is opened: devices, compare sides, generated tabs); the
+    // Edit > Read-only toggle goes through set_view_options().
     void set_read_only(bool ro) { read_only_ = ro; }
     bool busy() const { return busy_.load(); }  // save in progress
     ViewState& view() { return view_; }
@@ -391,17 +446,21 @@ public:
     const std::shared_ptr<FileSource>& original() const;  // current file version (null if untitled)
     uint32_t current_source() const { return uint32_t(sources_.size()) - 1; }
     // Export state for the session. History entries that reference older file versions (from a
-    // rewrite save in this run) are dropped; Original pieces are renumbered to chunk 0.
+    // rewrite save in this run) are dropped; Original pieces are renumbered to chunk 0 (the
+    // current file) or 1.. (PersistedDoc::ref_files: files of replace_with_file, by path).
     PersistedDoc persist() const;
     // False if persist() cannot export the current unsaved state (it references more than 16 MiB
     // of a file version replaced by a save in this run, reachable by undoing past that save): a
-    // hot exit would lose it, so the UI should ask before quitting.
+    // hot exit would lose it, so the UI should ask before quitting. Files of replace_with_file
+    // never count (the session references them by path).
     bool hot_exit_safe() const;
     // Rebuild from a PersistedDoc. If the file at `path` no longer matches `file_stat`, the doc is
     // still restored (edits on top of the new contents) and `*changed_on_disk` is set to true.
     // If the file on disk already holds exactly the persisted content (our own save completed but
     // the session was not rewritten before exit), the doc opens clean from disk instead of
     // re-applying the edits, history from before that save is dropped and *note explains it.
+    // A ref file (PersistedDoc::ref_files) that changed or vanished drops the history states that
+    // need it; if the current state does, the file on disk opens clean instead (*note says so).
     static std::unique_ptr<Document> restore(const PersistedDoc& state, bool* changed_on_disk,
                                              std::string* err, std::string* note = nullptr);
     // Monotonic id of the current content state; lets the session skip re-writing unchanged docs.
@@ -424,11 +483,18 @@ private:
     bool editable() const;
 
     // ---- implementation details (all *_locked helpers expect mu_ to be held) ----
-    void push_undo(const char* label, bool coalesce, uint64_t edit_begin, uint64_t edit_end);
+    // `view_step`: a set_view_options() step (a view-only entry outside groups).
+    void push_undo(const char* label, bool coalesce, uint64_t edit_begin, uint64_t edit_end,
+                   bool view_step = false);
     void push_entry(std::vector<UndoEntry>& stack, UndoEntry&& e);
     void splice(uint64_t pos, uint64_t del, const std::vector<Piece>& ins);
     UndoEntry capture() const;
+    UndoEntry capture_view() const;   // a view-only entry of the current view options
+    ViewOptions view_options_locked() const;
+    // True for a file of replace_with_file (the session references it by path).
+    bool is_ref_file(const std::shared_ptr<FileSource>& s) const;
     void apply_entry(const UndoEntry& e);
+    bool step_history(std::vector<UndoEntry>& from, std::vector<UndoEntry>& to);  // undo / redo
     void apply_pending();       // UI thread only: install history rewritten by a save
     const std::vector<UndoEntry>& eff_undo() const { return pend_ ? pend_undo_ : undo_; }
     const std::vector<UndoEntry>& eff_redo() const { return pend_ ? pend_redo_ : redo_; }
@@ -470,6 +536,8 @@ private:
     std::string path_;
     std::string display_name_;
     std::vector<std::shared_ptr<FileSource>> sources_;  // file versions; back() is current (may hold null for untitled)
+    // The sources added by replace_with_file (read-only files of their own, not versions of ours).
+    std::vector<std::weak_ptr<FileSource>> ref_files_;
     PieceTable table_;
     AddBuffer add_;
     ViewState view_;

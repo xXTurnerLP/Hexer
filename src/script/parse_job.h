@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/document.h"
@@ -83,6 +84,75 @@ private:
 
     std::atomic<bool> cancel_{false}, done_{false};
     std::atomic<uint64_t> fields_{0}, offset_{0};
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::thread thread_;
+};
+
+// DetectJob: ScriptEngine::detect_parser on a worker thread, so a slow detect() never blocks the
+// UI. Each parser's detect(doc) runs as a ParseJob's parse() does: in a Lua state that ran only
+// the parser's own script, over a read-only clone of the document (the rules above apply: no
+// globals of other script files, doc reads see the start state, output buffered until take()).
+// The answer is detect_parser's: the first parser (registration order) whose detect returns true,
+// else the first whose extensions match the path, else "". A parser that cannot be rebuilt that
+// way (console / command parsers, a script that does not load on its own) gets its detect()
+// called in the main engine by take(), in its place in that order. Limit 1 s per detect().
+class DetectJob {
+public:
+    // UI thread: copies what the worker needs and returns at once (no worker when no parser has
+    // a detect() that can run in the background).
+    DetectJob(ScriptEngine& eng, Document& doc);
+    ~DetectJob();  // cancels and waits for the worker
+    DetectJob(const DetectJob&) = delete;
+    DetectJob& operator=(const DetectJob&) = delete;
+
+    uint64_t doc_id() const { return doc_id_; }
+    uint64_t generation() const { return gen_; }  // Document::generation() at the start
+    uint64_t reload() const { return reload_; }   // ScriptEngine::reload_count() at the start
+    // Its answer still holds for `doc` now: same document, generation and script reload.
+    bool current(const ScriptEngine& eng, const Document& doc) const {
+        return doc.id() == doc_id_ && doc.generation() == gen_ && eng.reload_count() == reload_;
+    }
+
+    bool done() const { return done_.load(); }
+    bool wait(int ms);                            // waits up to `ms` (< 0: forever); returns done()
+    void cancel() { cancel_ = true; }
+    bool cancelled() const { return cancel_.load(); }
+    bool background() const { return background_; }  // a worker ran (some detect() in it)
+
+    // UI thread, once, after done(): the parser name ("" = none; a cancelled job: ""). Moves the
+    // buffered console output / detect errors (logged once per reload) into `eng`, and calls the
+    // detect() of the parsers that need the main engine; `doc` must then still be current().
+    std::string take(ScriptEngine& eng, Document& doc);
+
+private:
+    void run();  // the worker
+
+    struct Entry {
+        enum State : uint8_t { Pending, Hit, Miss, Main };  // Main: take() asks the main engine
+        std::string name, file;
+        State state = Pending;
+    };
+    struct Out {
+        ConsoleLine line;
+        bool once = false;  // a detect error (ScriptEngine logs those once per reload)
+    };
+
+    uint64_t doc_id_ = 0, gen_ = 0, reload_ = 0;
+    bool background_ = false;
+    std::vector<Entry> entries_;      // parsers with a detect(), in detect order
+    std::vector<ParserInfo> list_;    // the parsers at the start (extension fallback)
+
+    // Inputs of the worker (copied on the UI thread).
+    std::unique_ptr<Document> clone_;
+    struct Script {
+        std::string chunk, text;
+    };
+    std::vector<std::pair<std::string, Script>> scripts_;  // file -> its source (as ParseJob)
+    std::vector<std::string> dirs_;
+
+    std::vector<Out> out_;            // valid once done()
+    std::atomic<bool> cancel_{false}, done_{false};
     std::mutex m_;
     std::condition_variable cv_;
     std::thread thread_;

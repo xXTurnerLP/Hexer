@@ -9,7 +9,9 @@
 //                       doc's id at save time ("docid=", after its "doc=" line) and the session
 //                       extras ("x.<key>=<value>", %XX-escaped); older builds ignore those lines
 //   doc-<n>.hxs         one binary file per document (magic "HXS1", little-endian, versioned;
-//                       v3 adds the doc's extras, see PersistedDoc::extras)
+//                       v3 adds the doc's extras, see PersistedDoc::extras; v4 history times,
+//                       view steps, the Parse at range and files referenced by path, e.g. the
+//                       .backup of Revert to Backup: PersistedDoc::ref_files)
 //   lock                held (OS file lock) by the instance that owns this directory
 //   instance-<k>/       same layout, used by further Hexer instances running at the same time;
 //                       the next instance that owns the main directory adopts their documents

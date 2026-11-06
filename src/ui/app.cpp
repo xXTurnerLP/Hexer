@@ -26,6 +26,7 @@
 #include "nfd.h"
 
 #include "core/devices.h"
+#include "core/elevation.h"
 #include "core/highlight.h"
 #include "core/inspector.h"
 #include "core/nav.h"
@@ -71,6 +72,7 @@ const char* const kUsage =
     "  --config-dir DIR     use DIR for settings, session and user scripts\n"
     "  --no-session         do not restore or write the hot-exit session\n"
     "  --new-instance       open a new window even if Hexer is already running\n"
+    "  --wait-pid PID       first wait (up to 30 s) until process PID has exited (Restart as Administrator)\n"
     "  --screenshot OUT.ppm render, save the window as a binary PPM and exit\n"
     "  --frames N           exit after N frames (default 30 with --screenshot)\n"
     "  --exec \"LUA\"         run Lua in the console after startup\n"
@@ -106,6 +108,13 @@ bool parse_args(int argc, char** argv, AppOptions& out, std::string* err) {
             out.no_session = true;
         } else if (a == "--new-instance") {
             out.new_instance = true;
+        } else if (a == "--wait-pid") {
+            std::string v;
+            if (!value(v)) return fail("--wait-pid needs a process id");
+            char* end = nullptr;
+            const unsigned long long n = std::strtoull(v.c_str(), &end, 10);
+            if (v.empty() || *end != '\0' || n == 0 || n > 0xFFFFFFFFull) return fail("--wait-pid: invalid process id '" + v + "'");
+            out.wait_pid = uint64_t(n);
         } else if (a == "--config-dir") {
             if (!value(out.config_dir) || out.config_dir.empty()) return fail("--config-dir needs a directory");
         } else if (a == "--screenshot") {
@@ -251,15 +260,6 @@ static void navigate(App& app, Tab& t, bool forward) {
                         (e.length ? fmt_range(e.offset, e.length) : fmt_offset(e.offset)));
 }
 
-void InlineEdit::begin(int r, uint64_t c, std::string text) {
-    row = r;
-    ctx = c;
-    buf = std::move(text);
-    error.clear();
-    focus = true;
-    start_frame = ImGui::GetFrameCount();
-}
-
 // =============================================================================================
 // Tabs
 // =============================================================================================
@@ -270,6 +270,14 @@ void refresh_tab_cache(Tab& t) {
     if (t.doc->busy()) return;  // save_as may be changing the path on the worker thread
     t.label = t.doc->display_name();
     t.path = t.doc->path();
+}
+
+// Scrolls so that `off`'s row is the first visible one (next draw). top_row = off is a row index
+// at least as large as off's row at any row width, so the ensure-visible scroll moves it up to
+// exactly that row.
+void scroll_row_to_top(Tab& t, uint64_t off) {
+    t.doc->view().top_row = off;
+    t.view.request_scroll_to(off, false);
 }
 
 Tab& add_tab(App& app, std::unique_ptr<Document> doc) {
@@ -285,6 +293,9 @@ Tab& add_tab(App& app, std::unique_ptr<Document> doc) {
         if (PacketsPanel::is_capture(*t->doc)) app.show_packets = app.focus_packets = true;
         if (t->doc->target() == SourceKind::Process) app.show_regions = app.focus_regions = true;
     }
+    // Process memory starts at its main module (Document::open_process), shown as the first row:
+    // above it there is mostly a hole of unreadable "??" rows.
+    if (t->doc->target() == SourceKind::Process) scroll_row_to_top(*t, t->doc->view().cursor);
     app.tabs.push_back(std::move(t));
     app.active = int(app.tabs.size()) - 1;
     app.select_request = app.active;
@@ -771,13 +782,17 @@ void do_undo(App& app, bool redo) {
     if (!d) return;
     const auto& stack = redo ? d->redo_stack() : d->undo_stack();
     std::string label = stack.empty() ? std::string() : stack.back().label;
+    const bool view_step = !stack.empty() && stack.back().view_only;  // read-only / parser: no caret
     bool ok = redo ? d->redo() : d->undo();
     if (!ok) {
         set_status(app, redo ? "Nothing to redo" : "Nothing to undo");
         return;
     }
     d->view().low_nibble = false;  // the restored caret sits on a whole byte, not a half-typed one
-    after_edit(*t);
+    if (view_step)
+        d->view_generation++;  // the view stays where it is
+    else
+        after_edit(*t);
     set_status(app, std::string(redo ? "Redo" : "Undo") + (label.empty() ? "" : ": " + label));
 }
 
@@ -931,8 +946,9 @@ void toggle_insert_mode(App& app) {
 void toggle_read_only(App& app) {
     Document* d = usable_doc(app);
     if (!d) return;
-    d->set_read_only(!d->read_only());
-    d->view_generation++;
+    ViewOptions o = d->view_options();
+    o.read_only = !o.read_only;
+    d->set_view_options(o, o.read_only ? "Read-only on" : "Read-only off");  // undoable (Ctrl+Z)
     set_status(app, d->read_only() ? "Read-only" : "Writable");
 }
 
@@ -1262,11 +1278,8 @@ void revert_to_backup(App& app) {
         return;
     }
     t->doc->view_generation++;
+    // Hot exit keeps the revert at any size: the session references the .backup by path.
     set_status(app, "Reverted " + t->label + " to " + path_filename(bak) + " (Undo restores it; Save writes it)", 8.0);
-    if (!t->doc->hot_exit_safe())
-        log_console(app, ConsoleLine::Warn,
-                    t->label + ": the reverted content (" + fmt_size(t->doc->size()) +
-                        ") is too large for the session; save it before quitting (Hexer asks on exit).");
 }
 
 bool has_compare(App& a) { return a.diff != nullptr; }
@@ -1392,7 +1405,8 @@ struct Action {
     ImGuiKeyChord keys[4];  // unused slots are 0
     void (*run)(App&);
     bool (*enabled)(App&);  // nullptr = always enabled
-    bool in_text;           // also fires while a text field has keyboard focus
+    bool in_text;           // also fires while a text field has keyboard focus (unless the key is a
+                            // text-editing one; the routing policy is in ui/input.h)
     bool repeat;
 };
 
@@ -1434,9 +1448,7 @@ bool apply_parser_at_cursor(App& app, const std::string& lua, const std::string&
         return false;
     }
     if (!app.engine->run_source(lua, "C struct: " + name, err)) return false;
-    d->view().parser = name;
-    d->view_generation++;
-    set_parse_base(app, *t, focus_offset(d->view()));
+    set_parse(app, *t, name, focus_offset(d->view()), UINT64_MAX, true);  // one undo step
     app.show_structure = app.focus_structure = true;
     return true;
 }
@@ -1476,6 +1488,72 @@ void refresh_memory(App& a) {
     d->refresh_target();
     a.regions_panel.request_refresh();
     set_status(a, d->target_alive() ? "Memory refreshed (region map re-read)" : "The process has exited");
+}
+
+// Search > Next / Previous Readable Region: over the holes of a process's address space (the
+// region map is listed fresh: a quick OS query, like the Regions panel's Refresh).
+void step_readable_region(App& a, bool forward) {
+    Tab* t = active_tab(a);
+    Document* d = usable_doc(a);
+    if (!d || d->target() != SourceKind::Process) return;
+    std::vector<MemRegion> regs;
+    std::string err;
+    if (!process_regions(d->process_id(), regs, &err, false)) {
+        set_status(a, "Cannot list the memory regions: " + err);
+        return;
+    }
+    uint64_t base = 0, size = 0;
+    if (!readable_run_step(regs, d->size(), caret_byte(d->view()), forward, &base, &size)) {
+        set_status(a, forward ? "No readable region after the caret" : "No readable region before the caret");
+        return;
+    }
+    reveal_range(a, *t, base, 0, true);
+    scroll_row_to_top(*t, base);
+    set_status(a, "Readable region " + fmt_range(base, size));
+}
+
+// File > Restart as Administrator (Windows; the protocol is in core/elevation.h). `target` = one
+// more thing for the elevated instance to open (the picker's selection), "" = none.
+void restart_as_admin(App& app, const std::string& target) {
+    if (app.save.running) {
+        set_status(app, "Wait for the save to finish, then restart");
+        return;
+    }
+    // Hot exit carries the persistable tabs; the rest (process memory; every tab without hot exit)
+    // is reopened from the command line. Edits that would not survive are refused up front, so the
+    // quit below needs no prompt.
+    std::vector<std::string> targets;
+    for (auto& t : app.tabs) {
+        Document& d = *t->doc;
+        const bool carried = app.hot_exit && d.persistable();
+        if (d.dirty() && !(carried && d.hot_exit_safe())) {
+            show_message(app, "Restart as Administrator",
+                         t->label + " has unsaved changes that would not survive the restart" +
+                             (d.persistable() ? "" : " (process memory is not kept in the session)") +
+                             ".\nSave or undo them first.");
+            return;
+        }
+        if (!carried && d.has_path() && std::find(targets.begin(), targets.end(), d.path()) == targets.end())
+            targets.push_back(d.path());
+    }
+    if (!target.empty() && std::find(targets.begin(), targets.end(), target) == targets.end()) targets.push_back(target);
+    std::string err;
+    if (app.hot_exit && !save_session(app, true, &err)) {
+        show_message(app, "Restart as Administrator", "The session could not be written, so nothing was restarted:\n" + err);
+        return;
+    }
+    bool cancelled = false;
+    const std::vector<std::string> args =
+        restart_args(os_absolute_path(paths::config_dir()), os_process_id(), targets, app.opts.no_session);
+    if (!launch_elevated(args, &err, &cancelled)) {
+        if (cancelled)
+            set_status(app, "Restart as Administrator cancelled");
+        else
+            notify(app, "Restart as Administrator: " + err, true);
+        return;
+    }
+    // The elevated instance waits for this one to exit (--wait-pid), then restores the session.
+    app.quit_requested = true;  // process_quit: hot exit as usual, nothing left to ask
 }
 
 // Palette "Go to Module...": the Regions panel's Modules tab and its filterable module popup.
@@ -1586,6 +1664,8 @@ const Action kActions[] = {
     {"Open...", {C(ImGuiKey_O), 0}, [](App& a) { open_with_dialog(a); }, nullptr, true, false},
     {"Open Process...", {0, 0}, [](App& a) { a.targets.open_process_picker(); }, nullptr, true, false},
     {"Open Disk...", {0, 0}, [](App& a) { a.targets.open_disk_picker(); }, nullptr, true, false},
+    {"Restart as Administrator", {0, 0}, [](App& a) { restart_as_admin(a, ""); },
+     [](App&) { return can_restart_elevated(); }, true, false},
     {"Refresh Memory", {0, 0}, refresh_memory, has_process, true, false},
     {"Save", {C(ImGuiKey_S), 0},
      [](App& a) { if (Tab* t = active_tab(a)) start_save(a, *t, false, AfterSave::None); }, has_doc, true, false},
@@ -1641,6 +1721,9 @@ const Action kActions[] = {
     {"Navigate Back", {A(ImGuiKey_LeftArrow), 0}, [](App& a) { navigate(a, *active_tab(a), false); }, can_back, false, true},
     {"Navigate Forward", {A(ImGuiKey_RightArrow), 0}, [](App& a) { navigate(a, *active_tab(a), true); }, can_forward, false, true},
     {"Follow Pointer at Cursor", {C(ImGuiKey_Enter), C(ImGuiKey_KeypadEnter)}, follow_at_cursor, has_doc, false, false},
+    // Process memory: skip the unmapped / unreadable holes between regions
+    {"Next Readable Region", {A(ImGuiKey_PageDown), 0}, [](App& a) { step_readable_region(a, true); }, has_process, false, false},
+    {"Previous Readable Region", {A(ImGuiKey_PageUp), 0}, [](App& a) { step_readable_region(a, false); }, has_process, false, false},
     {"XOR / ADD / ROL Search...", {0, 0}, show_xor, nullptr, true, false},
     // View
     // "+" is Shift+= on US layouts and keeps the US "]" key code on e.g. German ones (GLFW backend).
@@ -1733,7 +1816,7 @@ const Action kActions[] = {
     {"Structure: Parse Selection", {0, 0}, parse_selection, has_selection, true, false},
     {"Structure: Parse from File Start", {0, 0}, [](App& a) {
          if (Tab* t = active_tab(a); t && usable_doc(a)) set_parse_base(a, *t, 0);
-     }, [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && (t->st.base != 0 || t->st.length != UINT64_MAX); }, true, false},
+     }, [](App& a) { const Document* d = usable_doc(a); return d && (d->view().parse_base != 0 || d->view().parse_length != UINT64_MAX); }, true, false},
     {"Structure: Copy as C Header", {0, 0}, [](App& a) { structure_copy_c_header(a); },
      [](App& a) { Tab* t = active_tab(a); return usable_doc(a) && t->st.has_result && !t->st.result.fields.empty(); }, true, false},
     {"Structure: Export C Header...", {0, 0}, [](App& a) { structure_export_c_header(a); },
@@ -1779,10 +1862,8 @@ void handle_shortcuts(App& app) {
     const bool typing = ImGui::GetIO().WantTextInput;
     for (const Action& act : kActions) {
         for (ImGuiKeyChord k : act.keys) {
-            if (!k) continue;
-            ImGuiInputFlags fl = ImGuiInputFlags_RouteGlobal | (act.repeat ? ImGuiInputFlags_Repeat : 0);
-            if (!ImGui::Shortcut(k, fl)) continue;
-            if (typing && !act.in_text) continue;
+            // Routing while a text field has focus: ui/input.h (text-editing keys never fire).
+            if (!global_shortcut(k, act.in_text, act.repeat)) continue;
             if (!action_enabled(app, act)) continue;
             act.run(app);
         }
@@ -2005,6 +2086,10 @@ void draw_navigate_items(App& app) {
     menu_action(app, "Go to Entry Point");
     menu_action(app, "Go to Symbol...");
     menu_action(app, "Go to Module...");
+    if (has_process(app)) {
+        menu_action(app, "Next Readable Region");
+        menu_action(app, "Previous Readable Region");
+    }
 }
 
 // File > Compare With: every other open document, or a file to open.
@@ -2044,6 +2129,7 @@ void draw_main_menu(App& app) {
         draw_recent_menu(app);
         menu_action(app, "Open Process...");
         menu_action(app, "Open Disk...");
+        if (can_restart_elevated()) menu_action(app, "Restart as Administrator");
         ImGui::Separator();
         menu_action(app, "Save");
         menu_action(app, "Save As...");
@@ -2180,12 +2266,48 @@ void draw_disk_banner(App& app, Tab& t) {
         reload_from_disk(app, t);
         return;
     }
+    ImGui::SetItemTooltip("Re-open the file as it is now. Edits and the undo history are dropped (the old\n"
+                          "history would undo onto bytes that are gone); bookmarks and the view are kept.");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Ignore")) {
+    // Keep mine: hide the banner for this version of the file (a newer change shows it again;
+    // saving over it asks first).
+    if (ImGui::SmallButton(t.doc->dirty() ? "Keep mine" : "Ignore")) {
         t.disk_changed = false;
         t.ignore_valid = true;
         t.ignored_stat = os_stat(t.path);
     }
+    if (t.doc->target() == SourceKind::File) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Compare")) compare_with_aux(app, t, false);
+        ImGui::SetItemTooltip("Compare this document with the file on disk (Compare tab)");
+    }
+    ImGui::Separator();
+}
+
+// Process memory that shows nothing but "??": the process has exited, or its memory cannot be read.
+void draw_process_banner(App& app, Tab& t) {
+    Document& d = *t.doc;
+    if (d.target() != SourceKind::Process) return;
+    if (!d.target_alive()) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(kWarnColor, "The process has exited: its memory is gone (File > Open Process... to open it again).");
+        ImGui::Separator();
+        return;
+    }
+    if (!d.target_read_denied()) return;
+    ImGui::AlignTextToFramePadding();
+#ifdef _WIN32
+    ImGui::TextColored(kErrorColor, "Cannot read this process's memory: access denied%s",
+                       can_restart_elevated() ? "." : " (a protected process).");
+    if (can_restart_elevated()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Restart as Administrator")) restart_as_admin(app, "");
+    }
+#else
+    (void)app;
+    ImGui::TextColored(kErrorColor, "Cannot read this process's memory: permission denied (needs ptrace access: "
+                                    "run Hexer as root, or allow it with kernel.yama.ptrace_scope).");
+#endif
     ImGui::Separator();
 }
 
@@ -2511,12 +2633,18 @@ void draw_split_panes(App& app, Tab& t, const std::vector<const HighlightSet*>& 
     }
 }
 
+// Ctrl+wheel over the editor (a tab's hex view or the Compare tab) zooms the mono font like
+// Ctrl +/- (the hex views leave Ctrl+wheel to us); touchpad fractions add up to whole steps.
+void ctrl_wheel_zoom(App& app) {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (!io.KeyCtrl || io.MouseWheel == 0.0f || !ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) return;
+    const int steps = wheel_steps(app.zoom_wheel, io.MouseWheel);
+    if (steps) zoom(app, float(steps));
+}
+
 void draw_hex_view(App& app, Tab& t) {
     Document& d = *t.doc;
-    // Ctrl+wheel over the editor zooms the mono font (the hex view leaves Ctrl+wheel to us).
-    ImGuiIO& io = ImGui::GetIO();
-    if (io.KeyCtrl && io.MouseWheel != 0.0f && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows))
-        zoom(app, io.MouseWheel > 0.0f ? 1.0f : -1.0f);
+    ctrl_wheel_zoom(app);
 
     std::vector<const HighlightSet*> layers;
     collect_layers(app, t, layers);
@@ -2556,6 +2684,7 @@ void draw_tab_content(App& app, Tab& t) {
         return;
     }
     draw_disk_banner(app, t);
+    draw_process_banner(app, t);
     draw_read_only_badge(app, t);
     if (app.find.open) draw_find_bar(app, t);
     draw_hex_view(app, t);
@@ -2579,6 +2708,7 @@ void scroll_compare_side(Document& d, const HexViewEvents& ev, uint64_t off, boo
 // scroll carry over to their tabs). The side the user works in becomes the active tab, so the
 // panels, shortcuts and context menu act on that document.
 void draw_compare(App& app, Tab& ta, Tab& tb) {
+    ctrl_wheel_zoom(app);
     DiffViewCallbacks cb;
     cb.config = make_view_config(app, ta);
     cb.config.tick_offsets = nullptr;
@@ -2685,6 +2815,7 @@ void draw_editor(App& app) {
             bool open = true;
             const bool selected = ImGui::BeginTabItem(label.c_str(), &open, flags);
             t.tab_id = ImGui::GetItemID();
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Middle)) open = false;  // middle-click closes, like x
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
                 ImGui::SetTooltip("%s", t.path.empty() ? "Untitled (not saved yet)" : t.path.c_str());
             if (selected) {
@@ -2706,6 +2837,7 @@ void draw_editor(App& app) {
                 const std::string label = "Compare: " + ta->label + " / " + tb->label + "###compare";
                 bool open = true;
                 const bool selected = ImGui::BeginTabItem(label.c_str(), &open, flags);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Middle)) open = false;
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
                     ImGui::SetTooltip("A: %s\nB: %s", ta->path.empty() ? ta->label.c_str() : ta->path.c_str(),
                                       tb->path.empty() ? tb->label.c_str() : tb->path.c_str());
@@ -2844,8 +2976,7 @@ void run_palette_item(App& app, const PaletteItem& it) {
         case 1: app.engine->run_command(it.arg); break;
         case 2:
             if (Document* d = usable_doc(app)) {
-                d->view().parser = it.arg;
-                d->view_generation++;
+                choose_parser(*d, it.arg);  // one undo step
                 app.show_structure = true;
             }
             break;
@@ -3454,7 +3585,7 @@ void draw_settings_window(App& app) {
         changed = true;
     }
 
-    ImGui::SeparatorText("Fonts (restart Hexer to apply)");
+    ImGui::SeparatorText("Fonts");
     static const char* kHinting[] = {"normal", "light", "none", "mono"};
     if (ImGui::BeginCombo("Hinting", st.font_hinting.c_str())) {
         for (const char* h : kHinting)
@@ -3468,6 +3599,7 @@ void draw_settings_window(App& app) {
     ImGui::PushItemWidth(360.0f * s);
     changed |= ImGui::InputTextWithHint("Hex font file", "auto (Cascadia Mono, Consolas, ...)", &st.mono_font);
     changed |= ImGui::InputTextWithHint("UI font file", "auto (Segoe UI, Inter, ...)", &st.ui_font);
+    help_marker("A .ttf / .otf path; loaded when you leave the field (a missing file: auto-detect).");
     ImGui::PopItemWidth();
     ImGui::TextDisabled("Loaded: %s, %s (%s)", app.fonts.mono_path.empty() ? "built-in" : path_filename(app.fonts.mono_path).c_str(),
                         app.fonts.ui_path.empty() ? "built-in" : path_filename(app.fonts.ui_path).c_str(),
@@ -3707,9 +3839,7 @@ uint64_t text_u64(const std::string& s, uint64_t fallback) {
 void save_tab_extras(Tab& t) {
     Document& d = *t.doc;
     if (d.busy()) return;
-    const bool parse_at = t.st.base != 0 || t.st.length != UINT64_MAX;  // Parse at offset / range
-    d.set_extra("parse.base", parse_at ? u64_text(t.st.base) : "");
-    d.set_extra("parse.length", parse_at && t.st.length != UINT64_MAX ? u64_text(t.st.length) : "");
+    // Parse at offset / range: ViewState::parse_base / parse_length (session format v4).
     d.set_extra("tail.enabled", t.tail.enabled ? "1" : "");
     d.set_extra("split.on", t.split ? "1" : "");
     d.set_extra("split.vertical", t.split && t.split_vertical ? "1" : "");
@@ -3733,13 +3863,8 @@ void save_tab_extras(Tab& t) {
 
 void restore_tab_extras(App& app, Tab& t) {
     Document& d = *t.doc;
-    const uint64_t base = text_u64(d.extra("parse.base"), 0);
-    const uint64_t length = text_u64(d.extra("parse.length"), UINT64_MAX);
-    if (base != 0 || length != UINT64_MAX) {
-        t.st.base = std::min(base, d.size());
-        t.st.length = length;
-        t.st.base_input = t.st.base ? fmt_offset(t.st.base) : std::string();
-    }
+    // Parse at (ViewState::parse_base; older sessions' "parse.*" extras are migrated on load).
+    d.view().parse_base = std::min(d.view().parse_base, d.size());
     if (d.extra("split.on") == "1") {
         set_split(t, true, d.extra("split.vertical") == "1");
         const std::string r = d.extra("split.ratio");
@@ -3908,6 +4033,7 @@ void update_title(App& app) {
         title += std::string(" ") + kEmDash + " " + t->label;
         if (t->doc->busy() || t->doc->dirty()) title += std::string(" ") + kDirtyDot;
     }
+    if (os_elevated()) title += " (Administrator)";
     if (title == app.window_title) return;
     app.window_title = title;
     glfwSetWindowTitle(app.window, title.c_str());
@@ -3961,8 +4087,7 @@ void draw_cstruct_dialog(App& app) {
         if (!os_write_whole_atomic(path, lua.data(), lua.size(), err)) return false;
         if (!app.save.running) app.engine->reload();  // else hot reload picks it up after the save
         if (Document* d = usable_doc(app)) {
-            d->view().parser = app.cstruct_dlg.options.name;
-            d->view_generation++;
+            choose_parser(*d, app.cstruct_dlg.options.name);  // one undo step
             app.show_structure = app.focus_structure = true;
         }
         return true;
@@ -3997,6 +4122,8 @@ void draw_targets_dialog(App& app) {
         mark_settings_dirty(app);
         return true;
     };
+    if (can_restart_elevated())
+        cb.restart_elevated = [&app](const std::string& target) { restart_as_admin(app, target); };
     app.targets.draw(app.fonts.mono, app.ui_scale, cb);
 }
 
@@ -4173,6 +4300,27 @@ void apply_ui_scale(App& app) {
     app.ui_scale = s;
     ImGui::GetStyle().FontSizeBase = kUiFontPx * s;  // fonts are rasterised on demand at any size
     apply_dark_theme(s);
+}
+
+FontOptions font_options(const Settings& s) {
+    FontOptions o;
+    o.ui_path = s.ui_font;
+    o.mono_path = s.mono_font;
+    o.hinting = s.font_hinting;
+    return o;
+}
+
+// Settings window: a new font file or hinting mode reloads the fonts right away (between frames;
+// sizes need nothing: fonts are rasterised at any size). Not while a text field is being edited,
+// so a font path being typed loads once, when the field is left.
+void apply_font_settings(App& app) {
+    const FontOptions want = font_options(app.settings);
+    if (same_font_options(want, app.fonts_loaded) || ImGui::GetIO().WantTextInput) return;
+    app.fonts_loaded = want;
+    app.fonts = reload_fonts(kUiFontPx * app.ui_scale, app.settings.font_size * app.ui_scale, want);
+    set_status(app, "Fonts reloaded: " + (app.fonts.mono_path.empty() ? std::string("built-in") : path_filename(app.fonts.mono_path)) +
+                        ", " + (app.fonts.ui_path.empty() ? std::string("built-in") : path_filename(app.fonts.ui_path)) +
+                        (app.fonts.freetype ? ", hinting " + want.hinting : std::string()));
 }
 
 void on_glfw_error(int code, const char* desc) {
@@ -4513,6 +4661,11 @@ void store_ui_settings(App& app) {
 // =============================================================================================
 
 int run_app(const AppOptions& opts) {
+    // Restart as Administrator: the old instance is still writing its session, settings and layout
+    // and holds the session lock; start once it is gone (it quits right after launching us).
+    if (opts.wait_pid && !wait_process_exit(opts.wait_pid, 30000))
+        std::fprintf(stderr, "hexer: process %llu is still running; starting anyway\n",
+                     static_cast<unsigned long long>(opts.wait_pid));
     App app;
     app.opts = opts;
     if (!opts.config_dir.empty()) paths::set_config_dir_override(opts.config_dir);
@@ -4561,10 +4714,8 @@ int run_app(const AppOptions& opts) {
     GImGui->ConfigNavWindowingKeyNext = 0;  // Ctrl+Tab switches document tabs instead
     GImGui->ConfigNavWindowingKeyPrev = 0;
 
-    FontOptions font_opt;
-    font_opt.ui_path = app.settings.ui_font;
-    font_opt.mono_path = app.settings.mono_font;
-    font_opt.hinting = app.settings.font_hinting;
+    const FontOptions font_opt = font_options(app.settings);
+    app.fonts_loaded = font_opt;
     app.fonts = load_fonts(kUiFontPx * app.ui_scale, app.settings.font_size * app.ui_scale, font_opt);
     apply_dark_theme(app.ui_scale);
     ImGui_ImplGlfw_InitForOpenGL(app.window, true);
@@ -4601,6 +4752,7 @@ int run_app(const AppOptions& opts) {
             app.quit_requested = true;  // the session makes this prompt-free (see process_quit)
         }
         if (app.dpi_changed) apply_ui_scale(app);
+        apply_font_settings(app);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();

@@ -954,3 +954,120 @@ TEST_CASE("procmem: Lua hx.open_process and doc:modules") {
     if (!err.empty()) MESSAGE(err);
     CHECK(host.docs.size() == 3);  // read-only + writable process documents + plain.bin
 }
+
+TEST_CASE("procmem: a process document starts at its main module, not in the hole at 0") {
+    std::vector<ModuleInfo> mods;
+    std::string err;
+    REQUIRE_MESSAGE(process_modules(self_pid(), mods, &err), err);
+    const ModuleInfo* exe = module_at(mods, addr_of(reinterpret_cast<const void*>(&self_pid)));
+    REQUIRE(exe);
+    CHECK(process_start_address(self_pid()) == exe->base);
+    auto doc = Document::open_process(self_pid(), false, &err);
+    REQUIRE_MESSAGE(doc, err);
+    CHECK(doc->view().cursor == exe->base);
+    CHECK_FALSE(doc->view().has_selection());
+    uint8_t b = 0, bad = 1;
+    REQUIRE(doc->read(doc->view().cursor, &b, 1, &bad) == 1);
+    CHECK(bad == 0);  // the first byte shown is readable (the image header)
+    CHECK_FALSE(doc->target_read_denied());  // this process's memory reads fine
+    CHECK(process_start_address(0xFFFFFFF0u) == 0);  // no such process
+}
+
+TEST_CASE("procmem: readable_run_step merges adjacent readable regions and steps over holes") {
+    auto reg = [](uint64_t base, uint64_t size, bool readable) {
+        MemRegion r;
+        r.base = base;
+        r.size = size;
+        r.readable = readable;
+        return r;
+    };
+    // [0x1000,0x3000) readable (two regions), hole, [0x5000,0x6000) no access, [0x8000,0x9000),
+    // [0x9000,0xA000) readable, hole, [0x20000,0x21000) at / above the limit.
+    const std::vector<MemRegion> regs = {reg(0x1000, 0x1000, true), reg(0x2000, 0x1000, true),
+                                         reg(0x5000, 0x1000, false), reg(0x8000, 0x1000, true),
+                                         reg(0x9000, 0x1000, true), reg(0x20000, 0x1000, true)};
+    const uint64_t limit = 0x20000;
+    uint64_t b = 0, n = 0;
+    auto fwd = [&](uint64_t from) { return readable_run_step(regs, limit, from, true, &b, &n); };
+    auto back = [&](uint64_t from) { return readable_run_step(regs, limit, from, false, &b, &n); };
+
+    REQUIRE(fwd(0));  // from the hole at 0
+    CHECK(b == 0x1000);
+    CHECK(n == 0x2000);  // merged
+    REQUIRE(fwd(0x1000));  // from a run's start: the next run
+    CHECK(b == 0x8000);
+    CHECK(n == 0x2000);
+    REQUIRE(fwd(0x2FFF));
+    CHECK(b == 0x8000);
+    REQUIRE(fwd(0x5800));  // inside the no-access region
+    CHECK(b == 0x8000);
+    CHECK_FALSE(fwd(0x8000));  // the last run below the limit
+    CHECK_FALSE(fwd(0x1FFFF));
+
+    CHECK_FALSE(back(0x2FFF));  // inside the first run: nothing before it
+    REQUIRE(back(0x3000));      // just past it (in the hole)
+    CHECK(b == 0x1000);
+    REQUIRE(back(0x8000));  // a run's start: the run before
+    CHECK(b == 0x1000);
+    REQUIRE(back(0x9FFF));  // inside the second run (its second region): the run before
+    CHECK(b == 0x1000);
+    REQUIRE(back(0xFFFFFFFF));
+    CHECK(b == 0x8000);
+    CHECK(n == 0x2000);
+    CHECK_FALSE(readable_run_step({}, limit, 0, true, &b, &n));
+}
+
+TEST_CASE("procmem: Next / Previous Readable Region step over a real hole of this process") {
+    HoleyPages hp;  // readable | no access | readable
+    const uint64_t a = addr_of(hp.base), pg = hp.pg;
+    std::vector<MemRegion> regs;
+    std::string err;
+    REQUIRE_MESSAGE(process_regions(self_pid(), regs, &err, false), err);
+    const uint64_t limit = process_address_limit(self_pid());
+    uint64_t b = 0, n = 0;
+    REQUIRE(readable_run_step(regs, limit, a, true, &b, &n));
+    CHECK(b == a + 2 * pg);  // the page after the hole starts the next run
+    REQUIRE(readable_run_step(regs, limit, a + 2 * pg, false, &b, &n));
+    CHECK(b <= a);
+    CHECK(b + n == a + pg);  // the run before ends at the hole
+}
+
+// A page that becomes unreadable after the region map was read (decommitted / unmapped) sits
+// inside a region the map still calls readable, so the 64 KiB block read fails as a whole: the
+// block then falls back to page-granular reads, and only that page shows "??" - the pages after
+// it in the same block stay readable.
+TEST_CASE("procmem: one failing page in a cached block does not blank the rest of the block") {
+    const size_t pg = page_size();
+#ifdef _WIN32
+    auto* m = static_cast<uint8_t*>(VirtualAlloc(nullptr, 3 * pg, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    REQUIRE(m);
+#else
+    void* mm = mmap(nullptr, 3 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(mm != MAP_FAILED);
+    auto* m = static_cast<uint8_t*>(mm);
+#endif
+    fill_pattern(m, 3 * pg, 21);
+    std::string err;
+    auto doc = Document::open_process(self_pid(), false, &err);  // its map: all three pages readable
+    REQUIRE_MESSAGE(doc, err);
+#ifdef _WIN32
+    REQUIRE(VirtualFree(m + pg, pg, MEM_DECOMMIT));
+#else
+    REQUIRE(munmap(m + pg, pg) == 0);
+#endif
+    std::vector<uint8_t> buf(3 * pg), bad(3 * pg);
+    CHECK(doc->read(addr_of(m), buf.data(), buf.size(), bad.data()) == buf.size());
+    CHECK(std::count(bad.begin(), bad.begin() + std::ptrdiff_t(pg), uint8_t(1)) == 0);
+    CHECK(std::count(bad.begin() + std::ptrdiff_t(pg), bad.begin() + std::ptrdiff_t(2 * pg), uint8_t(1)) ==
+          std::ptrdiff_t(pg));
+    CHECK(std::count(bad.begin() + std::ptrdiff_t(2 * pg), bad.end(), uint8_t(1)) == 0);
+    CHECK(std::memcmp(buf.data(), m, pg) == 0);
+    CHECK(std::memcmp(buf.data() + 2 * pg, m + 2 * pg, pg) == 0);
+    CHECK_FALSE(doc->io_error());
+#ifdef _WIN32
+    VirtualFree(m, 0, MEM_RELEASE);
+#else
+    munmap(m, pg);
+    munmap(m + 2 * pg, pg);
+#endif
+}

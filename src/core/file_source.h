@@ -30,6 +30,12 @@ public:
     // readable (size() when none follows); off itself when off is not inside a known hole.
     virtual bool sparse() const { return false; }
     virtual uint64_t next_readable(uint64_t off) const { return off; }
+    // Holes of a sparse FILE (readable, all zeros; unlike the holes above): FileSource::data_range.
+    // Default: unknown (false), everything may hold data.
+    virtual bool data_range(uint64_t off, uint64_t& begin, uint64_t& end) const {
+        (void)off, (void)begin, (void)end;
+        return false;
+    }
     virtual bool writable() const { return false; }
     // Writes all n bytes at off or returns false (read-only backends always return false).
     virtual bool write(uint64_t off, const uint8_t* src, size_t n) {
@@ -39,6 +45,9 @@ public:
     virtual bool flush() { return true; }
     virtual void refresh() {}                      // re-query the layout (process: region map)
     virtual bool alive() const { return true; }    // false once a process target has exited
+    // True when the target opened but not one of its readable regions gave a byte when probed at
+    // open (process memory whose reads are refused): its view would be nothing but "??".
+    virtual bool read_denied() const { return false; }
 };
 
 // A regular file / device opened through OsFile (mode Read or ReadWrite).
@@ -74,6 +83,12 @@ public:
     // sparse source (unmapped addresses, or pages that just failed to read); size() if none follows.
     uint64_t next_readable(uint64_t offset) const;
     bool sparse() const;                 // holes are expected (process memory)
+    // Sparse files (holes that read as zeros, not the unreadable holes above): the first range at
+    // or after `offset` that may hold non-zero bytes, [begin, end) with offset <= begin < end <=
+    // size(); [offset, begin) is a hole. begin == end == size() when only a hole follows. False
+    // when unknown (devices, process memory, no OS support): treat everything as data. One OS
+    // query (FSCTL_QUERY_ALLOCATED_RANGES / SEEK_DATA + SEEK_HOLE), nothing is read.
+    bool data_range(uint64_t offset, uint64_t& begin, uint64_t& end) const;
     void invalidate();                   // drop all cached blocks (after an in-place write)
     // Bumps whenever invalidate() / refresh() / extend() dropped cached bytes (the content may have
     // changed under the same source: an in-place save, a forced save, process memory).
@@ -81,6 +96,7 @@ public:
     // Process: re-read the region map and drop cached bytes (regions change while it runs).
     void refresh();
     bool alive() const;                  // false once a process target has exited
+    bool read_denied() const;            // ByteBackend::read_denied (process memory)
     // Live tail: the file grew by appending; make [size(), new_size) readable. Only growth (false
     // if new_size < size()). Drops the cached, possibly short block at the old end. Thread-safe with
     // readers; Snapshots keep their old size (their pieces only reference the old range).

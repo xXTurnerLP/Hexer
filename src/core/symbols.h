@@ -80,6 +80,11 @@ struct SymbolTable {
     // sorted, merged, small gaps between them included. The table depends on nothing else but
     // these bytes, the map, the limits and the document size (SymbolJob skips rebuilds with it).
     std::vector<std::pair<uint64_t, uint64_t>> sources;
+    // How it depends on the size: every document size in [size_min, size_max] gives the same
+    // table (with the same `sources` bytes). Each range check against the size is recorded: one
+    // that passed needs size >= its end, one that failed (a table past the end) needs size < its
+    // end; a value cut by the end (a name running into EOF) pins the exact size.
+    uint64_t size_min = 0, size_max = UINT64_MAX;
 
     bool empty() const { return symbols.empty() && forwarders.empty(); }
     // The first symbol at exactly `va` (exports before functions, objects, imports), or nullptr.
@@ -105,10 +110,11 @@ private:
 SymbolTable build_symbols(const Snapshot& snap, const AddressMap& map, const SymbolLimits& lim = {},
                           const std::atomic<bool>* cancel = nullptr);
 
-// True when `a` and `b` have the same size and every byte of `ranges` comes from the same place in
-// both (the same file version / add-buffer chunk at the same position, compared piece by piece:
-// O(pieces in the ranges), no bytes are read). An overwrite inside a range (even with equal
-// bytes) or an insert / delete before its end makes it false; undo back to `a`'s pieces true.
+// True when every byte of `ranges` (clipped to a's size) exists in `b` and comes from the same
+// place in both (the same file version / add-buffer chunk at the same position, compared piece
+// by piece: O(pieces in the ranges), no bytes are read). An overwrite inside a range (even with
+// equal bytes) or an insert / delete before its end makes it false, an edit after every range
+// does not (the sizes may differ); undo back to `a`'s pieces true.
 bool same_bytes(const Snapshot& a, const Snapshot& b, const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 // Background builds on one worker thread of its own (started by the first build). start() never
@@ -126,11 +132,14 @@ public:
 
     // Builds the table of `snap` under `map`, unless nothing it depends on changed: when no build
     // is pending and the last result was built under an equal map and limits, from a snapshot
-    // with same_bytes(that snapshot, *snap, result()->sources), the result is kept for `snap`
-    // (returns false; current() stays true). So an edit outside the tables' bytes (patching code)
-    // costs no rebuild; a size change always rebuilds. Process memory (a Process map, a Pe map
-    // in_memory) always rebuilds: its bytes change without edits. So does a truncated table (the
-    // time budget may have cut it) and a file version rewritten since (in-place save).
+    // with same_bytes(that snapshot, *snap, result()->sources) and a size inside the table's
+    // [size_min, size_max], the result is kept for `snap` (returns false; current() stays true).
+    // A Pe / Elf map's file_size is not compared (its regions are). So an edit outside the
+    // tables' bytes (patching code, an insert / delete after every table, e.g. appended data)
+    // costs no rebuild; a size change that flips a range check rebuilds. Process memory (a
+    // Process map, a Pe map in_memory) always rebuilds: its bytes change without edits. So does
+    // a truncated table (the time budget may have cut it) and a file version rewritten since
+    // (in-place save).
     bool start(std::shared_ptr<const Snapshot> snap, AddressMap map, SymbolLimits lim = {});
     bool running() const;   // a build is pending or running
     void wait();            // blocks until no build is pending or running (tests, scripts)

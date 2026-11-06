@@ -15,7 +15,9 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   takes no measurable time and adds about 6 MB of memory.
 - **Process memory and raw disks.** File > Open Process... lists the running processes (filter
   by name, pid or path) and opens one's address space as a document: offset = virtual address,
-  unmapped pages show as `??`, the status bar says `process 1234 · 47-bit address space`, and the
+  unmapped pages show as `??`, the status bar says `process 1234 · 47-bit address space`, the view
+  starts at the main module (its `MZ` header) instead of the empty address 0, Search > Next /
+  Previous Readable Region (`Alt+PgDn` / `Alt+PgUp`) jumps over the holes, and the
   **Regions** panel (opens by itself) lists the memory map (base, size, protection, type, module);
   click a region to select it. Its **Modules** tab lists the loaded modules (base, size, path;
   also the 32-bit ones of a WOW64 process), and Search > Go to Module... jumps to one by name. The
@@ -27,8 +29,11 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   Edit > Read-only off later); they keep their size, so they stay in overwrite mode and a save
   writes just the changed bytes in place (no backup). `F5` / File > Refresh Memory re-reads a
   process's memory map (cached bytes also refresh every second). Reading another process usually
-  needs administrator rights on Windows (ptrace rights on Linux). Process tabs are not kept by
-  hot exit; disks are, like files.
+  needs administrator rights on Windows (ptrace rights on Linux): **File > Restart as
+  Administrator** (also a button in both pickers and in a tab whose memory cannot be read) keeps
+  the session, unsaved edits included, starts Hexer elevated (Windows asks first) with the process
+  or disk you picked, and closes the old window; the title bar then says `(Administrator)`.
+  Process tabs are not kept by hot exit; disks are, like files.
 - **Editing.** Overwrite or insert (toggle with `Ins`), delete, fill a selection, cut, copy and
   paste. Paste is lenient: `DE AD BE EF`, `0xde,0xad`, `\xde\xad` and `b64:...` all work.
   Edited bytes are tinted amber.
@@ -36,8 +41,11 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   paste, fill, inspector and structure edits, and script commands (one undo step each). The
   history survives saves and restarts. Typing is grouped into one step per run of keys: a pause
   of more than 500 ms, or more than 32 typed bytes, starts a new step (both in Settings).
+  Edit > Read-only, the Structure panel's parser and Parse at are undo steps too (they change no
+  byte; `Ctrl+Z` turns read-only off again); moving the caret or scrolling is not.
 - **History panel** (View > History): every state of the document, oldest first, with the
-  action's name (Typing, Paste, Fill, Decode XOR 0x5A, Script: ...) and the bytes it changed.
+  action's name (Typing, Paste, Fill, Decode XOR 0x5A, Read-only on, Parser: PNG image, ...), the
+  bytes it changed and when ("just now", "5 min ago", "yesterday 14:03"; hover for the full date).
   The current state is highlighted, redo states are greyed and the last saved one is tagged
   "saved". Click a row (or use `Up` / `Down` in the panel) to undo or redo to exactly that state.
 - **Safe, fast saving.** If the size is unchanged, Hexer patches only the changed bytes in place.
@@ -131,7 +139,9 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Restore from .backup** (File menu, when `<file>.backup` exists): *Compare with Backup* shows
   the original side by side; *Revert to Backup* replaces the content with the backup as one
   undoable edit (nothing is read into memory, the file on disk changes only when you save, and the
-  `.backup` stays the original).
+  `.backup` stays the original). Hot exit keeps a revert of any size: the session refers to the
+  `.backup` by path; if it changed or vanished before the next start, the file on disk opens
+  instead (the console says so).
 - **Packets panel** for pcap / pcapng captures (opens by itself for a capture): every packet
   with time, length, protocol and a summary (Ethernet, VLAN, IPv4/IPv6, TCP, UDP, ICMP, ARP, ...),
   a live filter, and **Parse with**: pick a parser (e.g. your protocol's) and each packet you
@@ -176,7 +186,7 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   The "All open files" choice is remembered in `settings.ini`.
 - **Settings window** (Edit > Settings..., `Ctrl+,`): bytes per row, grouping, font size, UI
   scale, undo grouping, backups, hot exit, autosave interval and fonts. Changes apply right away
-  (fonts after a restart) and are saved to `settings.ini`.
+  (a font file path once you leave its field) and are saved to `settings.ini`.
 - **Fonts** are rasterised with FreeType (hinted, pixel-snapped hex cells). `font_hinting`
   (`normal`, `light`, `none`, `mono`), `mono_font` and `ui_font` (file paths, empty = auto) are
   in the Settings window and `settings.ini`.
@@ -185,8 +195,17 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Lua console** (REPL), script commands, and hot reload: save a `.lua` file and it reloads.
   Commands can ask for a value with `hx.prompt(title, default)` (a small dialog; Enter = OK,
   Esc = Cancel), e.g. *Selection: XOR with key* asks for the key.
-- Tabs, drag and drop, recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
-  banner when the file changes on disk, a read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
+- Tabs (drag to reorder, the order is kept by hot exit; middle-click closes one), drag and drop
+  of files (several at once), recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
+  read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
+- **File changed on disk** banner: **Reload** (the file as it is now; edits and undo history are
+  dropped, bookmarks kept), **Keep mine** (saving later asks before overwriting) or **Compare**
+  (your version against the file on disk in a Compare tab).
+- **Editing in panels:** double-click an Inspector value, a Structure field value or a bookmark's
+  name / note (or press `Enter` on the selected Inspector / Structure row) to edit it in place;
+  `Enter` applies it as one undo step, `Esc` cancels. While a text field has focus, its editing
+  keys (`Ctrl+Z`, `Ctrl+A`, `Ins`, arrows...) stay in it, and global shortcuts such as
+  `Ctrl+Tab`, `F3` and `Ctrl+S` still work.
 - **One window** (as in Sublime Text). Opening files while Hexer runs (`hexer file.bin`, "Open
   with") adds them as tabs to the running window and brings it to the front. `--new-instance`
   opens a separate window instead.
@@ -295,6 +314,7 @@ hexer [options] [files...]
 | `Ctrl+Shift+B` | Jump to a bookmark in any open file (fuzzy search) |
 | `Ctrl+click` / `Ctrl+Enter` | Follow the pointer under the mouse / at the cursor (`Ctrl+hover` previews the target) |
 | `Alt+Left` / `Alt+Right`, mouse back / forward | Back / forward through the jump history |
+| `Alt+PgDn` / `Alt+PgUp` (process memory) | Next / previous readable region (skips unmapped holes) |
 | `Ctrl+\` / `F6` | Split view on / off; switch to the other pane |
 | `Ctrl+,` | Settings |
 | `Ctrl+Shift+P` | Command palette |

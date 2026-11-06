@@ -1,8 +1,11 @@
 // Tests for session extras: per-document (PersistedDoc::extras, session file v3) and session-level
 // (Session::set_extra, stored in the index), backward compatibility with v2 session files, and the
-// Bookmarks "all open files" setting.
+// Bookmarks "all open files" setting; the Restart as Administrator handover (core/elevation).
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -16,10 +19,16 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/elevation.h"
 #include "core/nav.h"
 #include "core/os_file.h"
 #include "core/session.h"
 #include "core/settings.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 using namespace hx;
 namespace fs = std::filesystem;
@@ -168,16 +177,12 @@ TEST_CASE("session: document extras round trip (empty, many, binary-safe)") {
     {
         Session s(t.path());
         REQUIRE(s.save({plain.get(), rich.get(), one.get()}, 0));
-        // A doc without extras keeps the v2 layout (readable by older builds), others are v3.
-        int v2 = 0, v3 = 0;
+        // Every doc is written in the current format (v4: history times), extras or not.
         for (const std::string& f : os_list_files(t.path(), ".hxs")) {
             Bytes b = read_file(f);
             REQUIRE(b.size() > 8);
-            (le32(b, 4) == 2 ? v2 : v3)++;
-            if (le32(b, 4) != 2) CHECK(le32(b, 4) == 3);
+            CHECK(le32(b, 4) == 4);
         }
-        CHECK(v2 == 1);
-        CHECK(v3 == 2);
     }
     {
         Session s(t.path());
@@ -307,10 +312,10 @@ TEST_CASE("session: v2 session file written before extras still loads") {
         REQUIRE(d.undo_stack().size() == 2);
         CHECK(d.undo_stack().back().label == "Add bookmark");
         CHECK(d.redo_stack().empty());
-        // Upgrade: add an extra, the file becomes v3.
+        // Upgrade: the next save writes the current format (v4).
         d.set_extra("split.on", "1");
         REQUIRE(s.save({&d}, 0));
-        CHECK(le32(read_file(only_hxs(t.path())), 4) == 3);
+        CHECK(le32(read_file(only_hxs(t.path())), 4) == 4);
     }
     {
         Session s(t.path());
@@ -325,10 +330,10 @@ TEST_CASE("session: v2 session file written before extras still loads") {
         REQUIRE(d.undo());  // the overwrite
         const std::string orig = "hello\nfixture";
         CHECK(doc_bytes(d) == Bytes(orig.begin(), orig.end()));
-        // Downgrade direction: without extras the file is written as v2 again.
-        d.set_extra("split.on", "");
-        REQUIRE(s.save({&d}, 0));
-        CHECK(le32(read_file(only_hxs(t.path())), 4) == 2);
+        CHECK(d.undo_stack().empty());
+        CHECK(d.redo_stack().size() == 2);
+        // Steps from before timestamps have none (the History panel leaves the time empty).
+        CHECK(d.redo_stack().back().time_ms == 0);
     }
 }
 
@@ -464,4 +469,453 @@ TEST_CASE("session: the app's per-tab and session-level persistence keys round t
     CHECK(s.extra("cstruct.endian") == "be");
     CHECK(s.extra("cstruct.pack") == "4");
     s.clear();
+}
+
+// ---- Restart as Administrator (core/elevation.h) --------------------------------------------
+
+TEST_CASE("elevation: Windows command-line quoting round-trips through CommandLineToArgvW") {
+    CHECK(win_quote_arg("plain") == "plain");
+    CHECK(win_quote_arg("") == "\"\"");
+    CHECK(win_quote_arg("a b") == "\"a b\"");
+    CHECK(win_quote_arg(R"(C:\dir\x.bin)") == R"(C:\dir\x.bin)");  // no blanks: as is, backslashes literal
+    CHECK(win_quote_arg(R"(C:\Program Files\x\)") == R"("C:\Program Files\x\\")");  // doubled before the closing quote
+    CHECK(win_quote_arg(R"(say "hi")") == R"("say \"hi\"")");
+    CHECK(win_quote_arg(R"(a\"b)") == R"("a\\\"b")");  // backslashes before a quote: doubled, quote escaped
+    CHECK(win_quote_arg(R"(\\.\PhysicalDrive0)") == R"(\\.\PhysicalDrive0)");
+    const std::string jurgen = R"(C:\Users\J)" "\xC3\xBC" R"(rgen\my cfg)";
+    CHECK(win_command_line({"--config-dir", jurgen}) == "--config-dir \"" + jurgen + "\"");
+
+    const std::vector<std::string> args = {
+        "--new-instance", "--wait-pid", "1234", "--config-dir",
+        R"(C:\Users\J)" "\xC3\xBC" R"(rgen M)" "\xC3\xBC" R"(ller\AppData\Roaming\Hexer)",  // blanks + umlauts
+        "--", "process://4242", R"(\\.\PhysicalDrive1)", R"(C:\with space\)", "", "tab\there",
+        R"(quote"in)", R"(tail\\)", R"(a\\"b c)", "\xE6\x97\xA5\xE6\x9C\xAC \xE8\xAA\x9E.bin",  // CJK + a blank
+    };
+#ifdef _WIN32
+    const std::wstring line = L"hexer.exe " + utf8_to_wide(win_command_line(args));
+    int n = 0;
+    LPWSTR* w = CommandLineToArgvW(line.c_str(), &n);
+    REQUIRE(w);
+    REQUIRE(n == int(args.size()) + 1);
+    for (size_t i = 0; i < args.size(); ++i) CHECK(wide_to_utf8(w[i + 1]) == args[i]);
+    LocalFree(w);
+#else
+    CHECK(win_command_line(args).find(" \"\" \"tab\there\" ") != std::string::npos);  // pure: same text everywhere
+#endif
+}
+
+TEST_CASE("elevation: restart arguments of the elevated instance") {
+    CHECK(restart_args(R"(C:\cfg dir)", 77, {"process://5", R"(\\.\PhysicalDrive0)"}) ==
+          std::vector<std::string>{"--new-instance", "--wait-pid", "77", "--config-dir", R"(C:\cfg dir)", "--",
+                                   "process://5", R"(\\.\PhysicalDrive0)"});
+    CHECK(restart_args("", 9, {}) == std::vector<std::string>{"--new-instance", "--wait-pid", "9"});
+    CHECK(restart_args("/x", 9, {"-starts-with-dash.bin"}).back() == "-starts-with-dash.bin");  // after "--"
+    // An instance started with --no-session passes it on: the elevated one must not restore (and
+    // then own) the hot-exit session the old one never touched.
+    CHECK(restart_args("/x", 9, {"a.bin"}, true) ==
+          std::vector<std::string>{"--new-instance", "--no-session", "--wait-pid", "9", "--config-dir", "/x", "--", "a.bin"});
+    const std::vector<std::string> with_session = restart_args("/x", 9, {});
+    CHECK(std::count(with_session.begin(), with_session.end(), "--no-session") == 0);
+#ifndef _WIN32
+    CHECK_FALSE(can_restart_elevated());
+#endif
+    // Never blocks on a pid that is gone; times out on one that runs (this process).
+    CHECK_FALSE(wait_process_exit(os_process_id(), 30));
+    CHECK(wait_process_exit(0, 30));
+}
+
+TEST_CASE("elevation: session handover to the elevated instance through an injected launcher") {
+    TempDir td;
+    const std::string sdir = td.file("session");
+    REQUIRE(os_mkdirs(sdir));
+    const std::string data = td.file("data.bin");
+    write_file(data, Bytes(64, 0x11));
+
+    std::vector<std::string> launched;
+    bool deny = true;  // first: the user cancels the UAC prompt
+    set_elevated_launcher([&](const std::vector<std::string>& args, std::string* err, bool* cancelled) {
+        if (deny) {
+            if (cancelled) *cancelled = true;
+            if (err) *err = "cancelled";
+            return false;
+        }
+        launched = args;
+        return true;
+    });
+
+    auto old_session = std::make_unique<Session>(sdir);
+    REQUIRE(old_session->primary());
+    std::string err;
+    auto doc = Document::open_file(data, &err);
+    REQUIRE_MESSAGE(doc, err);
+    const uint8_t x = 0xAB;
+    REQUIRE(doc->overwrite(5, &x, 1));
+    doc->view().cursor = 5;
+    REQUIRE(old_session->save({doc.get()}, 0, &err));
+
+    // The old instance holds the session: an instance started now would only get instance-1/,
+    // without the edits. That is why the elevated one waits (--wait-pid) for the old one to exit.
+    {
+        Session early(sdir);
+        CHECK(early.secondary());
+        CHECK(early.load().docs.empty());
+    }
+
+    const auto args = restart_args(td.path(), os_process_id(), {"process://4242"});
+    bool cancelled = false;
+    CHECK_FALSE(launch_elevated(args, &err, &cancelled));
+    CHECK(cancelled);
+    CHECK(launched.empty());  // cancelled: nothing started, the old instance keeps running untouched
+
+    deny = false;
+    REQUIRE(launch_elevated(args, &err, &cancelled));
+    CHECK_FALSE(cancelled);
+    CHECK(launched == args);
+    CHECK(std::find(launched.begin(), launched.end(), "--new-instance") != launched.end());
+    CHECK(launched.back() == "process://4242");  // the process tab is not in the session: on the command line
+
+    // The old instance quits (hot exit already written), then the elevated one starts.
+    REQUIRE(old_session->save({doc.get()}, 0, &err));
+    old_session.reset();
+    doc.reset();
+    Session fresh(sdir);
+    CHECK(fresh.primary());
+    auto r = fresh.load();
+    REQUIRE(r.docs.size() == 1);  // exactly once: no duplicate, nothing lost
+    uint8_t b = 0;
+    REQUIRE(r.docs[0]->read(5, &b, 1) == 1);
+    CHECK(b == 0xAB);
+    CHECK(r.docs[0]->dirty());
+    CHECK(r.docs[0]->view().cursor == 5);
+    CHECK(r.docs[0]->can_undo());
+    set_elevated_launcher(nullptr);
+    fresh.clear();
+}
+
+// Tab drag reordering: App keeps app.tabs in the tab bar's visual order and saves them in that
+// order (a reorder changes session_signature, so it is saved); the session restores that order.
+TEST_CASE("session: documents restore in the order they were saved (reordered tabs)") {
+    TempDir t;
+    auto a = make_doc("A", "aaaa");
+    auto b = make_doc("B", "bbbb");
+    auto c = make_doc("C", "cccc");
+    {
+        Session s(t.path());
+        REQUIRE(s.save({c.get(), a.get(), b.get()}, 1));
+    }
+    auto r = Session(t.path()).load();
+    REQUIRE(r.docs.size() == 3);
+    CHECK(r.docs[0]->display_name() == "C");
+    CHECK(r.docs[1]->display_name() == "A");
+    CHECK(r.docs[2]->display_name() == "B");
+    CHECK(r.active_index == 1);
+}
+
+// ---- session format v4: history times, view steps, Parse at, files referenced by path --------
+
+namespace {
+
+void put_str(Bytes& b, const std::string& s) {
+    const size_t at = b.size();
+    b.resize(at + 4 + s.size());
+    put_le32(b, at, uint32_t(s.size()));
+    if (!s.empty()) std::memcpy(b.data() + at + 4, s.data(), s.size());
+}
+
+int64_t g_session_ms = 0;
+int64_t session_clock() { return g_session_ms; }
+
+}  // namespace
+
+TEST_CASE("session: a v3 file (Parse at kept as extras) restores exactly and migrates") {
+    // v3 = the v2 layout + the extension block: the kV2Doc fixture with version 3 and extras
+    // "parse.base" = "5", "parse.length" = "3", "split.on" = "1", as the previous build wrote them.
+    TempDir t;
+    Bytes b(std::begin(kV2Doc), std::end(kV2Doc));
+    b.resize(b.size() - 4);  // the CRC
+    put_le32(b, 4, 3);
+    Bytes block(4);
+    put_le32(block, 0, 3);
+    for (const char* kv : {"parse.base", "5", "parse.length", "3", "split.on", "1"}) put_str(block, kv);
+    put_str(b, std::string(block.begin(), block.end()));
+    b.resize(b.size() + 4);
+    fix_crc(b);
+    write_file(t.file("doc-1.hxs"), b);
+    REQUIRE(os_write_whole_atomic(t.file("session.ini"), kV2Index, std::strlen(kV2Index)));
+    const std::string want_s("he\xab\xcdo\nfixture", 13);
+    const Bytes want(want_s.begin(), want_s.end());
+    {
+        Session s(t.path());
+        auto r = s.load();
+        CHECK(r.warnings.empty());
+        REQUIRE(r.docs.size() == 1);
+        Document& d = *r.docs[0];
+        CHECK(doc_bytes(d) == want);
+        CHECK(d.view().parser == "png");
+        CHECK(d.view().parse_base == 5);  // moved out of the extras
+        CHECK(d.view().parse_length == 3);
+        CHECK(d.extras() == std::map<std::string, std::string>{{"split.on", "1"}});
+        REQUIRE(d.undo_stack().size() == 2);
+        CHECK(d.undo_stack().back().time_ms == 0);  // no times before v4
+        CHECK_FALSE(d.undo_stack().back().view_only);
+        d.view_generation++;  // a change: the next save writes the current format
+        REQUIRE(s.save({&d}, 0));
+        CHECK(le32(read_file(only_hxs(t.path())), 4) == 4);
+    }
+    Session s(t.path());
+    auto r = s.load();
+    CHECK(r.warnings.empty());
+    REQUIRE(r.docs.size() == 1);
+    Document& d = *r.docs[0];
+    CHECK(doc_bytes(d) == want);
+    CHECK(d.view().parse_base == 5);
+    CHECK(d.view().parse_length == 3);
+    CHECK(d.extra("parse.base").empty());
+    REQUIRE(d.undo());
+    REQUIRE(d.undo());
+    const std::string orig = "hello\nfixture";
+    CHECK(doc_bytes(d) == Bytes(orig.begin(), orig.end()));
+}
+
+TEST_CASE("session: v4 keeps history times, view steps and the Parse at range") {
+    TempDir t;
+    Document::set_clock_for_tests(&session_clock);
+    g_session_ms = 1700000000123;
+    auto d = make_doc("Doc", "0123456789");
+    const uint8_t x = 'x';
+    REQUIRE(d->overwrite(1, &x, 1));
+    g_session_ms += 1000;
+    ViewOptions o = d->view_options();
+    o.parser = "PNG image";
+    o.parse_base = 4;
+    o.parse_length = 6;
+    REQUIRE(d->set_view_options(o, "Parse 0x4..0x9 with PNG image"));
+    g_session_ms += 1000;
+    o.read_only = true;
+    REQUIRE(d->set_view_options(o, "Read-only on"));
+    Document::set_clock_for_tests(nullptr);
+    {
+        Session s(t.path());
+        REQUIRE(s.save({d.get()}, 0));
+    }
+    auto s = std::make_unique<Session>(t.path());
+    auto r = s->load();
+    CHECK(r.warnings.empty());
+    REQUIRE(r.docs.size() == 1);
+    Document& e = *r.docs[0];
+    CHECK(e.read_only());
+    CHECK(e.view().parser == "PNG image");
+    CHECK(e.view().parse_base == 4);
+    CHECK(e.view().parse_length == 6);
+    REQUIRE(e.undo_stack().size() == 3);
+    CHECK(e.undo_stack()[0].time_ms == 1700000000123);
+    CHECK(e.undo_stack()[1].time_ms == 1700000001123);
+    CHECK(e.undo_stack()[2].time_ms == 1700000002123);
+    CHECK(e.undo_stack()[1].view_only);
+    CHECK(e.undo_stack()[1].pieces.empty());
+    CHECK(e.undo_stack()[2].label == "Read-only on");
+    CHECK(e.dirty());
+    REQUIRE(e.undo());  // read-only off: allowed while read-only
+    CHECK_FALSE(e.read_only());
+    REQUIRE(e.undo());
+    CHECK(e.view().parser.empty());
+    CHECK(e.view().parse_base == 0);
+    CHECK(e.view().parse_length == UINT64_MAX);
+    CHECK(doc_bytes(e) == Bytes{'0', 'x', '2', '3', '4', '5', '6', '7', '8', '9'});
+    REQUIRE(e.undo());
+    CHECK(doc_bytes(e) == Bytes{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'});
+    // The redo states (view steps among them) survive the next round trip too.
+    REQUIRE(s->save({&e}, 0));
+    s.reset();  // the next instance owns the session directory
+    auto r2 = Session(t.path()).load();
+    REQUIRE(r2.docs.size() == 1);
+    Document& f = *r2.docs[0];
+    REQUIRE(f.redo_stack().size() == 3);
+    CHECK(f.redo_stack()[1].view_only);
+    CHECK(f.redo_stack()[1].time_ms == 1700000001123);
+    REQUIRE(f.redo());
+    REQUIRE(f.redo());
+    REQUIRE(f.redo());
+    CHECK(f.read_only());
+    CHECK(f.view().parse_base == 4);
+    CHECK(doc_bytes(f) == Bytes{'0', 'x', '2', '3', '4', '5', '6', '7', '8', '9'});
+}
+
+TEST_CASE("session: a malformed view-step flag is a different-version file, kept") {
+    TempDir t;
+    auto d = make_doc("Doc", "abc");
+    ViewOptions o = d->view_options();
+    o.read_only = true;
+    REQUIRE(d->set_view_options(o, "R"));
+    REQUIRE(Session(t.path()).save({d.get()}, 0));
+    const std::string f = only_hxs(t.path());
+    Bytes b = read_file(f);
+    // The entry's label "R" (u32 1, 'R') is followed by the time (u64) and the flags byte (3).
+    const Bytes label = {1, 0, 0, 0, 'R'};
+    auto it = std::search(b.begin(), b.end(), label.begin(), label.end());
+    REQUIRE(it != b.end());
+    const size_t flags = size_t(it - b.begin()) + 5 + 8;
+    REQUIRE(b[flags] == 3);
+    b[flags] = 1;  // a view step without its view options
+    fix_crc(b);
+    write_file(f, b);
+    Session s(t.path());
+    auto r = s.load();
+    CHECK(r.docs.empty());
+    CHECK(s.kept().size() == 1);
+}
+
+// Revert to Backup on a file whose backup is far above the 16 MiB the session could inline: the
+// session references the .backup by path (+ size + mtime) instead of copying it.
+TEST_CASE("session: Revert to Backup of a big sparse file survives hot exit without copying it") {
+    TempDir t;
+    const std::string sdir = t.file("session");
+    const std::string p = t.file("big.bin");
+    write_file(p, Bytes(4096, 0x11));
+    const std::string bak = Document::backup_path_of(p);
+    const uint64_t big = 256ull << 20;
+    {
+        std::ofstream f(fs::path(std::u8string(bak.begin(), bak.end())), std::ios::binary | std::ios::trunc);
+        f.write("HEAD", 4);
+    }
+    fs::resize_file(fs::path(std::u8string(bak.begin(), bak.end())), big);  // sparse (zeros) up to 256 MiB
+    {
+        std::fstream f(fs::path(std::u8string(bak.begin(), bak.end())), std::ios::binary | std::ios::in | std::ios::out);
+        f.seekp(std::streamoff(big - 4));
+        f.write("TAIL", 4);
+    }
+    auto bytes_at = [](const Document& d, uint64_t off, size_t n) {
+        Bytes b(n);
+        REQUIRE(d.read(off, b.data(), n) == n);
+        return b;
+    };
+    const Bytes head = {'H', 'E', 'A', 'D'}, tail = {'T', 'A', 'I', 'L'}, zeros(64, 0);
+
+    auto d = Document::open_file(p);
+    REQUIRE(d);
+    const uint8_t x = 0x42;
+    REQUIRE(d->overwrite(10, &x, 1));
+    std::string err;
+    REQUIRE(d->replace_with_file(bak, "Revert to Backup", &err));
+    CHECK(d->size() == big);
+    CHECK(d->hot_exit_safe());  // before: false above 16 MiB (Hexer asked on exit)
+    const PersistedDoc pd = d->persist();
+    REQUIRE(pd.ref_files.size() == 1);
+    CHECK(pd.ref_files[0].path == os_absolute_path(bak));
+    CHECK(pd.ref_files[0].stat.size == big);
+    CHECK_FALSE(pd.edits_dropped);
+    {
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+    }
+    CHECK(read_file(only_hxs(sdir)).size() < 4096);  // nothing of the backup was copied
+
+    SUBCASE("restores the reverted content and its history") {
+        auto r = Session(sdir).load();
+        CHECK(r.warnings.empty());
+        REQUIRE(r.docs.size() == 1);
+        Document& e = *r.docs[0];
+        CHECK(e.size() == big);
+        CHECK(e.dirty());
+        CHECK(bytes_at(e, 0, 4) == head);
+        CHECK(bytes_at(e, big - 4, 4) == tail);
+        CHECK(bytes_at(e, big / 2, 64) == zeros);
+        CHECK(e.table().pieces().size() == 1);
+        uint64_t held = 0;
+        for (const auto& c : e.add_buffer().chunks()) held += c ? c->used : 0;
+        CHECK(held < 4096);  // no materialization
+        CHECK(e.hot_exit_safe());
+        REQUIRE(e.undo());
+        CHECK(e.size() == 4096);
+        CHECK(bytes_at(e, 10, 1) == Bytes{0x42});
+        REQUIRE(e.undo());
+        CHECK(bytes_at(e, 10, 1) == Bytes{0x11});
+        REQUIRE(e.redo());
+        REQUIRE(e.redo());
+        CHECK(e.size() == big);
+        CHECK(bytes_at(e, big - 4, 4) == tail);
+    }
+    SUBCASE("a changed backup: the file on disk opens, with a warning") {
+        d.reset();  // releases the backup (Windows)
+        {
+            std::ofstream f(fs::path(std::u8string(bak.begin(), bak.end())), std::ios::binary | std::ios::app);
+            f.write("!", 1);
+        }
+        auto r = Session(sdir).load();
+        REQUIRE(r.docs.size() == 1);
+        REQUIRE(r.warnings.size() == 1);
+        CHECK(r.warnings[0].find("big.bin.backup changed or is missing") != std::string::npos);
+        Document& e = *r.docs[0];
+        CHECK_FALSE(e.dirty());
+        CHECK(e.size() == 4096);
+        CHECK(bytes_at(e, 10, 1) == Bytes{0x11});
+        REQUIRE(e.undo());  // the history before the revert is kept
+        CHECK(bytes_at(e, 10, 1) == Bytes{0x42});
+        CHECK(e.redo_stack().size() == 1);
+    }
+    SUBCASE("a deleted backup that only the redo history needs: those steps are dropped") {
+        REQUIRE(d->undo());
+        {
+            Session s(sdir);
+            REQUIRE(s.save({d.get()}, 0, &err));
+        }
+        d.reset();
+        REQUIRE(os_remove(bak));
+        auto r = Session(sdir).load();
+        REQUIRE(r.docs.size() == 1);
+        REQUIRE(r.warnings.size() == 1);
+        CHECK(r.warnings[0].find("undo steps that needed big.bin.backup were dropped") != std::string::npos);
+        Document& e = *r.docs[0];
+        CHECK(e.dirty());
+        CHECK(e.size() == 4096);
+        CHECK(bytes_at(e, 10, 1) == Bytes{0x42});
+        CHECK(e.redo_stack().empty());
+        REQUIRE(e.undo());
+        CHECK(bytes_at(e, 10, 1) == Bytes{0x11});
+    }
+}
+
+TEST_CASE("session: an unsaved Revert to Backup is not taken for our own save when the file changed to its size") {
+    TempDir t;
+    const std::string sdir = t.file("session");
+    const std::string p = t.file("f.bin");
+    const std::string bak = Document::backup_path_of(p);
+    write_file(p, Bytes(64, 0x11));
+    write_file(bak, Bytes(64, 0x22));
+    {
+        auto d = Document::open_file(p);
+        REQUIRE(d);
+        std::string err;
+        REQUIRE(d->replace_with_file(bak, "Revert to Backup", &err));
+        Session s(sdir);
+        REQUIRE(s.save({d.get()}, 0, &err));
+    }
+    // The file on disk changes behind our back, keeping its size (a newer mtime either way).
+    auto rewrite = [&](uint8_t v) {
+        const fs::path fp(std::u8string(p.begin(), p.end()));
+        const auto before = fs::last_write_time(fp);
+        write_file(p, Bytes(64, v));
+        fs::last_write_time(fp, before + std::chrono::seconds(5));
+    };
+    auto said_saved = [](const Session::Restored& r) {
+        for (const std::string& w : r.warnings)
+            if (w.find("was saved just before") != std::string::npos) return true;
+        return false;
+    };
+    SUBCASE("other bytes: the reverted content stays, unsaved") {
+        rewrite(0x33);
+        auto r = Session(sdir).load();
+        REQUIRE(r.docs.size() == 1);
+        CHECK_FALSE(said_saved(r));
+        CHECK(r.docs[0]->dirty());
+        CHECK(doc_bytes(*r.docs[0]) == Bytes(64, 0x22));
+    }
+    SUBCASE("the reverted bytes (our save completed): it opens clean from disk") {
+        rewrite(0x22);
+        auto r = Session(sdir).load();
+        REQUIRE(r.docs.size() == 1);
+        CHECK(said_saved(r));
+        CHECK_FALSE(r.docs[0]->dirty());
+        CHECK(doc_bytes(*r.docs[0]) == Bytes(64, 0x22));
+    }
 }

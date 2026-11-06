@@ -54,24 +54,6 @@ void empty_note(App& app, const char* no_doc_text) {
     ImGui::TextDisabled("%s", t ? "Document is being saved..." : no_doc_text);
 }
 
-// Single-line in-place editor. Returns +1 = commit, -1 = cancelled, 0 = still editing.
-// With `commit_on_blur`, clicking elsewhere after an edit commits instead of cancelling.
-int inline_edit_input(InlineEdit& e, bool commit_on_blur) {
-    if (e.focus) {
-        ImGui::SetKeyboardFocusHere();
-        e.focus = false;
-    }
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    const bool enter = ImGui::InputText("##inline", &e.buf,
-                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
-    if (!e.error.empty() && ImGui::IsItemActive()) ImGui::SetTooltip("%s", e.error.c_str());
-    if (enter) return 1;
-    if (ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) return -1;
-    if (commit_on_blur && ImGui::IsItemDeactivatedAfterEdit()) return 1;
-    if (!ImGui::IsItemActive() && ImGui::GetFrameCount() > e.start_frame + 2) return -1;
-    return 0;
-}
-
 // Popups close on Esc only with keyboard navigation enabled, which the app does not use.
 void close_popup_on_escape() {
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
@@ -79,9 +61,7 @@ void close_popup_on_escape() {
 
 // Keep editing after a rejected value (error shown as tooltip + status).
 void retry_edit(App& app, InlineEdit& e, const std::string& err) {
-    e.error = err.empty() ? "invalid value" : err;
-    e.focus = true;
-    e.start_frame = ImGui::GetFrameCount();
+    e.retry(err);
     set_status(app, "Invalid value: " + e.error);
 }
 
@@ -595,21 +575,18 @@ void adopt_parse(App& app, Tab& t) {
     parse_result_changed(app, st, *t.doc, old_count);
 }
 
-// Detects the parser (cheap detect() calls, UI thread) and starts the job; no parser: no tree.
-void start_parse(App& app, Tab& t) {
+// Starts the parse job with parser `name` (requested: the chosen parser, "" = Auto; t0: start of
+// the detect + parse); no parser: no tree.
+void start_parse_job(App& app, Tab& t, const std::string& name, const std::string& requested, double t0) {
     StructureState& st = t.st;
     Document& d = *t.doc;
-    const double t0 = now_s();
-    const std::string requested = d.view().parser;
-    const std::string name = requested.empty() ? app.engine->detect_parser(d) : requested;
-    st.due = 0.0;
     if (name.empty()) {
         const size_t old_count = st.result.fields.size();
         st.result = ParseResult{};
         st.has_result = false;
         st.used_parser.clear();
-        st.parsed_base = st.base;
-        st.parsed_length = st.length;
+        st.parsed_base = d.view().parse_base;
+        st.parsed_length = d.view().parse_length;
         st.gen = d.generation();
         st.reload = app.engine->reload_count();
         st.requested = requested;
@@ -617,15 +594,40 @@ void start_parse(App& app, Tab& t) {
         parse_result_changed(app, st, d, old_count);
         return;
     }
-    st.job = std::make_unique<ParseJob>(*app.engine, d, name, st.base, st.length);
+    st.job = std::make_unique<ParseJob>(*app.engine, d, name, d.view().parse_base, d.view().parse_length);
     st.job_reload = app.engine->reload_count();
     st.job_requested = requested;
     st.job_t0 = t0;
-    if (st.job->wait(kInstantParseMs)) adopt_parse(app, t);
+    const int left = kInstantParseMs - int((now_s() - t0) * 1000.0);  // what the detect left
+    if (st.job->wait(std::max(left, 0))) adopt_parse(app, t);
 }
 
-// A parse has been running for a while: the shown tree is the previous one.
-bool parse_running(const StructureState& st) { return st.job && now_s() - st.job_t0 >= kParsingShowS; }
+// The finished detect job's answer (it is still current): parse with it.
+void adopt_detect(App& app, Tab& t) {
+    std::unique_ptr<DetectJob> job = std::move(t.st.detect);
+    const std::string name = job->take(*app.engine, *t.doc);
+    start_parse_job(app, t, name, std::string(), t.st.job_t0);
+}
+
+// Auto: detects the parser on a worker (DetectJob), then parses; else parses the chosen parser.
+void start_parse(App& app, Tab& t) {
+    StructureState& st = t.st;
+    Document& d = *t.doc;
+    const double t0 = now_s();
+    const std::string requested = d.view().parser;
+    st.due = 0.0;
+    if (!requested.empty()) return start_parse_job(app, t, requested, requested, t0);
+    st.detect = std::make_unique<DetectJob>(*app.engine, d);
+    st.job_reload = app.engine->reload_count();
+    st.job_requested.clear();
+    st.job_t0 = t0;
+    if (st.detect->wait(kInstantParseMs)) adopt_detect(app, t);  // else "Detecting..." meanwhile
+}
+
+// A detect / parse has been running for a while: the shown tree is the previous one.
+bool parse_running(const StructureState& st) {
+    return (st.job || st.detect) && now_s() - st.job_t0 >= kParsingShowS;
+}
 
 // Flattened list of visible rows (DFS honoring the expanded flags). Only rebuilt on change, so a
 // 200k-field tree costs nothing per frame; drawing is virtualised with ImGuiListClipper.
@@ -687,10 +689,7 @@ void draw_parser_combo(App& app, Tab& t, Document& d) {
         }
         ImGui::EndCombo();
     }
-    if (chosen && choose != forced) {
-        forced = choose;
-        d.view_generation++;
-    }
+    if (chosen && choose != forced) choose_parser(d, choose);  // one undo step
     ImGui::SameLine();
     if (ImGui::Button("Reparse")) {
         st.gen = UINT64_MAX;
@@ -717,9 +716,14 @@ void draw_parse_base(App& app, Tab& t, Document& d) {
     ImGui::TextUnformatted("Parse at");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150.0f * app.ui_scale);
+    const uint64_t base = d.view().parse_base;
+    if (st.base_input_for != base) {  // set elsewhere (Cursor, undo / redo, the session)
+        st.base_input_for = base;
+        st.base_input = base ? fmt_offset(base) : std::string();
+    }
     const bool enter = ImGui::InputTextWithHint("##base", "0 (file start)", &st.base_input,
                                                 ImGuiInputTextFlags_EnterReturnsTrue);
-    if (ImGui::IsItemDeactivated() && !enter) st.base_input = st.base ? fmt_offset(st.base) : std::string();
+    if (ImGui::IsItemDeactivated() && !enter) st.base_input = base ? fmt_offset(base) : std::string();
     ImGui::SetItemTooltip("Offset to parse from, like Go to: 0x1F00, #1234, cur, end-0x100 (Enter applies)");
     if (enter) {
         uint64_t v = 0;
@@ -735,7 +739,7 @@ void draw_parse_base(App& app, Tab& t, Document& d) {
     if (ImGui::Button("Cursor")) set_parse_base(app, t, focus_offset(d.view()));
     ImGui::SetItemTooltip("Parse from the cursor / selection start");
     ImGui::SameLine();
-    ImGui::BeginDisabled(st.base == 0 && st.length == UINT64_MAX);
+    ImGui::BeginDisabled(base == 0 && d.view().parse_length == UINT64_MAX);
     if (ImGui::Button("File start")) set_parse_base(app, t, 0);
     ImGui::EndDisabled();
 }
@@ -748,6 +752,11 @@ uint64_t parsed_len(const StructureState& st, const Document& d) {
 
 // "Parsing... 1234 fields [Cancel]" while a background parse has been running for a while.
 void draw_parse_progress(StructureState& st) {
+    if (!st.job) {  // still detecting the parser (no Cancel: pick a parser above instead)
+        ImGui::TextColored(kWarnColor, "Detecting...");
+        ImGui::SetItemTooltip("Asking each parser's detect() (1 s limit each)");
+        return;
+    }
     ImGui::TextColored(kWarnColor, "Parsing... %llu fields", ull(st.job->fields()));
     ImGui::SameLine();
     ImGui::BeginDisabled(st.job->cancelled());
@@ -760,6 +769,8 @@ void draw_parse_info(App& app, StructureState& st, const Document& d) {
     if (!st.has_result) {
         if (parse_running(st)) {
             draw_parse_progress(st);
+        } else if (st.detect) {
+            ImGui::TextDisabled("Detecting...");
         } else if (st.gen == UINT64_MAX || st.job) {
             ImGui::TextDisabled("Parsing...");
         } else {
@@ -968,6 +979,15 @@ void draw_field_table(App& app, Tab& t, Document& d) {
         }
     }
     if (app.st_edit.ctx == d.id() && app.st_edit.row >= 0 && st.gen != d.generation()) app.st_edit.end();
+    // Enter edits the selected field when the panel has focus (as in the Inspector; Ctrl+Enter
+    // follows the pointer at the caret). Not in the frame an edit commits with Enter: it is active.
+    if (st.cursor_field >= 0 && st.cursor_field < int(st.result.fields.size()) && app.st_edit.row < 0 &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !ImGui::GetIO().WantTextInput &&
+        !ImGui::GetIO().KeyCtrl &&
+        (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
+        const Field& f = st.result.fields[size_t(st.cursor_field)];
+        if (f.editable() && !d.read_only() && st.gen == d.generation()) app.st_edit.begin(st.cursor_field, d.id(), f.value);
+    }
     if (st.rows_dirty) rebuild_rows(st);
 
     int scroll_row = -1;
@@ -1005,13 +1025,24 @@ void update_structure(App& app, Tab& t) {
     StructureState& st = t.st;
     Document& d = *t.doc;
     std::erase_if(st.retired, [](const std::unique_ptr<ParseJob>& j) { return j->done(); });
+    std::erase_if(st.retired_detect, [](const std::unique_ptr<DetectJob>& j) { return j->done(); });
     const uint64_t gen = d.generation();
     const uint64_t rel = app.engine->reload_count();
     const std::string& want = d.view().parser;
+    if (st.detect) {  // Auto: its answer is used only while it still holds (else detect again)
+        const bool current = st.detect->current(*app.engine, d) && want.empty();
+        if (current && st.detect->done()) {
+            adopt_detect(app, t);
+        } else if (!current) {
+            st.detect->cancel();
+            st.retired_detect.push_back(std::move(st.detect));
+        }
+    }
+    if (st.detect || !st.retired_detect.empty()) app.wants_poll = true;
     if (st.job) {
         const ParseJob& j = *st.job;
         const bool current = j.generation() == gen && st.job_reload == rel && st.job_requested == want &&
-                             j.base() == st.base && j.length() == st.length;
+                             j.base() == d.view().parse_base && j.length() == d.view().parse_length;
         if (current && j.done()) {
             adopt_parse(app, t);
         } else if (!current) {  // its result would be stale: stop it, parse again once edits pause
@@ -1020,12 +1051,12 @@ void update_structure(App& app, Tab& t) {
         }
     }
     if (st.job || !st.retired.empty()) app.wants_poll = true;  // poll for the result / the worker's end
-    if (gen == st.gen && rel == st.reload && want == st.requested && st.base == st.parsed_base &&
-        st.length == st.parsed_length) {
+    if (gen == st.gen && rel == st.reload && want == st.requested && d.view().parse_base == st.parsed_base &&
+        d.view().parse_length == st.parsed_length) {
         st.due = 0.0;
         return;
     }
-    if (st.job) return;  // already parsing the current state
+    if (st.job || st.detect) return;  // already detecting / parsing the current state
     const double now = now_s();
     if (gen != st.pending_gen || rel != st.pending_reload || want != st.pending_parser) {
         st.pending_gen = gen;
@@ -1040,16 +1071,40 @@ void update_structure(App& app, Tab& t) {
 }
 
 void set_parse_base(App& app, Tab& t, uint64_t base, uint64_t length) {
+    // detect() looks at the file start: keep the parser that is shown now.
+    std::string parser = t.doc->view().parser;
+    if (base && parser.empty()) parser = t.st.used_parser;
+    set_parse(app, t, parser, base, length, true);
+}
+
+bool choose_parser(Document& d, const std::string& parser) {
+    ViewOptions o = d.view_options();
+    if (o.parser == parser) return false;
+    o.parser = parser;
+    return d.set_view_options(o, "Parser: " + (parser.empty() ? std::string("Auto-detect") : parser));
+}
+
+void set_parse(App& app, Tab& t, const std::string& parser, uint64_t base, uint64_t length, bool undoable) {
     StructureState& st = t.st;
     Document& d = *t.doc;
     if (d.busy()) return;
     base = std::min(base, d.size());
-    st.base = base;
-    st.length = length;  // UINT64_MAX = up to the end (the engine clamps a longer one)
-    st.base_input = base ? fmt_offset(base) : std::string();
-    // detect() looks at the file start: keep the parser that is shown now.
-    if (base && d.view().parser.empty() && !st.used_parser.empty()) {
-        d.view().parser = st.used_parser;
+    // length UINT64_MAX = up to the end (the engine clamps a longer one)
+    ViewOptions o = d.view_options();
+    const bool new_parser = o.parser != parser;
+    o.parser = parser;
+    o.parse_base = base;
+    o.parse_length = length;
+    if (undoable) {
+        std::string label = length != UINT64_MAX ? "Parse " + fmt_range(base, std::min(length, d.size() - base))
+                            : base               ? "Parse at " + fmt_offset(base)
+                                                 : std::string("Parse from file start");
+        if (new_parser) label += " with " + (parser.empty() ? std::string("Auto-detect") : parser);
+        d.set_view_options(o, label);  // false when nothing changes: then it is just a re-parse
+    } else {
+        d.view().parser = parser;
+        d.view().parse_base = base;
+        d.view().parse_length = length;
         d.view_generation++;
     }
     st.gen = UINT64_MAX;  // re-parse now
@@ -1347,6 +1402,20 @@ struct BookmarkChange {
     std::string text;
 };
 
+// Right-click menu of a bookmark row's Name / Note cell (the same edits as double-clicks).
+void bookmark_context_menu(App& app, Tab& t, const Bookmark& b, size_t i, BookmarkChange& change) {
+    if (!ImGui::BeginPopupContextItem("##bmctx")) return;
+    Document& d = *t.doc;
+    if (ImGui::MenuItem("Select bytes")) reveal_range(app, t, b.offset, b.length, true);
+    if (ImGui::MenuItem("Edit name")) app.bm_edit.begin(int(i) * 2, d.id(), b.name);
+    if (ImGui::MenuItem("Edit note")) app.bm_edit.begin(int(i) * 2 + 1, d.id(), b.note);
+    if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(b.offset).c_str());
+    ImGui::Separator();
+    if (ImGui::MenuItem("Delete")) change = {BookmarkChange::Remove, d.id(), i, {}};
+    close_popup_on_escape();
+    ImGui::EndPopup();
+}
+
 // The Name / Note cell: text (double-click edits) or the in-place editor. `field` 0 = name, 1 = note.
 void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, bool selected,
                         BookmarkChange& change) {
@@ -1372,6 +1441,7 @@ void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s\n%s", fmt_range(b.offset, b.length).c_str(),
                               "Click: select it  \xC2\xB7  double-click the name or note to edit");
+        bookmark_context_menu(app, t, b, i, change);
         return;
     }
     // Note: plain text; a double-click anywhere in the cell edits it.
@@ -1381,6 +1451,7 @@ void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field
     ImGui::InvisibleButton("##hit", ImVec2(w, ImGui::GetTextLineHeight()), ImGuiButtonFlags_AllowOverlap);
     const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (ImGui::IsItemClicked() && !dbl) reveal_range(app, t, b.offset, b.length, false);
+    bookmark_context_menu(app, t, b, i, change);
     ImGui::SetCursorScreenPos(p);
     if (text.empty())
         ImGui::TextDisabled("%s", dbl ? "" : "-");
@@ -1649,11 +1720,9 @@ void draw_packets_panel(App& app) {
     cb.parse = [&app, doc_id](const std::string& parser, uint64_t off, uint64_t len) {
         Tab* tab = find_tab(app, doc_id);
         if (!tab || tab->doc->busy()) return;
-        if (tab->doc->view().parser != parser) {
-            tab->doc->view().parser = parser;  // sticky per document; Structure > Auto-detect undoes it
-            tab->doc->view_generation++;
-        }
-        set_parse_base(app, *tab, off, len);
+        // Sticky per document (Structure > Auto-detect resets it); follows the selected packet like
+        // a caret move, so not an undo step.
+        set_parse(app, *tab, parser, off, len, false);
         app.show_structure = true;
     };
     cb.notify = [&app](const std::string& m) { set_status(app, m); };
@@ -1801,7 +1870,11 @@ void draw_doc_status(App& app, Tab& t) {
     const bool have = at < d.size() && d.read(at, &b, 1, &bad) == 1;
     if (have && bad) {
         ImGui::TextColored(kErrColor, "Byte ??");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("This byte could not be read from disk");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", d.target() == SourceKind::Process
+                                        ? "Unmapped or inaccessible memory: Alt+PgDn / Alt+PgUp jump to the next / "
+                                          "previous readable region"
+                                        : "This byte could not be read from disk");
     } else if (have) {
         const char c = (b >= 0x20 && b < 0x7F) ? char(b) : '.';
         ImGui::Text("Byte 0x%02X  %u  '%c'", unsigned(b), unsigned(b), c);

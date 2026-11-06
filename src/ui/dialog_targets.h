@@ -6,7 +6,8 @@
 //     cb.open_process(pid, writable). The disk picker lists disks and volumes with their sizes
 //     (also accepts a typed device path), "Writable" with a warning; Open calls
 //     cb.open_device(path, writable). A callback returning false keeps the window open and shows
-//     its *err (e.g. "Access is denied (try running Hexer as administrator)").
+//     its *err (e.g. "Access is denied (try running Hexer as administrator)"). With
+//     cb.restart_elevated set, both show a "Restart as Administrator" button.
 //   * RegionsPanel: two tabs for the active process document. "Regions": table base | size |
 //     prot | type | module, filter, Refresh (re-reads the region map and the document's cached
 //     bytes); a click calls cb.jump(base, size). "Modules": the loaded modules (core/devices.h
@@ -37,6 +38,10 @@ struct TargetsDialogCallbacks {
     // with the error shown. Null = that picker's Open button is disabled.
     std::function<bool(uint32_t pid, bool writable, std::string* err)> open_process;
     std::function<bool(const std::string& path, bool writable, std::string* err)> open_device;
+    // Set = both pickers show "Restart as Administrator" (the app sets it on Windows while not
+    // elevated; core/elevation.h). `target` = what the elevated instance opens: "process://<pid>"
+    // of the selected process / the selected or typed disk path ("" when nothing is selected).
+    std::function<void(const std::string& target)> restart_elevated;
 };
 
 class TargetsDialog {

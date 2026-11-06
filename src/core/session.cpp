@@ -21,8 +21,14 @@ constexpr char kMagic[4] = {'H', 'X', 'S', '1'};
 // 3: v2 + an extension block (u32 byte length, then u32 count + key/value strings: the doc's
 //    extras). Only written when the doc has extras, so files without them stay readable by v2
 //    builds. A malformed block (length right, contents not) drops the extras, not the doc.
-// Version 1 and 2 files are still read.
-constexpr uint32_t kVersion = 3;
+// 4: every history entry carries its time (i64 ms since the epoch) and a flags byte (bit 0 view
+//    step, bit 1 view options follow: u8 read-only, str parser, u64 parse base, u64 parse length);
+//    the view gets the Parse at range (u64 base, u64 length; v3 kept it in the extras
+//    "parse.base" / "parse.length", moved over on load); after the backed-up targets come the ref
+//    files (u32 count, then str path + u64 size + u64 mtime each: Original pieces with chunk k >= 1
+//    read ref file k - 1); the extension block is always present. Always written (the timestamps).
+// Versions 1 to 3 are still read; a newer file is kept for the Hexer that wrote it.
+constexpr uint32_t kVersion = 4;
 constexpr const char* kIndexFile = "session.ini";
 
 uint32_t crc32(const uint8_t* p, size_t n) {
@@ -87,6 +93,14 @@ struct Writer {
             u64(e.coalesce_begin);
             u64(e.coalesce_end);
             str(e.label);
+            u64(uint64_t(e.time_ms));
+            u8(uint8_t((e.view_only ? 1 : 0) | (e.has_view ? 2 : 0)));
+            if (e.has_view) {
+                u8(e.view.read_only);
+                str(e.view.parser);
+                u64(e.view.parse_base);
+                u64(e.view.parse_length);
+            }
         }
     }
 };
@@ -167,6 +181,20 @@ struct Reader {
             e.coalesce_begin = u64();
             e.coalesce_end = u64();
             e.label = str();
+            if (version >= 4) {
+                e.time_ms = int64_t(u64());
+                const uint8_t flags = u8();
+                if (flags & ~3u) ok = false;
+                e.view_only = (flags & 1) != 0;
+                e.has_view = (flags & 2) != 0;
+                if (e.view_only && (!e.has_view || !e.pieces.empty())) ok = false;
+                if (e.has_view) {
+                    e.view.read_only = u8() != 0;
+                    e.view.parser = str();
+                    e.view.parse_base = u64();
+                    e.view.parse_length = u64();
+                }
+            }
             if (!ok) break;
         }
         return es;
@@ -176,7 +204,7 @@ struct Reader {
 std::string serialize(const PersistedDoc& d) {
     Writer w;
     w.bytes(kMagic, 4);
-    w.u32(d.extras.empty() ? 2 : kVersion);
+    w.u32(kVersion);
     w.str(d.path);
     w.str(d.display_name);
     w.u8(d.file_stat.exists);
@@ -197,26 +225,55 @@ std::string serialize(const PersistedDoc& d) {
     w.u8(d.view.ascii_focus);
     w.u64(d.view.top_row);
     w.str(d.view.parser);
+    w.u64(d.view.parse_base);
+    w.u64(d.view.parse_length);
     w.bookmarks(d.view.bookmarks);
     w.u8(d.dirty);
     w.u8(d.read_only);
     w.u8(d.edits_dropped);
     w.u32(uint32_t(d.backup_done.size()));
     for (const std::string& b : d.backup_done) w.str(b);
-    if (!d.extras.empty()) {
-        Writer x;
-        x.u32(uint32_t(d.extras.size()));
-        for (const auto& [k, v] : d.extras) {
-            x.str(k);
-            x.str(v);
-        }
-        w.str(x.b);
+    w.u32(uint32_t(d.ref_files.size()));
+    for (const PersistedDoc::RefFile& f : d.ref_files) {
+        w.str(f.path);
+        w.u64(f.stat.size);
+        w.u64(uint64_t(f.stat.mtime_ns));
     }
+    Writer x;
+    x.u32(uint32_t(d.extras.size()));
+    for (const auto& [k, v] : d.extras) {
+        x.str(k);
+        x.str(v);
+    }
+    w.str(x.b);
     w.u32(crc32(reinterpret_cast<const uint8_t*>(w.b.data()), w.b.size()));
     return std::move(w.b);
 }
 
 enum class Parse { Ok, Corrupt, Unsupported };
+
+// Sessions before v4: the Parse at range was the doc extras "parse.base" / "parse.length"
+// (decimal; unset = file start / to the end) and every Original piece read the document's file.
+void migrate_v3(PersistedDoc& d) {
+    auto take = [&](const char* key, uint64_t fallback) {
+        auto it = d.extras.find(key);
+        if (it == d.extras.end()) return fallback;
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);
+        const bool ok = !it->second.empty() && end && *end == 0;
+        d.extras.erase(it);
+        return ok ? uint64_t(v) : fallback;
+    };
+    d.view.parse_base = take("parse.base", 0);
+    d.view.parse_length = take("parse.length", UINT64_MAX);
+    auto zero = [](std::vector<Piece>& ps) {
+        for (Piece& p : ps)
+            if (p.src == Piece::Original) p.chunk = 0;
+    };
+    zero(d.pieces);
+    for (auto* stack : {&d.undo, &d.redo})
+        for (UndoEntry& e : *stack) zero(e.pieces);
+}
 
 // *ext_dropped: the extension block was malformed and ignored (the doc itself parsed fine).
 Parse deserialize(const std::string& data, PersistedDoc& d, bool* ext_dropped) {
@@ -255,6 +312,10 @@ Parse deserialize(const std::string& data, PersistedDoc& d, bool* ext_dropped) {
     d.view.ascii_focus = r.u8() != 0;
     d.view.top_row = r.u64();
     d.view.parser = r.str();
+    if (r.version >= 4) {
+        d.view.parse_base = r.u64();
+        d.view.parse_length = r.u64();
+    }
     d.view.bookmarks = r.bookmarks();
     d.dirty = r.u8() != 0;
     d.read_only = r.u8() != 0;
@@ -264,6 +325,15 @@ Parse deserialize(const std::string& data, PersistedDoc& d, bool* ext_dropped) {
         for (std::string& b : d.backup_done) b = r.str();
     } else if (r.ok && r.pos < body) {
         d.edits_dropped = r.u8() != 0;  // v1: optional trailing flag
+    }
+    if (r.version >= 4) {
+        d.ref_files.resize(r.count(20));
+        for (PersistedDoc::RefFile& f : d.ref_files) {
+            f.path = r.str();
+            f.stat.exists = true;
+            f.stat.size = r.u64();
+            f.stat.mtime_ns = int64_t(r.u64());
+        }
     }
     if (r.version >= 3) {
         const uint32_t len = r.count(1);
@@ -282,6 +352,7 @@ Parse deserialize(const std::string& data, PersistedDoc& d, bool* ext_dropped) {
             r.pos += len;
         }
     }
+    if (r.version < 4) migrate_v3(d);
     return r.ok && r.pos == body ? Parse::Ok : Parse::Unsupported;
 }
 
@@ -293,7 +364,8 @@ std::string doc_key(const Document& doc) {
          std::to_string(doc.view_generation) + '|' + std::to_string(v.cursor) + '|' +
          std::to_string(v.anchor) + '|' + std::to_string(v.top_row) + '|' +
          std::to_string(int(v.low_nibble)) + std::to_string(int(v.ascii_focus)) +
-         std::to_string(int(doc.read_only())) + '|' + v.parser + '|' + doc.path() + '|' + doc.display_name();
+         std::to_string(int(doc.read_only())) + '|' + v.parser + '|' + std::to_string(v.parse_base) + '|' +
+         std::to_string(v.parse_length) + '|' + doc.path() + '|' + doc.display_name();
     return k;
 }
 
