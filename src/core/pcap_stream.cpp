@@ -153,6 +153,21 @@ private:
     bool stop_ = false;
 };
 
+// Directions were counted from endpoint a; `client` (0 = a, 1 = b) becomes direction 0.
+void orient(TcpStream& out, int client, const TcpEndpoint& a, const TcpEndpoint& b) {
+    out.client = client == 0 ? a : b;
+    out.server = client == 0 ? b : a;
+    if (client != 1) return;
+    for (TcpStreamSegment& sg : out.segments) sg.dir ^= 1;
+    std::swap(out.bytes[0], out.bytes[1]);
+    std::swap(out.missing[0], out.missing[1]);
+    std::swap(out.syn[0], out.syn[1]);
+    std::swap(out.fin[0], out.fin[1]);
+}
+
+// A UDP datagram with ports that is not an IP fragment.
+bool is_udp(const PacketInfo& pi) { return pi.has_ports && pi.proto == "UDP" && !pi.fragment; }
+
 }  // namespace
 
 bool follow_tcp_stream(const Snapshot& snap, const std::vector<Packet>& packets, size_t packet, TcpStream& out,
@@ -226,22 +241,71 @@ bool follow_tcp_stream(const Snapshot& snap, const std::vector<Packet>& packets,
     re.skip_gaps(1, INT64_MAX);
     if (done) done->store(packets.size(), std::memory_order_relaxed);
     if (client < 0) client = first < 0 ? 0 : first;
-    out.client = client == 0 ? a : b;
-    out.server = client == 0 ? b : a;
-    if (client == 1) {  // directions were counted from a: flip them
-        for (TcpStreamSegment& sg : out.segments) sg.dir ^= 1;
-        std::swap(out.bytes[0], out.bytes[1]);
-        std::swap(out.missing[0], out.missing[1]);
-        std::swap(out.syn[0], out.syn[1]);
-        std::swap(out.fin[0], out.fin[1]);
+    orient(out, client, a, b);
+    return true;
+}
+
+bool follow_udp_stream(const Snapshot& snap, const std::vector<Packet>& packets, size_t packet, TcpStream& out,
+                       uint64_t max_bytes, const std::atomic<bool>* cancel, std::atomic<uint64_t>* done) {
+    out = TcpStream{};
+    out.udp = true;
+    if (packet >= packets.size()) {
+        out.error = "no such packet";
+        return false;
     }
+    uint64_t len0 = 0;
+    const PacketInfo pi0 = headers(snap, packets[packet], len0);
+    if (!is_udp(pi0)) {
+        out.error = "packet #" + std::to_string(packet + 1) + " is not a UDP packet";
+        return false;
+    }
+    const TcpEndpoint a = endpoint(pi0, true), b = endpoint(pi0, false);
+    int client = -1;  // 0 = a, 1 = b
+    uint64_t total = 0;
+    for (size_t i = 0; i < packets.size(); ++i) {
+        if ((i & 255) == 0) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) {
+                out.cancelled = true;
+                return false;
+            }
+            if (done) done->store(i, std::memory_order_relaxed);
+        }
+        uint64_t len = 0;
+        const PacketInfo pi = headers(snap, packets[i], len);
+        if (!is_udp(pi)) continue;
+        const TcpEndpoint src = endpoint(pi, true), dst = endpoint(pi, false);
+        int di = -1;
+        if (src == a && dst == b) di = 0;
+        else if (src == b && dst == a) di = 1;
+        if (di < 0) continue;
+        if (client < 0) client = di;
+        ++out.packets;
+        if (len > max_bytes - total) {
+            len = max_bytes - total;
+            out.truncated = true;
+        }
+        if (len) {
+            TcpStreamSegment sg;
+            sg.packet = i;
+            sg.dir = uint8_t(di);
+            sg.data_off = packets[i].data_off + pi.payload_off;
+            sg.len = len;
+            sg.stream_off = out.bytes[di];
+            out.segments.push_back(sg);
+            out.bytes[di] += len;
+            total += len;
+        }
+        if (out.truncated) break;
+    }
+    if (done) done->store(packets.size(), std::memory_order_relaxed);
+    orient(out, client < 0 ? 0 : client, a, b);
     return true;
 }
 
 void build_tcp_stream_doc(const Snapshot& snap, const TcpStream& s, bool interleaved, TcpStreamDoc& out,
                           size_t max_bookmarks) {
     out = TcpStreamDoc{};
-    out.name = "TCP " + fmt_endpoint(s.client) + " > " + fmt_endpoint(s.server) + (interleaved ? " (interleaved)" : "");
+    out.name = (s.udp ? "UDP " : "TCP ") + fmt_endpoint(s.client) + " > " + fmt_endpoint(s.server) + (interleaved ? " (interleaved)" : "");
     std::vector<const TcpStreamSegment*> order;
     order.reserve(s.segments.size());
     for (int pass = 0; pass < (interleaved ? 1 : 2); ++pass)
@@ -275,8 +339,13 @@ void build_tcp_stream_doc(const Snapshot& snap, const TcpStream& s, bool interle
 
 std::string tcp_stream_summary(const TcpStream& s) {
     std::string m = fmt_count(s.bytes[0]) + " bytes client -> server, " + fmt_count(s.bytes[1]) +
-                    " bytes server -> client, " + fmt_count(s.segments.size()) + " segments of " +
-                    fmt_count(s.packets) + " packets";
+                    " bytes server -> client, ";
+    if (s.udp) {
+        m += fmt_count(s.packets) + " datagrams";
+        if (s.truncated) m += "; cut at " + fmt_count(s.bytes[0] + s.bytes[1]) + " bytes (stream size limit)";
+        return m;
+    }
+    m += fmt_count(s.segments.size()) + " segments of " + fmt_count(s.packets) + " packets";
     if (s.retransmitted) m += ", " + fmt_count(s.retransmitted) + " retransmitted";
     if (s.out_of_order) m += ", " + fmt_count(s.out_of_order) + " out of order";
     if (s.missing[0] + s.missing[1]) m += ", " + fmt_count(s.missing[0] + s.missing[1]) + " bytes not captured";
@@ -287,18 +356,77 @@ std::string tcp_stream_summary(const TcpStream& s) {
 }
 
 void TcpStreamJob::start(std::shared_ptr<const PcapIndexJob::Result> index, size_t packet, bool interleaved,
-                         uint64_t max_bytes) {
+                         uint64_t max_bytes, bool udp) {
     const uint64_t total = index ? index->index.packets.size() : 0;
-    w_.start(total, [index = std::move(index), packet, interleaved, max_bytes](
+    w_.start(total, [index = std::move(index), packet, interleaved, max_bytes, udp](
                         TcpStreamJobResult& r, const std::atomic<bool>& cancel, std::atomic<uint64_t>& done) {
         r.packet = packet;
         r.interleaved = interleaved;
+        r.stream.udp = udp;
         if (!index || !index->snap) {
             r.stream.error = "no packet index";
             return;
         }
-        if (follow_tcp_stream(*index->snap, index->index.packets, packet, r.stream, max_bytes, &cancel, &done))
-            build_tcp_stream_doc(*index->snap, r.stream, interleaved, r.doc);
+        const Snapshot& snap = *index->snap;
+        const std::vector<Packet>& ps = index->index.packets;
+        if (udp ? follow_udp_stream(snap, ps, packet, r.stream, max_bytes, &cancel, &done)
+                : follow_tcp_stream(snap, ps, packet, r.stream, max_bytes, &cancel, &done))
+            build_tcp_stream_doc(snap, r.stream, interleaved, r.doc);
+    });
+}
+
+// ---- conversations ------------------------------------------------------------------------------
+
+void number_conversations(const Snapshot& snap, const std::vector<Packet>& packets, Conversations& t,
+                          const std::atomic<bool>* cancel, std::atomic<uint64_t>* done) {
+    const size_t begin = std::min(t.stream.size(), packets.size());
+    t.stream.resize(begin);
+    t.is_udp.resize(begin);
+    t.stream.reserve(packets.size());
+    t.is_udp.reserve(packets.size());
+    std::string key;
+    for (size_t i = begin; i < packets.size(); ++i) {
+        if (((i - begin) & 255) == 0) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) return;
+            if (done) done->store(i - begin, std::memory_order_relaxed);
+        }
+        const PacketInfo pi = dissect_packet(snap, packets[i], kHeaderRead);
+        const bool tcp = pi.tcp_header && !pi.fragment, udp = is_udp(pi);
+        uint32_t id = kNoStream;
+        if (tcp || udp) {
+            // proto + the two endpoints in a fixed order (both directions = one key)
+            uint8_t e[2][19];
+            for (int k = 0; k < 2; ++k) {
+                e[k][0] = pi.ip_version;
+                std::memcpy(e[k] + 1, k == 0 ? pi.ip_src : pi.ip_dst, 16);
+                const uint16_t port = k == 0 ? pi.src_port : pi.dst_port;
+                e[k][17] = uint8_t(port >> 8);
+                e[k][18] = uint8_t(port);
+            }
+            const int lo = std::memcmp(e[0], e[1], 19) <= 0 ? 0 : 1;
+            key.assign(1, udp ? 'u' : 't');
+            key.append(reinterpret_cast<const char*>(e[lo]), 19);
+            key.append(reinterpret_cast<const char*>(e[1 - lo]), 19);
+            auto it = t.ids.find(key);
+            if (it == t.ids.end()) it = t.ids.emplace(key, t.count[udp ? 1 : 0]++).first;
+            id = it->second;
+        }
+        t.stream.push_back(id);
+        t.is_udp.push_back(udp ? 1 : 0);
+    }
+    if (done) done->store(packets.size() - begin, std::memory_order_relaxed);
+}
+
+void ConversationJob::start(std::shared_ptr<const PcapIndexJob::Result> index,
+                            std::shared_ptr<const ConversationJobResult> prev) {
+    const size_t n = index ? index->index.packets.size() : 0;
+    const size_t from = prev ? std::min(prev->conv.stream.size(), n) : 0;
+    w_.start(n - from, [index = std::move(index), prev = std::move(prev)](
+                           ConversationJobResult& r, const std::atomic<bool>& cancel, std::atomic<uint64_t>& done) {
+        r.index = index;
+        if (prev) r.conv = prev->conv;
+        if (index && index->snap) number_conversations(*index->snap, index->index.packets, r.conv, &cancel, &done);
+        r.cancelled = cancel.load();
     });
 }
 

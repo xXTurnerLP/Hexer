@@ -190,7 +190,10 @@ What it understands:
   `pack(push, n)`, `pack(pop)`, `pack()`, `__attribute__((packed))`.
 * Endianness: the window's default; a comment containing `@be` or `@le` on the line(s) right
   before `struct` / `typedef` (or right after the struct's `{`) overrides it for that struct.
-  Unnamed nested structs inherit it; named struct types keep their own.
+  Unnamed nested structs inherit it; named struct types keep their own. One member: the
+  annotation on the member's own line before its type (`/* @be */ int16_t delta;`, also enum
+  members and bit fields) overrides the struct's for that member; a trailing `// @be` after a
+  member does not change the next one.
 * Comments, `#define NAME <constant>`; other preprocessor lines are ignored.
 
 Errors name the line: `line 7: unknown type 'uint9_t'`.
@@ -208,14 +211,18 @@ the length it had here):
   identical layouts share one typedef
 * typed readers -> `uint8_t`..`int64_t`, `float`, `double`; `enum` -> `enum name_e : uint16_t
   {...}` (the `{false, true}` enum -> `bool`; constants the field's type cannot hold, e.g. 300 on
-  a `u8` sharing an enum table with wider fields, become comments); `flags` -> the bit names in a comment
+  a `u8` sharing an enum table with wider fields, become comments); `flags` -> the bit names in a
+  comment plus a `#define MEMBER_FLAG 0x...` mask per bit before the struct; a 1-byte `fmt = "char"`
+  field -> `char`
 * arrays of one layout -> `T name[N]` (`T name[N][M]` for nested ones), `p:str` -> `char[N]`,
   bytes / LEB128 / `p:field` / other arrays -> `uint8_t[N]`; `bitfield` fields -> `T name : w;`
   (unused bits of a unit -> unnamed `T : k;`, so MSVC and GCC / Clang lay it out alike)
 * gaps -> `uint8_t _padN[k];`, overlapping fields (unions, re-reads) -> a comment
 * `#pragma pack(push, 1)`, a `static_assert(sizeof(...))` per struct, `/* +0x0004, BE */` offset
-  comments; a mostly big-endian struct gets `// @be`, so the header pasted back into the C struct
-  window gives a parser with the same tree (padding members aside).
+  comments; a mostly big-endian struct gets `// @be`; a struct with both byte orders gets its
+  majority's annotation (`// @be` / `// @le`) and `/* @le */` / `/* @be */` before each member of
+  the other order. So the header pasted back into the C struct window gives a parser with the same
+  tree (padding members aside).
 
 Enums with an underlying type need C23 or C++.
 
@@ -287,9 +294,12 @@ again after every edit while the parser is on Auto.
 | `doc:insert(off, bytes)` `doc:erase(off, len)` `doc:replace(off, len, bytes)` | |
 | `doc:transaction(fn, label?)` | every edit inside `fn` becomes **one** undo step, even if `fn` errors. Inside a command, which already is one step (`Script: <name>`), a label renames that step (the innermost label wins: Edit > Undo shows "Undo Append TLV") |
 | `doc:cursor()` `doc:selection()` → start, len | |
-| `doc:select(off, len)` `doc:jump(off)` | moves the selection/cursor and scrolls it into view (`doc:goto` also exists, but `goto` is a Lua keyword: call it as `doc["goto"](doc, off)`) |
+| `doc:select(off, len)` `doc:jump(off)` | moves the selection/cursor and scrolls it into view; like any big jump the position it leaves goes into the tab's Back / Forward history (`Alt+Left` returns; also `doc:select_ranges`) (`doc:goto` also exists, but `goto` is a Lua keyword: call it as `doc["goto"](doc, off)`); `doc:select` also drops the extra ranges of a multi-selection |
+| `doc:selections()` | every selected range of a multi-selection as a list of `{offset, length}`: the one holding the primary selection first, then the others in file order (overlapping ranges merged); `{}` when nothing is selected |
+| `doc:select_ranges{ {offset=, length=}, ... }` | sets a multi-selection (entries may also be `{off, len}`): the first range becomes the primary selection (scrolled into view), the others the extra ranges, clamped to the document and merged when they touch; at most 100,000 ranges, `{}` leaves only the caret. Like `doc:select` this is view state, not an undo step. Copy, Delete, Fill, Paste and Bookmark Selections in the editor then act on all ranges |
 | `doc:find(needle, start?, {hex=bool, backward=bool})` | offset or `nil`; `hex=true` takes patterns like `"DE ?? AD"` |
-| `doc:hash(algo, off?, len?)` | lowercase hex digest of the range (default: the whole document; clamped to the end). It blocks, so at most 256 MiB per call; the Hashes panel hashes any size in the background |
+| `doc:hash(algo, off?, len?)` | lowercase hex digest of the range (default: the whole document; clamped to the end). It blocks, so at most 256 MiB per call; the Hashes panel hashes any size in the background. `algo` may be an `hx.hash_algorithm` one (it runs right there, under the script time limit) |
+| `doc:apply_transform{op=, key=, start=?, length=?, phase=?, decode=false, label=?}` | XORs / ADDs / SUBtracts / rotates a range in place as **one** undo step (the XOR Search panel's "Decode selection"). `op`: `"xor"`, `"add"`, `"sub"`, `"rol"`, `"ror"` (also `hx.xor_scan`'s `"xor_key"` / `"add_key"`); `key`: a string of key bytes (1..4096, repeated) or a byte value; `rol` / `ror` take the bit count 1..7 (a number, or `hx.xor_scan`'s 1-byte key string). `decode = true` applies the inverse (sub for add, ror for rol), so a scan hit decodes with `doc:apply_transform{op = h.transform, key = h.key, start = h.offset, length = #plain, decode = true}`. Range: `start` / `length` (length default: to the end), neither = the selection (an error when nothing is selected); at most 256 MiB. `phase` = key index of `start` (default `start % #key`: key byte `key[x % #key]` applies to absolute offset `x`, as in `hx.xor_scan`). Read-only documents, empty ranges and unreadable bytes raise; a failure partway changes nothing (inside a command / transaction it rolls back that whole step). Label: `"Encode <key>"` / `"Decode <key>"`, or `label`; inside a command or transaction that step's label |
 | `doc:disasm(off, count?, mode?)` | x86-64 disassembly of `count` instructions (default 16, at most 10000) from file offset `off`, as a list like `hx.disasm`'s. `address` / `target` are virtual addresses from the document's address map (PE and ELF headers; process memory and other files: the offset), `section` names the PE section / ELF section when known. `mode` defaults to the header's (32 for PE32 / ELF32), else 64. Unreadable bytes are 1-byte `"??"` entries |
 | `doc:view_range()` → first, last | the first and last byte (inclusive) the document's hex view showed in the last drawn frame (the active pane of a split view), or `nil` when it has no drawn view (headless, empty document) |
 | `doc:bookmarks()` | list of `{offset, length, name, color, note}` (`color` is a packed color, `0` = default) |
@@ -297,6 +307,7 @@ again after every edit while the parser is on Auto.
 | `doc:remove_bookmark(i)` | removes bookmark `i` (1-based, as in `doc:bookmarks()`; an error if there is none). Undoable like adding |
 | `doc:symbols()` | Symbols of a PE / ELF executable, sorted by address (forwarded exports last), each `{name, address, offset, kind, module, ordinal?, forward?}`: `kind` is `"export"`, `"import"`, `"function"` or `"object"`; `module` the export / import DLL (`"KERNEL32.dll"`, ELF: `""`); imports are one entry per IAT slot (`address` = the slot, `name` = `"GetProcAddress"` or `"#12"` by ordinal) and on ELF `"puts@got"` (GOT slot) / `"puts@plt"` (PLT stub); `offset` is the file offset (nil when the address is not in the file); a forwarded export has `forward = "NTDLL.RtlAllocateHeap"` and no `address`. Sources: PE export / import / delay-import directories, ELF `.symtab` / `.dynsym` (FUNC / OBJECT) and JUMP_SLOT / GLOB_DAT relocations, plus function `"entry"` at an unnamed entry point. Process memory (Windows): the exports / imports of every loaded module, read from its PE headers as mapped in memory (`"KERNEL32.dll"` / `"CreateFileW"` at its real address; `offset` = `address`), plus `"entry"` per module; Linux processes: `{}` for now. `{}` for other files. Capped at 1M symbols / ~3 s; instant when the Disassembly panel already holds the document's current table (Auto map) |
 | `doc:modules()` | The loaded modules of a process-memory document, by base: `{name, base, size, path}` (`"KERNEL32.DLL"`, load address, image size, full path; Linux: the file-backed mappings with an executable part, `base` = the lowest one). `{}` for files and devices; `nil, err` when the process cannot be queried |
+| `doc:packets(opts?)` → list, next | The packets of a pcap / pcapng capture in file order (the Packets panel's index and dissector), each `{number, offset, data, length, wire_length, payload, payload_length, time, time_ns, interface, linktype, proto, src, dst, info, summary}` plus, when that layer was decoded, `vlan`, `ip_version`, `ip_proto`, `src_port`, `dst_port`, `tcp_seq`, `tcp_ack`, `tcp_flags`, `fragment`, `malformed`. `number` is 1-based; `offset` is the record (pcapng: block) start, `data` the first captured byte, `length` / `wire_length` the captured / original length; `payload` / `payload_length` locate the L7 payload (`doc:read(p.payload, p.payload_length)`); `time` is seconds since the epoch (a float; `time_ns` the integer), both nil for Simple Packet Blocks; `proto` / `src` / `dst` / `info` / `summary` are the panel's columns. `opts = {filter=, first=1, max=10000}`: `filter` is a Packets panel filter expression (`"tcp.port == 80 and tcp.flags.syn"`; a bad one raises `doc:packets: filter: <message> (column N)`), `first` the packet number to start at, `max` the number of entries (1..1000000). `next` is the `first` of the next page (nil when the capture ended). Synchronous: each call indexes the document as it is now from the start up to where its page ends (in chunks of 64k packets), stopped by the script time limit (an error; page with `first` / `max`). Returns `nil, "not a pcap / pcapng capture"` for other documents |
 
 All edits are undoable. They fail with an error on read-only documents (`document is read-only`)
 and while a save is running.
@@ -322,10 +333,11 @@ and while a save is running.
 | `hx.hex(s)` → `"DE AD"` / `hx.unhex("de:ad")` → bytes | `unhex` is as lenient as paste: `0x`, commas, `\x`, `b64:` |
 | `hx.crc32(s, prev?)` | zlib/PNG/ZIP CRC-32; pass the previous result to continue over chunks |
 | `hx.hash(algo, s)` | lowercase hex digest of a string: `hx.hash("sha256", data)`. Names ignore case and punctuation (`"CRC-32C"`, `"crc32c"`, `"md5"`) |
-| `hx.hash_algorithms()` | the names, in display order: Sum-8, XOR-8, CRC-8, CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-16/XMODEM, CRC-32, CRC-32C, Adler-32, Fletcher-16, FNV-1a/32, FNV-1a/64, MD5, SHA-1, SHA-256, SHA-512 |
+| `hx.hash_algorithms()` | the names, in display order: Sum-8, XOR-8, CRC-8, CRC-16/CCITT-FALSE, CRC-16/MODBUS, CRC-16/XMODEM, CRC-32, CRC-32C, Adler-32, Fletcher-16, FNV-1a/32, FNV-1a/64, MD5, SHA-1, SHA-256, SHA-512, then the `hx.hash_algorithm` ones |
+| `hx.hash_algorithm{name=, init=, update=, final=}` | registers a custom hash / checksum (see [Custom hash algorithms](#custom-hash-algorithms)) |
 | `hx.disasm(bytes, address?, mode?)` | disassembles a string as x86-64 (`mode` 64, the default) or 32-bit x86 (`32` / `"x86"`), the first byte at `address` (default 0); at most 10000 instructions. Each entry: `address`, `offset` (0-based position in `bytes`), `length`, `text`, `bytes`, `valid`, and when present `target` (branch target or RIP-relative / absolute memory address) and `flow` (`"call"`, `"jmp"`, `"jcc"`, `"ret"`, `"int"`). Text is Intel syntax: `mov rax, qword ptr [rip+0x2a]  ; 0x1031` (the comment is the resolved address), `call 0x1105`; an invalid byte is `db 0x06` with `valid = false` |
-| `hx.xor_scan(doc, plaintext, opts?)` | where `plaintext` (raw bytes; `hx.unhex` for hex text) occurs XOR / ADD / ROL-encoded, like the XOR Search panel. A list by offset of `{offset, transform, key, phase, text}`: `transform` is `"xor"`, `"add"`, `"rol"` or `"xor_key"`, `key` the raw key bytes (`rol`: one byte, the bit count), `phase` the key index of `offset` (key byte `key[x % #key]` applies to absolute offset `x`), `text` e.g. `"XOR 0x5A"`. `opts`: `start` (0), `length` (to the end), `xor` / `add` / `rol` (true), `multi` (false: 2..16-byte XOR keys), `max_key_len` (16), `max` (10000 hits). The plaintext itself (key 0) is not reported. It blocks: at most 256 MiB per call (pass `start` / `length` or use the panel) and stopped at the script time limit |
-| `hx.xor_guess_key(doc, off, len, opts?)` | XOR key candidates for the range, best first: `{key, score}` (`score` 0..1 = share of bytes that decode to `plain`). `opts`: `plain` (0; a byte value or a 1-character string, `" "` for text), `max_len` (16). At most 16 MiB per call |
+| `hx.xor_scan(doc, plaintext, opts?)` | where `plaintext` (raw bytes; `hx.unhex` for hex text) occurs XOR / ADD / ROL-encoded, like the XOR Search panel. A list by offset of `{offset, transform, key, phase, text}`: `transform` is `"xor"`, `"add"`, `"rol"` or `"xor_key"`, `key` the raw key bytes (`rol`: one byte, the bit count), `phase` the key index of `offset` (key byte `key[x % #key]` applies to absolute offset `x`), `text` e.g. `"XOR 0x5A"`. `transform` `"add_key"` for multi-byte ADD keys. `opts`: `start` (0), `length` (to the end), `xor` / `add` / `rol` (true), `multi` (false: 2..16-byte XOR keys), `add_multi` (false: 2..16-byte ADD keys), `max_key_len` (16), `max` (10000 hits). The plaintext itself (key 0) is not reported. It blocks: at most 256 MiB per call (pass `start` / `length` or use the panel) and stopped at the script time limit |
+| `hx.xor_guess_key(doc, off, len, opts?)` | XOR key candidates for the range, best first: `{key, score}` (`score` 0..1 = share of bytes that decode to `plain`). `opts`: `plain` (0; a byte value or a 1-character string, `" "` for text), `max_len` (16), `op` (`"xor"`; `"add"` for ADD keys: the column's most common byte minus `plain`). At most 16 MiB per call |
 | `string.pack` / `string.unpack` | standard Lua, the recommended way to (de)serialize |
 
 `os.exit` and stdin are disabled: Hexer has no stdin (`io.read`, `io.lines()`, `io.stdin`,
@@ -333,6 +345,38 @@ and while a save is running.
 editor. File names are UTF-8 everywhere, also on Windows (`io.open`, `io.lines`, `loadfile`,
 `dofile`, `require`; in hexer.exe, whose manifest selects the UTF-8 code page, also `os.rename`,
 `os.remove` and `package.loadlib`). A `__gc` finalizer runs under a 1 s limit of its own.
+
+### Custom hash algorithms
+
+`hx.hash_algorithm` adds a checksum or hash next to the 16 built-ins. It appears in the Hashes
+panel (Algorithms... > Scripts), in `hx.hash`, `doc:hash` and `hx.hash_algorithms()`:
+
+```lua
+hx.hash_algorithm {
+    name = "Sum-16",
+    init = function() return 0 end,                     -- the state of one run (any value)
+    update = function(s, bytes)                         -- the data in order, chunks of up to 4 MiB
+        for i = 1, #bytes do s = s + bytes:byte(i) end
+        return s & 0xFFFF                               -- the new state (nil keeps the old one)
+    end,
+    final = function(s) return string.format("%04x", s) end,  -- the digest as hex
+}
+```
+
+* `update` may also change a state table in place and return nothing.
+* `final` returns hex text; case, spaces, `:` / `-` and a leading `0x` are ignored.
+* `name` must not be a built-in's (ignoring case and punctuation) and must not contain `,`;
+  registering the same name again replaces it.
+* The Hashes panel runs it on a worker thread, in a Lua state of its own that ran only the
+  algorithm's script file, like [background parses](#parsers-run-in-the-background): no globals
+  of other script files, `print` output is dropped, and algorithms typed into the console only
+  work in `hx.hash` / `doc:hash` (the panel shows why). Each `update` call has the script time
+  limit; Cancel stops it at once. A script error shows in the panel's Value column and once in
+  the console.
+* Plain Lua hashes roughly 10-50 MB/s: fine for selections, slow for multi-GB files.
+
+`scripts/examples/hashes.lua` implements Adler-32 ("Adler-32 (Lua)"), which gives the same value
+as the built-in "Adler-32": a template for your own.
 
 ---
 
@@ -398,10 +442,15 @@ See "Selection: XOR with key" in `scripts/examples/commands.lua`.
 * `for _, i in ipairs(doc:disasm(cur, 8)) do print(("%X  %s"):format(i.address, i.text)) end`
   lists eight instructions at the caret (the Disassembly panel does the same interactively).
 * `for _, h in ipairs(hx.xor_scan(doc, "This program")) do print(("%X  %s"):format(h.offset, h.text)) end`
-  finds an XOR- / ADD- / ROL-obfuscated PE stub; `doc:add_bookmark(h.offset, 12, h.text)` marks one.
+  finds an XOR- / ADD- / ROL-obfuscated PE stub; `doc:add_bookmark(h.offset, 12, h.text)` marks one,
+  `doc:apply_transform{ op = h.transform, key = h.key, start = h.offset, length = 12, decode = true }`
+  decodes it in place (one undo step).
 * `for _, s in ipairs(doc:symbols()) do if s.kind == "import" then print(("%X  %s!%s"):format(s.address, s.module, s.name)) end end`
 * `local p = hx.open_process(1234); for _, m in ipairs(p:modules()) do print(("%X  %8X  %s"):format(m.base, m.size, m.name)) end`
   prints every IAT slot with its DLL and function.
+* `for _, p in ipairs(doc:packets{ filter = "udp.port == 53" }) do print(p.number, p.summary) end`
+  lists the DNS packets of a capture; `scripts/examples/packets.lua` has a protocol summary and a
+  "bookmark every matching payload" command.
 * Tables print readably: `{ a = 1, list = { 1, 2, 3 } }`.
 * Prototype a parser in a file and keep it open in your editor: every save hot-reloads it.
 * Commands and console code are stopped after 10 s (time waiting in `hx.prompt` doesn't count),

@@ -1,6 +1,8 @@
 #include "ui/panel_hash.h"
 
+#include <algorithm>
 #include <cfloat>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -44,6 +46,8 @@ std::string upper(std::string s) {
     return s;
 }
 
+std::string first_line(const std::string& s) { return s.substr(0, s.find('\n')); }
+
 }  // namespace
 
 HashPanel::HashPanel() : algos_(default_algos()) {}
@@ -53,15 +57,39 @@ std::vector<std::string> HashPanel::selected() const {
     const auto& all = hash_algorithms();
     for (size_t i = 0; i < all.size(); ++i)
         if (algos_ & (uint32_t(1) << i)) out.push_back(all[i].name);
+    for (const std::string& n : custom_sel_) out.push_back(n);
     return out;
 }
 
 void HashPanel::set_selected(const std::vector<std::string>& names) {
     const auto& all = hash_algorithms();
     uint32_t m = 0;
-    for (const auto& n : names)
+    custom_sel_.clear();
+    for (const auto& n : names) {
         if (const HashAlgorithm* a = find_hash_algorithm(n)) m |= uint32_t(1) << size_t(a - all.data());
+        else if (!hash_name_key(n).empty()) set_custom_on(n, true);  // a script algorithm (maybe later)
+    }
     algos_ = m;
+}
+
+bool HashPanel::custom_on(const std::string& name) const {
+    const std::string k = hash_name_key(name);
+    for (const std::string& s : custom_sel_)
+        if (hash_name_key(s) == k) return true;
+    return false;
+}
+
+void HashPanel::set_custom_on(const std::string& name, bool on) {
+    const std::string k = hash_name_key(name);
+    for (size_t i = custom_sel_.size(); i-- > 0;)
+        if (hash_name_key(custom_sel_[i]) == k) custom_sel_.erase(custom_sel_.begin() + std::ptrdiff_t(i));
+    if (on) custom_sel_.push_back(name);
+}
+
+void HashPanel::set_custom(std::vector<CustomHashAlgorithm> list, uint64_t generation) {
+    custom_ = std::move(list);
+    custom_gen_ = generation;
+    reported_.clear();
 }
 
 void HashPanel::start(const Document& doc, const Key& k) {
@@ -69,7 +97,11 @@ void HashPanel::start(const Document& doc, const Key& k) {
     const auto& all = hash_algorithms();
     for (size_t i = 0; i < all.size(); ++i)
         if (k.algos & (uint32_t(1) << i)) names.push_back(all[i].name);
-    job_.start(doc.snapshot(), k.offset, k.length, std::move(names));
+    std::vector<CustomHashAlgorithm> custom;
+    for (const std::string& n : k.custom)
+        for (const CustomHashAlgorithm& c : custom_)
+            if (c.name == n) custom.push_back(c);
+    job_.start(doc.snapshot(), k.offset, k.length, std::move(names), std::move(custom));
     // A previous run may have published after this frame's pickup in draw(); its result belongs to
     // the old key, not to `k`. From here on only the new run can publish (HashJob::start).
     seen_gen_ = job_.generation();
@@ -80,16 +112,34 @@ void HashPanel::start(const Document& doc, const Key& k) {
 void HashPanel::draw_algorithm_popup() {
     if (!ImGui::BeginPopup("##hash_algos")) return;
     const auto& all = hash_algorithms();
-    if (ImGui::SmallButton("Defaults")) algos_ = default_algos();
+    if (ImGui::SmallButton("Defaults")) {
+        algos_ = default_algos();
+        custom_sel_.clear();
+    }
     ImGui::SameLine();
-    if (ImGui::SmallButton("All")) algos_ = (uint32_t(1) << all.size()) - 1;
+    if (ImGui::SmallButton("All")) {
+        algos_ = (uint32_t(1) << all.size()) - 1;
+        for (const CustomHashAlgorithm& c : custom_) set_custom_on(c.name, true);
+    }
     ImGui::SameLine();
-    if (ImGui::SmallButton("None")) algos_ = 0;
+    if (ImGui::SmallButton("None")) {
+        algos_ = 0;
+        custom_sel_.clear();
+    }
     ImGui::Separator();
     for (size_t i = 0; i < all.size(); ++i) {
         if (i > 0 && all[i].digest_size >= 16 && all[i - 1].digest_size < 16) ImGui::Separator();  // MD5/SHA
         bool on = (algos_ >> i) & 1;
         if (ImGui::Checkbox(all[i].name, &on)) algos_ = on ? algos_ | (uint32_t(1) << i) : algos_ & ~(uint32_t(1) << i);
+    }
+    if (!custom_.empty()) {
+        ImGui::SeparatorText("Scripts (Lua, slower)");
+        for (size_t i = 0; i < custom_.size(); ++i) {
+            ImGui::PushID(int(i));
+            bool on = custom_on(custom_[i].name);
+            if (ImGui::Checkbox(custom_[i].name.c_str(), &on)) set_custom_on(custom_[i].name, on);
+            ImGui::PopID();
+        }
     }
     ImGui::EndPopup();
 }
@@ -124,13 +174,19 @@ void HashPanel::draw_results(ImFont* mono, float ui_scale, const HashPanelCallba
             ImGui::Separator();
             if (ImGui::MenuItem("Copy all")) {
                 std::string all;
-                for (const auto& w : values) all += w.algo + ": " + w.hex + "\n";
+                for (const auto& w : values)
+                    if (w.error.empty()) all += w.algo + ": " + w.hex + "\n";
                 copy(all, "all hashes");
             }
             ImGui::EndPopup();
         }
         ImGui::PopID();
         ImGui::TableSetColumnIndex(1);
+        if (!v.error.empty()) {  // a script algorithm failed
+            ImGui::TextColored(kErrColor, "Error: %s", first_line(v.error).c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", v.error.c_str());
+            continue;
+        }
         if (mono) ImGui::PushFont(mono, 0.0f);
         if (match) ImGui::TextColored(kMatchText, "%s", v.hex.c_str());
         else ImGui::TextUnformatted(v.hex.c_str());
@@ -146,6 +202,14 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
         seen_gen_ = job_.generation();
         HashJob::Result r = job_.result();
         if (!r.cancelled) {
+            for (const HashJob::Value& val : r.values) {
+                if (val.error.empty()) continue;
+                const std::string msg = "Hash '" + val.algo + "': " + val.error;
+                if (std::find(reported_.begin(), reported_.end(), msg) != reported_.end()) continue;
+                if (reported_.size() > 100) reported_.clear();
+                reported_.push_back(msg);
+                if (cb.error) cb.error(msg);
+            }
             result_ = std::move(r);
             result_key_ = job_key_;
             have_result_ = true;
@@ -177,15 +241,18 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
     cur.offset = use_sel ? v.sel_begin() : 0;
     cur.length = use_sel ? v.sel_len() : doc->size();
     cur.algos = algos_;
+    for (const CustomHashAlgorithm& c : custom_)
+        if (custom_on(c.name)) cur.custom.push_back(c.name);
+    if (!cur.custom.empty()) cur.custom_gen = custom_gen_;
     const bool running = job_.running();
     const bool running_cur = running && job_key_ == cur;
     const bool fresh = have_result_ && result_key_ == cur;
     const bool small = cur.length <= kAutoLimit;
-    const bool auto_ok = small && cur.algos != 0 && !(have_no_auto_ && no_auto_key_ == cur);
+    const bool auto_ok = small && cur.any() && !(have_no_auto_ && no_auto_key_ == cur);
 
     // ---- auto compute (debounced) / manual request ----
     const double now = ImGui::GetTime();
-    if (compute_requested_ && cur.algos) {
+    if (compute_requested_ && cur.any()) {
         start(*doc, cur);
     } else if (!fresh && !running_cur && auto_ok) {
         if (pending_since_ < 0 || !(pending_key_ == cur)) {
@@ -210,11 +277,11 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
         ImGui::SetTooltip("Hash the whole file even when bytes are selected");
 
     char label[48];
-    std::snprintf(label, sizeof label, "Algorithms (%d)...", count_bits(algos_));
+    std::snprintf(label, sizeof label, "Algorithms (%d)...", count_bits(algos_) + int(cur.custom.size()));
     if (ImGui::Button(label)) ImGui::OpenPopup("##hash_algos");
     draw_algorithm_popup();
     ImGui::SameLine();
-    ImGui::BeginDisabled(algos_ == 0);
+    ImGui::BeginDisabled(!cur.any());
     if (ImGui::Button(fresh ? "Recompute" : "Compute")) start(*doc, cur);
     ImGui::EndDisabled();
     if (job_.running()) {
@@ -233,7 +300,7 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
                              &expected);
 
     // ---- state line ----
-    if (algos_ == 0) {
+    if (!cur.any()) {
         ImGui::TextDisabled("No algorithm selected.");
     } else if (!fresh) {
         if (running_cur || (auto_ok && !running)) {
@@ -249,6 +316,8 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
                               : result_key_.gen != cur.gen     ? "document changed"
                               : result_key_.offset != cur.offset || result_key_.length != cur.length
                                   ? "range changed"
+                              : result_key_.algos == cur.algos && result_key_.custom == cur.custom
+                                  ? "scripts reloaded"
                                   : "algorithms changed";
             ImGui::TextColored(kWarnColor, "Stale (%s)", why);
             if (ImGui::IsItemHovered())

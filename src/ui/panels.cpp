@@ -19,6 +19,7 @@
 #include "core/hash.h"
 #include "core/highlight.h"
 #include "core/inspector.h"
+#include "core/multisel.h"
 #include "core/nav.h"
 #include "core/os_file.h"
 #include "core/util.h"
@@ -1345,6 +1346,11 @@ void draw_search_results_panel(App& app) {
         ImGui::TextColored(kWarnColor, "(document changed since the search)");
     }
     ImGui::SameLine();
+    if (ImGui::SmallButton("Select All")) select_hits(app, *t);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Select every hit (multi-selection, Alt+F3): Copy, Delete, Fill, Paste and\n"
+                          "Bookmark Selections then act on all of them");
+    ImGui::SameLine();
     if (ImGui::SmallButton("Clear")) {
         h = SearchHits{};
         ImGui::End();
@@ -1654,7 +1660,13 @@ void draw_hash_panel(App& app) {
     dock_like(kWinInspector);
     HashPanelCallbacks cb;
     cb.status = [&app](const std::string& m) { set_status(app, m); };
+    cb.error = [&app](const std::string& m) {
+        if (app.engine) app.engine->log(ConsoleLine::Error, m);
+    };
     HashPanel& hp = app.hash_panel;
+    // Script algorithms (hx.hash_algorithm): refreshed after every reload / registration.
+    if (app.engine && hp.custom_generation() != app.engine->hash_algorithms_generation())
+        hp.set_custom(app.engine->custom_hashes(), app.engine->hash_algorithms_generation());
     hp.draw(kWinHashes, &app.show_hashes, usable_doc(app), app.fonts.mono, app.ui_scale, cb);
     if (hp.wants_frames()) app.wants_poll = true;
     // Remember the algorithm choice ("-" = none, "" = the defaults, so an untouched choice is not
@@ -1861,6 +1873,16 @@ void draw_doc_status(App& app, Tab& t) {
     if (ImGui::IsItemClicked()) app.req_goto = true;
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Go to offset (Ctrl+G)");
     status_sep();
+    if (has_extra_selections(v)) {  // multi-selection: count + total, then the primary range
+        const std::vector<ByteRange> rs = selection_ranges(v, d.size());
+        ImGui::TextColored(kResultColor, "%zu selections, %s", rs.size(), fmt_size(range_total(rs)).c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Multi-selection: Copy / Copy As (one line per range), Cut, Delete, Fill, Paste (a value\n"
+                              "of every range's length) and Bookmark Selections act on all ranges as one undo step.\n"
+                              "Hash, Strings, Parse Selection and XOR use the primary selection only.\n"
+                              "Alt+click / Alt+drag adds or removes a range; Esc or a plain click clears the extras.");
+        ImGui::SameLine();
+    }
     if (v.has_selection())
         ImGui::Text("Sel %s", fmt_range(v.sel_begin(), v.sel_len()).c_str());
     else

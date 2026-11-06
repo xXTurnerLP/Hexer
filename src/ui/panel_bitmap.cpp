@@ -120,7 +120,7 @@ void BitmapPanel::load_settings(const Settings& s) {
     for (int i = 0; i < kPixelFormatCount; ++i)
         if (s.bitmap_format == pixel_format_name(PixelFormat(i))) format = PixelFormat(i);
     width = std::clamp(s.bitmap_width, 1, kMaxWidth);
-    zoom = std::clamp(s.bitmap_zoom, 1, kMaxZoom);
+    zoom = bitmap_zoom_clamp(s.bitmap_zoom, kMaxZoom);
     fit_width = s.bitmap_fit;
     use_alpha = s.bitmap_alpha;
     source = s.bitmap_source == 1 ? BitmapSource::FollowCursor : BitmapSource::FollowView;
@@ -219,18 +219,37 @@ void BitmapPanel::refresh(const Document& doc, const Key& k) {
     key_ = k;
     have_key_ = true;
     const uint64_t stride = bitmap_row_stride(k.format, k.width);
-    const size_t row_bytes = size_t(bitmap_row_stride(k.format, k.cols));
+    // A cell is step x step image pixels (1 unless downscaled); a cell row reads `sub` of its
+    // step image rows (all of them while that stays within kMaxBytes, else evenly spaced ones),
+    // each `w` pixels from col0 on.
+    const int step = std::max(1, k.step);
+    const int w = int(std::min<uint64_t>(uint64_t(k.width) - std::min<uint64_t>(k.col0, uint64_t(k.width)),
+                                         uint64_t(k.cols) * uint64_t(step)));
+    const size_t row_bytes = size_t(bitmap_row_stride(k.format, w));
+    // Cell rows that hold data (the rest is past the end: missing, not read).
+    const uint64_t data_rows = std::clamp<uint64_t>(
+        (bitmap_row_count(k.base, k.size, k.format, k.width) + uint64_t(step) - 1) / uint64_t(step), 1, uint64_t(k.rows));
+    const int sub = int(std::clamp<uint64_t>(kMaxBytes / std::max<uint64_t>(1, uint64_t(row_bytes) * data_rows), 1,
+                                             uint64_t(step)));
+    // Downscaled: only the cell rows that hold data are gathered (bitmap_downscale marks the others
+    // missing), so a short image in a tall panel stays within the byte budget too.
+    const int rows_read = step > 1 ? int(data_rows) * sub : k.rows;
     const uint64_t col_byte = k.col0 * uint64_t(pixel_format_bits(k.format)) / 8;  // col0 % 8 == 0
-    bytes_.assign(row_bytes * size_t(k.rows), 0);
+    bytes_.assign(row_bytes * size_t(rows_read), 0);
     size_t valid = 0;
-    for (int y = 0; y < k.rows; ++y) {
-        const uint64_t off = k.base + uint64_t(y) * stride + col_byte;
+    for (int r = 0; r < rows_read; ++r) {
+        const uint64_t img_row = uint64_t(r / sub) * uint64_t(step) + uint64_t(r % sub) * uint64_t(step) / uint64_t(sub);
+        const uint64_t off = k.base + img_row * stride + col_byte;
         if (off >= k.size) break;
-        const size_t got = doc.read(off, bytes_.data() + size_t(y) * row_bytes, row_bytes);
-        valid = size_t(y) * row_bytes + got;
+        const size_t got = doc.read(off, bytes_.data() + size_t(r) * row_bytes, row_bytes);
+        valid = size_t(r) * row_bytes + got;
         if (got < row_bytes) break;  // end of file: the rest is missing
     }
-    const size_t valid_px = decode_pixels(bytes_.data(), valid, k.format, k.cols, k.rows, pixels_);
+    size_t valid_px = decode_pixels(bytes_.data(), valid, k.format, w, rows_read, pixels_);
+    if (step > 1) {  // average the blocks: one pixel per cell
+        valid_px = bitmap_downscale(pixels_, valid_px, w, k.rows, step, sub, scaled_);
+        pixels_.swap(scaled_);
+    }
 
     // Upscale (nearest) into the texture so it is sampled 1:1 (the backend filters linearly).
     const int z = k.zoom, line_w = k.cols * z;
@@ -326,12 +345,23 @@ void BitmapPanel::draw_toolbar(const Document& doc) {
     ImGui::SameLine(0.0f, style.ItemInnerSpacing.x);
     ImGui::SetNextItemWidth(zoom_w);
     ImGui::BeginDisabled(fit_width);
-    if (ImGui::SliderInt("##zoom", &zoom, 1, kMaxZoom, "%dx")) zoom = std::clamp(zoom, 1, kMaxZoom);
+    {
+        // Levels 1/16x .. 1/2x, 1x .. 16x as one slider position each.
+        int levels[4 + kMaxZoom];
+        int n = 0, at = 0;
+        for (int d = 16; d >= 2; d /= 2) levels[n++] = -d;
+        for (int z = 1; z <= kMaxZoom; ++z) levels[n++] = z;
+        for (int i = 0; i < n; ++i)
+            if (levels[i] == zoom) at = i;
+        if (ImGui::SliderInt("##zoom", &at, 0, n - 1, bitmap_zoom_label(zoom), ImGuiSliderFlags_NoInput))
+            zoom = levels[std::clamp(at, 0, n - 1)];
+    }
     ImGui::EndDisabled();
-    ImGui::SetItemTooltip("Zoom (Ctrl+wheel over the image)");
+    ImGui::SetItemTooltip("Zoom (Ctrl+wheel over the image); below 1x a screen pixel averages\n"
+                          "a block of image pixels (for very wide images)");
     ImGui::SameLine();
     ImGui::Checkbox("Fit", &fit_width);
-    ImGui::SetItemTooltip("Largest zoom at which a whole row fits the panel");
+    ImGui::SetItemTooltip("Largest zoom at which a whole row fits the panel (down to 1/16x)");
     ImGui::EndGroup();
 
     // Source + offset
@@ -390,7 +420,7 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
         pressed_ = drag_select_ = false;
     }
     width = std::clamp(width, 1, kMaxWidth);
-    zoom = std::clamp(zoom, 1, kMaxZoom);
+    zoom = bitmap_zoom_clamp(zoom, kMaxZoom);
     draw_toolbar(*doc);
     if (doc->busy()) {
         ImGui::TextDisabled("Saving...");
@@ -422,14 +452,19 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
     // Ctrl+wheel zooms (leaves fit mode).
     if (area_hovered && io.KeyCtrl && io.MouseWheel != 0.0f) {
         if (fit_width) fit_width = false;
-        zoom = std::clamp(zoom + (io.MouseWheel > 0.0f ? 1 : -1), 1, kMaxZoom);
+        zoom = bitmap_zoom_next(zoom, io.MouseWheel > 0.0f ? 1 : -1, kMaxZoom);
     }
-    const int z = fit_width ? bitmap_fit_zoom(width, area_w, kMaxZoom) : zoom;
-    if (fit_width) zoom = z;
+    const int level = fit_width ? bitmap_fit_level(width, area_w, kMaxZoom) : zoom;
+    if (fit_width) zoom = level;
+    // A cell = step x step image pixels drawn as z x z screen pixels (step 1: zoomed in or 1x;
+    // z 1: downscaled). sc = screen pixels per image pixel.
+    const int z = bitmap_zoom_px(level), step = bitmap_zoom_step(level);
+    const float sc = float(z) / float(step);
     // Columns / rows one page shows: what fits the panel, capped like the decoded window below so
     // scrolling by a page never skips pixels that were not drawn.
-    const uint64_t cols_fit = std::clamp<uint64_t>(uint64_t(area_w) / uint64_t(z), 1,
-                                                   std::min<uint64_t>(kMaxPixels, uint64_t(kMaxTexture / z)));
+    const uint64_t cells_fit = std::clamp<uint64_t>(uint64_t(area_w) / uint64_t(z), 1,
+                                                    std::min<uint64_t>(kMaxPixels, uint64_t(kMaxTexture / z)));
+    const uint64_t cols_fit = cells_fit * uint64_t(step);  // image columns
     const bool need_h = uint64_t(width) > cols_fit;
     if (need_h) area_h -= sb;
     if (area_h < 4.0f) {
@@ -439,7 +474,8 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
     const uint64_t rows_cap = std::min<uint64_t>(
         {uint64_t(kMaxPixels), uint64_t(kMaxTexture / z),
          std::max<uint64_t>(1, kMaxBytes / bitmap_row_stride(format, int(std::min<uint64_t>(uint64_t(width), cols_fit))))});
-    const uint64_t rows_full = std::clamp<uint64_t>(uint64_t(area_h) / uint64_t(z), 1, rows_cap);
+    const uint64_t cell_rows_full = std::clamp<uint64_t>(uint64_t(area_h) / uint64_t(z), 1, rows_cap);
+    const uint64_t rows_full = cell_rows_full * uint64_t(step);  // image rows one page shows
 
     // ---- scrolling (64-bit row index; the phase base % stride is kept) ---------------------------
     uint64_t base = source == BitmapSource::FollowView     ? view_top_offset
@@ -504,11 +540,15 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
     base_ = base;
 
     // ---- decode the visible window ---------------------------------------------------------------
-    const int cols = int(std::min<uint64_t>({uint64_t(width) - col0_, cols_fit, uint64_t(kMaxPixels),
-                                             uint64_t(kMaxTexture / z)}));
-    const uint64_t row_bytes = bitmap_row_stride(format, cols);
+    // cols x rows cells; vis_cols x vis_rows image pixels from (col0_, top row).
+    const uint64_t ustep = uint64_t(step);
+    const int cols = int(std::min<uint64_t>({(uint64_t(width) - col0_ + ustep - 1) / ustep, cells_fit,
+                                             uint64_t(kMaxPixels), uint64_t(kMaxTexture / z)}));
+    const uint64_t vis_cols = std::min<uint64_t>(uint64_t(width) - col0_, uint64_t(cols) * ustep);
+    const uint64_t row_bytes = bitmap_row_stride(format, int(vis_cols));
     const int rows = int(std::min<uint64_t>({uint64_t(std::ceil(area_h / float(z))), uint64_t(kMaxPixels),
                                              uint64_t(kMaxTexture / z), std::max<uint64_t>(1, kMaxBytes / row_bytes)}));
+    const uint64_t vis_rows = uint64_t(rows) * ustep;
     Key k;
     k.doc_id = doc->id();
     k.gen = doc->generation();
@@ -519,6 +559,7 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
     k.cols = cols;
     k.rows = rows;
     k.zoom = z;
+    k.step = step;
     k.format = format;
     k.alpha = use_alpha && pixel_format_has_alpha(format);
     const bool have_tex = ensure_texture(cols * z, rows * z);
@@ -555,15 +596,17 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
         offset_to_pixel(base, format, width, lo, x0, y0);
         offset_to_pixel(base, format, width, hi - 1, x1, y1);
         x1 = std::min<uint64_t>(x1 + ppb, uint64_t(width));  // exclusive
-        if (y0 >= uint64_t(rows)) return;
-        const uint64_t vx0 = col0_, vx1 = col0_ + uint64_t(cols);
+        if (y0 >= vis_rows) return;
+        const uint64_t vx0 = col0_, vx1 = col0_ + vis_cols;
         auto rect = [&](uint64_t xa, uint64_t xb, uint64_t ya, uint64_t yb) {  // [xa,xb) x [ya,yb]
             xa = std::max(xa, vx0);
             xb = std::min(xb, vx1);
-            yb = std::min<uint64_t>(yb, uint64_t(rows) - 1);
+            yb = std::min<uint64_t>(yb, vis_rows - 1);
             if (xa >= xb || ya > yb) return;
-            dl->AddRectFilled(ImVec2(a0.x + float((xa - col0_) * uint64_t(z)), a0.y + float(ya * uint64_t(z))),
-                              ImVec2(a0.x + float((xb - col0_) * uint64_t(z)), a0.y + float((yb + 1) * uint64_t(z))), col);
+            const float x0f = a0.x + std::floor(float(xa - col0_) * sc), y0f = a0.y + std::floor(float(ya) * sc);
+            const float x1f = std::max(x0f + 1.0f, a0.x + std::floor(float(xb - col0_) * sc));  // >= 1 px
+            const float y1f = std::max(y0f + 1.0f, a0.y + std::floor(float(yb + 1) * sc));
+            dl->AddRectFilled(ImVec2(x0f, y0f), ImVec2(x1f, y1f), col);
         };
         if (y0 == y1) {
             rect(x0, x1, y0, y0);
@@ -571,7 +614,7 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
         }
         rect(x0, uint64_t(width), y0, y0);
         if (y1 > y0 + 1) rect(0, uint64_t(width), y0 + 1, y1 - 1);
-        if (y1 < uint64_t(rows)) rect(0, x1, y1, y1);
+        if (y1 < vis_rows) rect(0, x1, y1, y1);
     };
     const HexColors& C = hex_colors();
     const ViewState& v = doc->view();
@@ -579,15 +622,17 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
 
     // Hover -> offset
     const ImVec2 mouse = io.MousePos;
+    // Image pixel (relative to col0_ / the top row) under a screen point: the top-left pixel of
+    // the cell's block.
     auto pixel_at = [&](float mx, float my, bool clamp_inside, uint64_t& px, uint64_t& py) {
         float fx = std::floor((mx - a0.x) / float(z)), fy = std::floor((my - a0.y) / float(z));
         if (clamp_inside) {
             fx = std::clamp(fx, 0.0f, float(cols - 1));
-            fy = std::clamp(fy, 0.0f, float(std::min<uint64_t>(uint64_t(rows), rows_full + 1) - 1));
+            fy = std::clamp(fy, 0.0f, float(std::min<uint64_t>(uint64_t(rows), cell_rows_full + 1) - 1));
         }
         if (fx < 0.0f || fy < 0.0f || fx >= float(cols) || fy >= float(rows) || fy * float(z) >= area_h) return false;
-        px = uint64_t(fx);
-        py = uint64_t(fy);
+        px = uint64_t(fx) * ustep;
+        py = uint64_t(fy) * ustep;
         return true;
     };
     uint64_t hpx = 0, hpy = 0, hover_off = 0;
@@ -628,14 +673,14 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
 
     // Hex caret: outline (+ crosshair ticks when the pixels are small).
     uint64_t cx = 0, cy = 0;
-    if (cursor <= size && offset_to_pixel(base, format, width, cursor, cx, cy) && cy < uint64_t(rows) &&
-        cx >= col0_ && cx < col0_ + uint64_t(cols)) {
-        const uint64_t cw = std::min<uint64_t>(ppb, col0_ + uint64_t(cols) - cx);
-        const ImVec2 c0(a0.x + float((cx - col0_) * uint64_t(z)), a0.y + float(cy * uint64_t(z)));
-        const ImVec2 c1(c0.x + float(cw * uint64_t(z)), c0.y + float(z));
+    if (cursor <= size && offset_to_pixel(base, format, width, cursor, cx, cy) && cy < vis_rows &&
+        cx >= col0_ && cx < col0_ + vis_cols) {
+        const uint64_t cw = std::min<uint64_t>(ppb, col0_ + vis_cols - cx);
+        const ImVec2 c0(a0.x + std::floor(float(cx - col0_) * sc), a0.y + std::floor(float(cy) * sc));
+        const ImVec2 c1(c0.x + std::max(1.0f, float(cw) * sc), c0.y + std::max(1.0f, sc));
         dl->AddRect(ImVec2(c0.x - 2.0f, c0.y - 2.0f), ImVec2(c1.x + 2.0f, c1.y + 2.0f), rgba(0, 0, 0, 200), 0.0f, 0, 3.0f);
         dl->AddRect(ImVec2(c0.x - 1.0f, c0.y - 1.0f), ImVec2(c1.x + 1.0f, c1.y + 1.0f), C.cursor, 0.0f, 0, 1.5f);
-        if (z < 6) {
+        if (c1.y - c0.y < 6.0f) {
             const float mx = std::floor((c0.x + c1.x) * 0.5f) + 0.5f, my = std::floor((c0.y + c1.y) * 0.5f) + 0.5f;
             const float g = 4.0f, l = 9.0f;
             dl->AddLine(ImVec2(c0.x - g - l, my), ImVec2(c0.x - g, my), C.cursor, 1.5f);
@@ -644,7 +689,7 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
             dl->AddLine(ImVec2(mx, c1.y + g), ImVec2(mx, c1.y + g + l), C.cursor, 1.5f);
         }
     }
-    if (hover_valid && z >= 4 && !drag_select_) {
+    if (hover_valid && z >= 4 && !drag_select_) {  // z >= 4: step 1, hpx / hpy are cells
         const ImVec2 h0(a0.x + float(hpx * uint64_t(z)), a0.y + float(hpy * uint64_t(z)));
         dl->AddRect(h0, ImVec2(h0.x + float(z), h0.y + float(z)), rgba(255, 255, 255, 140));
     }
@@ -688,7 +733,7 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
         } else if (bits == 4) {
             line += " nibble=" + fmt_hex((ix & 1) ? unsigned(b[0] & 15u) : unsigned(b[0] >> 4), 1);
         }
-        const size_t pi = size_t(hpy) * size_t(cols) + size_t(hpx);
+        const size_t pi = size_t(hpy / ustep) * size_t(cols) + size_t(hpx / ustep);  // its cell
         if (have_key_ && key_ == k && pi < pixels_.size()) {
             const uint32_t c = pixels_[pi];
             // packed 0xAABBGGRR -> #RRGGBB[AA]
@@ -697,11 +742,11 @@ void BitmapPanel::draw(Document* doc, uint64_t cursor, uint64_t view_top_offset,
         }
         ImGui::TextUnformatted(line.c_str());
     } else {
-        const uint64_t last = std::min(size, base + std::min<uint64_t>(uint64_t(rows), rows_full) * stride);
+        const uint64_t last = std::min(size, base + std::min<uint64_t>(vis_rows, rows_full) * stride);
         char buf[256];
-        std::snprintf(buf, sizeof buf, "%s - %s  row %llu / %llu  %dx  %llu B/row",
+        std::snprintf(buf, sizeof buf, "%s - %s  row %llu / %llu  %s  %llu B/row",
                       fmt_off(base).c_str(), fmt_off(last ? last - 1 : 0).c_str(), (unsigned long long)(base / stride),
-                      (unsigned long long)total_rows, z, (unsigned long long)stride);
+                      (unsigned long long)total_rows, bitmap_zoom_label(level), (unsigned long long)stride);
         ImGui::TextDisabled("%s", size ? buf : "Empty document");
     }
     if (mono) ImGui::PopFont();

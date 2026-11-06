@@ -3,10 +3,12 @@
 // difference, Find Shift (worker job -> shift applied -> recompare), and synced scrolling.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string>
@@ -170,6 +172,36 @@ TEST_CASE("diffview: Find Shift applies the shift, recompares and shows the matc
     REQUIRE(c.until([&] { return !c.dv.finding_shift() && !c.dv.wants_frames(); }));
     CHECK(c.dv.shift == 300);
     CHECK(c.dv.note().find("Nothing to align") != std::string::npos);
+}
+
+TEST_CASE("diffview: Find Shift passes over a change and finds the next misalignment from the caret") {
+    const Bytes x = random_bytes(20000, 11), y = random_bytes(30000, 12), z = random_bytes(40000, 13);
+    const Bytes ins = random_bytes(200, 14), ins2 = random_bytes(50, 15);
+    Bytes da, db;
+    for (const Bytes* p : {&x, &y, &z}) std::copy(p->begin(), p->end(), std::back_inserter(da));
+    for (const Bytes* p : {&x, &ins, &y, &ins2, &z}) std::copy(p->begin(), p->end(), std::back_inserter(db));
+    db[100] ^= 0xFF;  // a change, then an insertion, then another insertion
+    Cmp c(da, db);
+    REQUIRE(c.compared());
+
+    c.dv.request_find_shift();
+    REQUIRE(c.until([&] { return !c.dv.finding_shift() && c.dv.shift != 0; }));
+    CHECK(c.dv.shift == 200);
+    CHECK(c.dv.note().find("after 1 change") != std::string::npos);
+    CHECK(c.a->view().cursor == 20000);  // the caret sits on the match
+    REQUIRE(c.compared());
+
+    c.dv.request_find_shift();  // from the caret on: the second insertion
+    REQUIRE(c.until([&] { return !c.dv.finding_shift() && c.dv.shift != 200; }));
+    CHECK(c.dv.shift == 250);
+    CHECK(c.dv.note().find("B has 50 bytes more at B 0xC418") != std::string::npos);
+    CHECK(c.a->view().cursor == 50000);
+    REQUIRE(c.compared());
+
+    c.dv.request_find_shift();  // nothing after the caret
+    REQUIRE(c.until([&] { return !c.dv.finding_shift() && !c.dv.wants_frames(); }));
+    CHECK(c.dv.shift == 250);
+    CHECK(c.dv.note().find("no difference after A 0x") != std::string::npos);
 }
 
 TEST_CASE("diffview: both sides scroll together, the shift applied") {

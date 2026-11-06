@@ -1,8 +1,11 @@
-// Tests for live tail: FileSource::extend + Document::refresh_appended (files growing by appending).
+// Tests for live tail: FileSource::extend + Document::refresh_appended (files growing by appending),
+// and a growing capture indexed incrementally (PcapIndexJob::start_append).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -15,6 +18,8 @@
 #include "core/document.h"
 #include "core/file_source.h"
 #include "core/os_file.h"
+#include "core/pcap.h"
+#include "pcap_fixture.h"
 
 using namespace hx;
 namespace fs = std::filesystem;
@@ -466,4 +471,80 @@ TEST_CASE("tail: bytes appended while an in-place save runs are picked up afterw
     CHECK(doc_bytes(*d) == expect);
     CHECK_FALSE(d->dirty());
     CHECK_FALSE(d->changed_on_disk());
+}
+
+// ---- a growing packet capture (the Packets index follows it incrementally) ----
+
+TEST_CASE("tail: a capture written record by record is indexed incrementally") {
+    TempDir t;
+    std::vector<Bytes> frames;
+    for (int i = 0; i < 40; ++i)
+        frames.push_back(
+            pcapfx::udp_frame("10.0.0.1", uint16_t(1000 + i), "10.0.0.2", 53, pcapfx::str("q" + std::to_string(i))));
+    for (bool ng : {false, true}) {
+        const Bytes full = ng ? pcapfx::pcapng_file(frames) : pcapfx::pcap_file(frames);
+        const std::string p = t.file(ng ? "live.pcapng" : "live.pcap");
+        // The writer starts with the header + 10 records, then appends in uneven pieces (cutting
+        // records in half, like a capture tool flushing its buffer).
+        const size_t first = ng ? 48 + 10 * 92 : 24 + 10 * 76;  // the frames are padded to 60 bytes
+        write_file(p, Bytes(full.begin(), full.begin() + std::ptrdiff_t(first)));
+        auto d = Document::open_file(p);
+        REQUIRE(d);
+        REQUIRE(d->refresh_appended() == GrowResult::Unchanged);  // records the bytes before the end
+        PcapIndexJob job;
+        job.start(d->snapshot());
+        auto wait = [&](uint64_t gen) {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (job.generation() == gen) {
+                REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return job.result();
+        };
+        auto r = wait(0);
+        REQUIRE(r);
+        CHECK(r->index.packets.size() == 10);
+        CHECK_FALSE(r->index.error);
+        size_t pos = first;
+        uint64_t gen = 1;
+        while (pos < full.size()) {
+            const size_t n = std::min<size_t>(full.size() - pos, 37);
+            mtime_tick();
+            append_file(p, Bytes(full.begin() + std::ptrdiff_t(pos), full.begin() + std::ptrdiff_t(pos + n)));
+            pos += n;
+            uint64_t added = 0;
+            REQUIRE(d->refresh_appended(&added) == GrowResult::Grown);
+            CHECK(added == n);
+            const size_t before = r->index.packets.size();
+            job.start_append(d->snapshot(), r);
+            r = wait(gen++);
+            REQUIRE(r);
+            CHECK(r->incremental);
+            CHECK(r->prev_packets == before);
+            CHECK(r->index.packets.size() >= before);
+            // A record cut short at the end is an error now and is read again by the next append.
+            CHECK(r->index.error == (r->index.scanned < pos));
+        }
+        PcapIndexResult direct;
+        index_pcap(*d->snapshot(), direct);
+        REQUIRE(r->index.packets.size() == 40);
+        CHECK_FALSE(r->index.error);
+        for (size_t i = 0; i < 40; ++i) {
+            CHECK(r->index.packets[i].record_off == direct.packets[i].record_off);
+            CHECK(r->index.packets[i].cap_len == direct.packets[i].cap_len);
+        }
+
+        // The file is rewritten (shorter, other content): the tail notices, and an append request
+        // over the reloaded document falls back to a full index.
+        mtime_tick();
+        const Bytes small = ng ? pcapfx::pcapng_file({frames[5], frames[6]}) : pcapfx::pcap_file({frames[5], frames[6]});
+        write_file(p, small);
+        CHECK(d->refresh_appended() == GrowResult::NotAppend);
+        REQUIRE(d->reload(nullptr));
+        job.start_append(d->snapshot(), r);
+        r = wait(gen++);
+        REQUIRE(r);
+        CHECK_FALSE(r->incremental);
+        CHECK(r->index.packets.size() == 2);
+    }
 }

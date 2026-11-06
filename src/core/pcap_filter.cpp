@@ -18,7 +18,7 @@ std::string lower(std::string s) {
 
 bool is_word_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
-           c == ':' || c == '/';
+           c == ':' || c == '/' || c == '+';
 }
 
 int hex_digit(char c) {
@@ -199,7 +199,33 @@ const FieldName kFields[] = {
     {"udp.port", PacketFilter::Field::UdpPort},     {"udp.srcport", PacketFilter::Field::UdpSrcPort},
     {"udp.dstport", PacketFilter::Field::UdpDstPort}, {"frame.len", PacketFilter::Field::FrameLen},
     {"eth.type", PacketFilter::Field::EthType},     {"proto", PacketFilter::Field::Proto},
+    {"frame.number", PacketFilter::Field::FrameNumber}, {"vlan", PacketFilter::Field::Vlan},
+    {"vlan.id", PacketFilter::Field::Vlan},         {"ip.proto", PacketFilter::Field::IpProto},
+    {"tcp.seq", PacketFilter::Field::TcpSeq},       {"tcp.ack", PacketFilter::Field::TcpAck},
+    {"tcp.flags", PacketFilter::Field::TcpFlags},
 };
+
+// TCP flag names (tcp.flags values, tcp.flags.<name> fields): bit i = kTcpFlagNames[i].
+const char* const kTcpFlagNames[] = {"fin", "syn", "rst", "psh", "ack", "urg", "ece", "cwr"};
+int tcp_flag_bit(const std::string& lname) {
+    for (int i = 0; i < 8; ++i)
+        if (lname == kTcpFlagNames[i]) return i;
+    return -1;
+}
+
+// "syn+ack" -> 0x12; false on an unknown or empty name.
+bool parse_flag_names(const std::string& s, uint64_t& v) {
+    v = 0;
+    size_t pos = 0;
+    while (true) {
+        const size_t plus = s.find('+', pos);
+        const int bit = tcp_flag_bit(lower(s.substr(pos, plus == std::string::npos ? std::string::npos : plus - pos)));
+        if (bit < 0) return false;
+        v |= uint64_t(1) << bit;
+        if (plus == std::string::npos) return true;
+        pos = plus + 1;
+    }
+}
 
 // Protocol ids (Node::num of a Proto comparison).
 enum ProtoId : uint64_t { kTcp, kUdp, kIcmp, kIcmpv6, kArp, kIp, kIpv6 };
@@ -320,6 +346,20 @@ private:
                 n.field = f.field;
                 known = true;
             }
+        if (!known && w.rfind("tcp.flags.", 0) == 0) {  // tcp.flags.syn ...
+            const int bit = tcp_flag_bit(w.substr(10));
+            if (bit < 0)
+                return bad("unknown TCP flag '" + name.text.substr(10) + "' (fin, syn, rst, psh, ack, urg, ece, cwr)",
+                           name.pos + 10);
+            n.field = PacketFilter::Field::TcpFlag;
+            n.mask = uint8_t(1u << bit);
+            if (cur().kind != Tok::Op) {  // alone: the flag is set
+                n.op = PacketFilter::Op::Ne;
+                n.num = 0;
+                return add(std::move(n));
+            }
+            known = true;
+        }
         if (!known) {  // a bare protocol name: proto == name
             if (proto_id(w, n.num) && cur().kind != Tok::Op) {
                 n.field = PacketFilter::Field::Proto;
@@ -363,11 +403,27 @@ private:
             if (!proto_id(v.text, n.num))
                 return bad("unknown protocol '" + v.text + "' (tcp, udp, icmp, icmpv6, arp, ip, ipv6)", v.pos);
             break;
+        case PacketFilter::Field::TcpFlags:
+            if (parse_flag_names(v.text, n.num)) break;
+            if (!parse_uint(v.text, n.num))
+                return bad("expected a number or flag names (syn+ack), got '" + v.text + "'", v.pos);
+            if (n.num > 0xFF) return bad("value out of range (0..255)", v.pos);
+            break;
         default: {
             if (!parse_uint(v.text, n.num)) return bad("expected a number, got '" + v.text + "'", v.pos);
-            const bool port = n.field != PacketFilter::Field::FrameLen;  // ports and eth.type are 16-bit
-            if (port && n.num > 0xFFFF) return bad("value out of range (0..65535)", v.pos);
-            if (!port && n.num > UINT32_MAX) return bad("value out of range", v.pos);
+            uint64_t max = 0xFFFF;  // ports and eth.type
+            const char* range = "0..65535";
+            switch (n.field) {
+            case PacketFilter::Field::FrameLen:
+            case PacketFilter::Field::TcpSeq:
+            case PacketFilter::Field::TcpAck: max = UINT32_MAX, range = "0..4294967295"; break;
+            case PacketFilter::Field::FrameNumber: max = UINT64_MAX; break;
+            case PacketFilter::Field::Vlan: max = 4095, range = "0..4095"; break;
+            case PacketFilter::Field::IpProto: max = 255, range = "0..255"; break;
+            case PacketFilter::Field::TcpFlag: max = 1, range = "0 or 1"; break;
+            default: break;
+            }
+            if (n.num > max) return bad(std::string("value out of range (") + range + ")", v.pos);
             break;
         }
         }
@@ -469,16 +525,16 @@ bool PacketFilter::parse(const std::string& text, std::string* err, size_t* err_
     return true;
 }
 
-bool PacketFilter::match(const Packet& p, const PacketInfo& pi) const {
-    return root_ < 0 || eval(root_, p, pi);
+bool PacketFilter::match(const Packet& p, const PacketInfo& pi, uint64_t number) const {
+    return root_ < 0 || eval(root_, p, pi, number);
 }
 
-bool PacketFilter::eval(int i, const Packet& p, const PacketInfo& pi) const {
+bool PacketFilter::eval(int i, const Packet& p, const PacketInfo& pi, uint64_t number) const {
     const Node& n = nodes_[size_t(i)];
     switch (n.kind) {
-    case Kind::And: return eval(n.a, p, pi) && eval(n.b, p, pi);
-    case Kind::Or: return eval(n.a, p, pi) || eval(n.b, p, pi);
-    case Kind::Not: return !eval(n.a, p, pi);
+    case Kind::And: return eval(n.a, p, pi, number) && eval(n.b, p, pi, number);
+    case Kind::Or: return eval(n.a, p, pi, number) || eval(n.b, p, pi, number);
+    case Kind::Not: return !eval(n.a, p, pi, number);
     case Kind::Text:
         return lower(pi.proto).find(n.text) != std::string::npos || lower(pi.summary).find(n.text) != std::string::npos;
     case Kind::Compare: break;
@@ -503,6 +559,13 @@ bool PacketFilter::eval(int i, const Packet& p, const PacketInfo& pi) const {
     case Field::FrameLen: return test_num(n, n.op, p.orig_len);
     case Field::EthType: return pi.eth_type != 0 && test_num(n, n.op, pi.eth_type);
     case Field::Proto: return has_proto(pi, n.num) == (n.op == Op::Eq);
+    case Field::FrameNumber: return number != 0 && test_num(n, n.op, number);
+    case Field::Vlan: return pi.vlan != 0xFFFF && test_num(n, n.op, pi.vlan);
+    case Field::IpProto: return pi.ip_version != 0 && test_num(n, n.op, pi.ip_proto);
+    case Field::TcpSeq: return pi.tcp_header && test_num(n, n.op, pi.tcp_seq);
+    case Field::TcpAck: return pi.tcp_header && test_num(n, n.op, pi.tcp_ack);
+    case Field::TcpFlags: return pi.tcp_header && test_num(n, n.op, pi.tcp_flags);
+    case Field::TcpFlag: return pi.tcp_header && test_num(n, n.op, (pi.tcp_flags & n.mask) ? 1 : 0);
     }
     return false;
 }
@@ -515,20 +578,23 @@ void filter_packets(const Snapshot& snap, const std::vector<Packet>& packets, co
             if (cancel && cancel->load(std::memory_order_relaxed)) return;
             if (done) done->store(i - begin, std::memory_order_relaxed);
         }
-        if (f.match(packets[i], dissect_packet(snap, packets[i], kFilterRead))) out.push_back(uint32_t(i));
+        if (f.match(packets[i], dissect_packet(snap, packets[i], kFilterRead), i + 1)) out.push_back(uint32_t(i));
     }
     if (done) done->store(end > begin ? end - begin : 0, std::memory_order_relaxed);
 }
 
-void PacketFilterJob::start(std::shared_ptr<const PcapIndexJob::Result> index, const PacketFilter& f) {
-    const uint64_t total = index ? index->index.packets.size() : 0;
-    w_.start(total, [index = std::move(index), f](PacketFilterResult& r, const std::atomic<bool>& cancel,
-                                                  std::atomic<uint64_t>& done) {
+void PacketFilterJob::start(std::shared_ptr<const PcapIndexJob::Result> index, const PacketFilter& f, size_t begin,
+                            std::vector<uint32_t> prefix) {
+    const uint64_t n = index ? index->index.packets.size() : 0;
+    const uint64_t total = n > begin ? n - begin : 0;
+    w_.start(total, [index = std::move(index), f, begin, prefix = std::move(prefix)](
+                        PacketFilterResult& r, const std::atomic<bool>& cancel, std::atomic<uint64_t>& done) {
         r.text = f.text();
         r.index = index;
+        r.matches = prefix;
         if (index && index->snap)
-            filter_packets(*index->snap, index->index.packets, f, 0, index->index.packets.size(), r.matches, &cancel,
-                           &done);
+            filter_packets(*index->snap, index->index.packets, f, begin, index->index.packets.size(), r.matches,
+                           &cancel, &done);
         r.cancelled = cancel.load();
     });
 }

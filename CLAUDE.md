@@ -12,7 +12,8 @@ Modern, KISS, dark-mode hex editor for binary analysis (HxD alternative). C++20 
 - **Full undo history** (Ctrl+Z / Ctrl+Y) for every content and bookmark change; it survives saves and
   restarts (session). New mutating features must go through `Document` so they are undoable.
   View-level settings worth undoing (read-only toggle, parser, Parse at) are cheap view steps via
-  `Document::set_view_options` (no piece list copy; `UndoEntry::view_only`); caret moves and
+  `Document::set_view_options` (no piece list copy; `UndoEntry::view_only`; they keep the redo
+  stack's content steps and only replace undone view steps); caret moves and
   scrolling are not undo steps. Every step has a wall-clock `time_ms` (History panel "Time").
 - **Hot exit** (Sublime-style): no "save changes?" prompts on exit; unsaved edits + history + view
   state persist in the session dir and restore on launch. Only edits are stored, never the original file.
@@ -33,14 +34,17 @@ src/core/    no UI, no Lua — os_file, file_source (ByteBackend: file / device 
              extras), session (hot exit + per-doc / session extras), search, inspector, util (goto
              exprs, copy-as, paste parse), settings (+ paths), nav (PointerType, follow pointer +
              jump history), xorscan (XorScanJob, key_guess, undoable apply_transform),
-             strings_scan (StringsJob), hash (16 algorithms + HashJob), cstruct (C struct
-             definitions -> Lua parser source),
+             strings_scan (StringsJob), hash (16 algorithms + HashJob; CustomHashAlgorithm = script ones), cstruct (C struct
+             definitions -> Lua parser source), multisel (ByteRange sets + multi-selection
+             operations over Document::fill_ranges),
              entropy (ByteClass + EntropyJob: sampled per-bucket entropy for the minimap), bitmap
              (bytes -> pixels), diff (DiffJob: compare two Snapshots with a shift), pcap (pcap/pcapng
-             PcapIndexJob + packet dissector), pcap_filter (PacketFilter expressions +
-             PacketFilterJob), pcap_stream (TCP reassembly: follow_tcp_stream, TcpStreamJob),
-             pcap_job.h (PcapWorker<R>: one background run, used by both); document also has
-             refresh_appended() (live tail);
+             PcapIndexJob + packet dissector; index_pcap_append / start_append continue an index
+             of a grown capture), pcap_filter (PacketFilter expressions + PacketFilterJob),
+             pcap_stream (TCP reassembly: follow_tcp_stream, follow_udp_stream, TcpStreamJob;
+             Conversations / ConversationJob for the Stream column),
+             pcap_job.h (PcapWorker<R>: one background run, used by all of them); document also has
+             refresh_appended() (live tail; App passes growths to PacketsPanel::appended);
              exe_map (AddressMap: PE / ELF / manual file offset <-> VA, entry point, sections;
              detect_pe_image = a PE mapped by RVA in process memory; a Process map's `names` are
              the modules), nav also has AutoPointerWidth (process docs' pointer-size default);
@@ -52,7 +56,9 @@ src/script/  script_engine.h (Lua API contract — the header comment is the API
              script_engine.cpp, lua_api.cpp, lua_onelua.cpp (the wrap's Lua sources compiled as ONE
              C++ TU: Lua errors are C++ exceptions; include "lua.h" etc., never lua.hpp),
              cexport (parse tree -> C header, opts.flags names; no Lua, but on Field so it lives here), parse_job (ParseJob: one parse on a worker
-             thread in a ScriptEngine of its own over Document::clone_readonly)
+             thread in a ScriptEngine of its own over Document::clone_readonly), lua_hash
+             (hx.hash_algorithm: LuaHasher on a Lua stack; ScriptEngine::custom_hashes() = HashJob
+             factories that rebuild the algorithm's script in a fresh engine on the worker)
 src/ui/      theme (dark theme, fonts + live reload_fonts, palette), hex_view (the widget), panels, app (main loop,
              menus, shortcuts, tabs, Compare tab, live tail, split view, minimap wiring, session
              extras, ScriptHost impl); self-contained feature UIs without App dependency:
@@ -74,18 +80,22 @@ tests/       doctest; one exe per module: test_core, test_util, test_script, tes
              test_diff, test_pcap, test_pcapfilter, test_tcpstream (synthetic captures from
              pcap_fixture.h), test_tail (growing files), test_procmem (reads and writes the
              test process's own memory; its modules, their in-memory PE symbols, hx.open_process), test_history, test_xorscan, test_session,
+             test_multisel (range sets, every multi-selection operation + its undo step),
              test_symbols (PE / ELF fixtures in symbol_fixture.h, malformed tables, kernel32.dll
              when present), test_disasm (encodings, sync_back, PE / ELF maps incl. malformed
              headers, Lua, headless panel incl. labels / Go to Symbol / session extras),
              test_cexport (C header export + round trip through cstruct, opts.flags, bit toggles),
-             test_parsejob (background parses: cancel, stale reads, errors, sync fallback, holes)
+             test_parsejob (background parses: cancel, stale reads, errors, sync fallback, holes),
+             test_app (the whole App headless: session round trips, History / XOR panel actions)
 tools/       meson.bat (MSVC env wrapper), ppm2png.py (screenshot conversion),
              make_icon.py (regenerates assets/icon/* + src/ui/icon_data.h; edit the design there),
              make_pcap.py (demo pcapng with HXP packets + an HTTP-over-TCP connection for the
              Packets panel / Follow TCP Stream)
-assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file
+assets/      app icon (PNG sizes + hexer.ico, embedded via src/hexer.rc), Linux .desktop file,
+             linux/*.metainfo.xml (AppStream; meson installs it to share/metainfo)
 .github/     CI (workflows/ci.yml): release builds + tests on GCC / Clang / MSVC; packages
-             (Windows zip, Linux AppImage on ubuntu-22.04 + tar.gz) as 7-day artifacts, smoke-tested
+             (Windows zip, Linux AppImage + tar.gz on ubuntu-22.04, x86_64 + an experimental
+             aarch64 leg; metainfo checked by appstreamcli, warnings only) as 7-day artifacts, smoke-tested
              by ci/smoke-package.sh (source scripts/ moved away); `v*` tags publish a GitHub Release
 ```
 Headers are the module contracts. Changing a public signature means updating every caller —
@@ -116,7 +126,8 @@ Other app flags: `--exec "<lua>"` (run console code after startup), `--frames N`
 `"Show All Bookmarks"`, `"Jump to Bookmark..."`, `"Strings: Scan File"`, `"Hash Selection"`,
 `"New Parser from C Struct..."`, `"Follow Pointer at Cursor"`, `"Navigate Back"`, `"Minimap: Byte Classes"`,
 `"Color Bytes by Class"`, `"Toggle Bitmap"`, `"Bitmap: Show at Cursor"`, `"Toggle Packets"`,
-`"Packets: Follow TCP Stream"` / `"... (Interleaved)"`, `"Packets: Open Packet as Tab"`, `"Packets:
+`"Packets: Follow TCP Stream"` / `"... (Interleaved)"`, `"Packets: Follow UDP Stream"` / `"...
+(Interleaved)"`, `"Packets: Open Packet as Tab"`, `"Packets:
 Open Payload as Tab"`, `"Packets: Filter Conversation"` (selected packet, else the one under the
 caret: e.g. `--exec "local d=hx.doc(); d:jump(d:size()-20)"` picks the last packet; they wait
 for the index),
@@ -150,6 +161,13 @@ Every change to input handling or hit testing in `ui/hex_view.cpp` gets a case t
 Use `Document::set_clock_for_tests` for undo-merge timing and step times (`Document::now_ms`). The `Form` fixture there drives
 `ui/input.h`: shortcut routing while a text field has focus and the inline row editor.
 
+Headless App tests (`tests/test_app.cpp`, target `test_app`): the whole App (app.cpp + panels.cpp)
+with no window / GL through `app_startup` / `app_frame` / `app_shutdown` (ui/app_internal.h;
+`App::window` stays null, so GLFW calls in frame code must check it; `now_s()` is a steady clock,
+not glfwGetTime). `HeadlessApp` owns the ImGui context and a temp config dir (so one App's
+hot-exit session is the next one's restore); `run_named_action()` is what `--action` runs. New
+session extras / App-level persistence get a round trip there.
+
 Shortcut routing (`ui/input.h`, the one policy): the action table's `in_text` says whether an
 action may fire while a text field has focus, and `global_shortcut()` never fires a
 text-editing chord then (`text_editing_chord()`: Ctrl+Z/Y/A/C/V/X, Ins, Del, arrows, Home/End,
@@ -171,7 +189,11 @@ they stay the synchronous API (tests, scripts).
 Minimap sampling (core/entropy): holes of sparse files are known zeros (`snapshot_data_ranges` over
 `FileSource::data_range`: FSCTL_QUERY_ALLOCATED_RANGES / SEEK_DATA+SEEK_HOLE), only data ranges are
 read and each gets a chunk; `EntropyBucket::peak` / `nonzero` + `entropy_spot()` mark small dense
-regions the average hides (a tick on the minimap's right edge).
+regions the average hides (a tick on the minimap's right edge). Allocated zero areas: after the scan
+the job refines sampled all-zero buckets while idle (`EntropyOptions::refine_passes`: one more 4 KiB
+slot per gap and pass, bit-reversed order, paced by `refine_pause_ms`; `EntropyBucket::refined`).
+Process memory changes underneath: `EntropyJob::refresh(snap, ranges)` recomputes only the given
+ranges (the app: the visible buckets + a rotating 1/64 every 2 s, `refresh_process_entropy`).
 
 Symbol tables survive size changes after every table: `SymbolTable::size_min / size_max` record how
 the build's range checks against the size came out (every check goes through `Reader::fits` /
@@ -210,9 +232,11 @@ Persistence (every new window / option must land in exactly one of these; nothin
   bitmap.fixed, cstruct.* (the C Struct to Parser draft + open state).
 - **Console input history**: `<config>/console_history.txt` (`load_history` / `save_history`).
 - Deliberately transient: search results, filters / inputs of pickers and popups, Whole file /
-  Selection radios (the actions set them), Writable checkboxes (safety), the Settings window.
+  Selection radios (the actions set them), Writable checkboxes (safety), the Settings window,
+  the extra ranges of a multi-selection (`ViewState::extra_sel`: neither session nor undo entries).
 Packets / Regions auto-open when a capture / process is newly opened (`add_tab`), not when the
-session restores one (`App::restoring`): the saved `panel_*` visibility wins. Process documents
+session restores one (`App::restoring`): the saved `panel_*` visibility wins. Reset Layout applies
+`Settings{}`'s `panel_*` defaults (`apply_panel_visibility`): on-demand panels close. Process documents
 are not persistable: the session skips them (hot exit drops them with a console line). Restart as
 Administrator (`restart_as_admin`, protocol in core/elevation.h) therefore puts them on the elevated
 instance's command line, refuses edits the restart would lose, writes the session, launches, and
@@ -224,6 +248,8 @@ state ("disasm.map" / "disasm.base" / "disasm.top") itself: `DisasmPanel::save_e
 
 Jump history: `reveal_range()` (app_internal.h) is the one "big jump" helper: it pushes the
 position it leaves onto the tab's `NavHistory`. Use it for new jump sources (not for caret moves).
+Script jumps (`doc:jump` / `doc:select` / `doc:select_ranges`) reach it through `App::reveal`:
+lua_api calls `ScriptHost::reveal` *before* it moves the view, so the old position is recorded.
 Scroll-only sources (minimap click/drag, live tail follow) call `HexView::request_scroll_to`.
 
 Compare tab: the DiffView sides draw the documents' own ViewState (caret, selection, top_row are
@@ -232,12 +258,20 @@ shared with their tabs; only one of them is drawn per frame). `top_row` is a row
 view with another width draws. Jumps aimed at a tab's HexView while the Compare tab is shown are
 handed over with `HexView::take_scroll_request()`. A B side that is not a tab (the file on disk,
 the `.backup`) is `App::diff_aux` (a read-only Document; `compare_b()` finds either kind); Find
-Shift is `core/diff.h find_shift` on DiffView's own `ShiftJob`.
+Shift is `core/diff.h find_shift` on DiffView's own `ShiftJob`, from the A caret on
+(`ShiftOptions::from`; plain changes are passed over), so repeating it walks the misalignments.
 
 Selection convention (one for the whole UI, see `ui/hex_view.h`): `ViewState` selection is
 half-open `[sel_begin, sel_end)`; the caret is drawn on `caret_byte()` (inside the selection);
 the Inspector/status bar/inspector edits use `focus_offset()` (selection start, else caret);
 ranges are displayed with `fmt_range()` (inclusive end).
+Multi-selection (`core/multisel.h`): `ViewState::extra_sel` is a range set (sorted, merged) of
+extra ranges beside that primary selection, which keeps every rule above. Operations on all ranges
+(`selection_ranges()`: primary + extras merged, file order) are one undo step each through
+`Document::fill_ranges` (one pass over the pieces, any number of ranges) or one bookmark group;
+tools that need one contiguous range keep using the primary selection. Hex view: Alt+click /
+Alt+drag adds, Alt+click on a selected byte removes, a plain click / Esc clears (Esc is claimed
+with a focused `ImGui::Shortcut` only while extras exist, so the app's global Esc keeps working).
 
 ## Conventions
 - namespace `hx`; 4-space indent; `snake_case` functions/vars, `PascalCase` types, `trailing_` members.

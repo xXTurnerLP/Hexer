@@ -1,12 +1,15 @@
 // Tests for core/pcap_stream: TCP stream reassembly over synthetic pcap / pcapng captures (handshake,
 // both directions, out-of-order / retransmitted / overlapping segments, sequence wraparound, gaps,
-// connection reuse, caps), the stream document (sequential / interleaved + bookmarks), the job.
+// connection reuse, caps), the stream document (sequential / interleaved + bookmarks), the job;
+// Follow UDP Stream and the conversation numbers of the Packets panel's Stream column.
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -407,4 +410,174 @@ TEST_CASE("tcp stream: TcpStreamJob follows and builds in the background") {
     }
     REQUIRE(job.result());
     CHECK(job.result()->doc.bytes.size() == 2000);
+}
+
+// ---- Follow UDP Stream -------------------------------------------------------------------------
+
+TEST_CASE("udp stream: datagrams of one conversation, both directions, in capture order") {
+    std::vector<Bytes> f;
+    f.push_back(arp_frame());                                                             // 0
+    f.push_back(udp_frame("10.0.0.5", 5353, "10.0.0.9", 53, str("q1")));                  // 1 client first
+    f.push_back(udp_frame("10.0.0.9", 53, "10.0.0.5", 5353, str("answer1")));             // 2
+    f.push_back(udp_frame("10.0.0.5", 5354, "10.0.0.9", 53, str("other port")));          // 3 other conversation
+    f.push_back(udp_frame("10.0.0.5", 5353, "10.0.0.9", 53, str("")));                    // 4 empty datagram
+    f.push_back(tcp_frame("10.0.0.5", 5353, "10.0.0.9", 53, 1, 1, ACK, str("tcp!")));     // 5 TCP, same ports
+    f.push_back(udp_frame("10.0.0.5", 5353, "10.0.0.9", 53, str("q2")));                  // 6
+    f.push_back(udp_frame("10.0.0.9", 53, "10.0.0.5", 5353, str("answer2"), 7));          // 7 the VLAN tag is ignored
+    for (bool ng : {false, true}) {
+        Capture cap(ng ? pcapng_file(f, true) : pcap_file(f));
+        REQUIRE(cap.packets().size() == f.size());
+        // From a server -> client packet: the client is still the first sender.
+        TcpStream s;
+        std::atomic<uint64_t> done{0};
+        REQUIRE(follow_udp_stream(*cap.res->snap, cap.packets(), 2, s, kTcpStreamMax, nullptr, &done));
+        CHECK(done.load() == f.size());
+        CHECK(s.udp);
+        CHECK(fmt_endpoint(s.client) == "10.0.0.5:5353");
+        CHECK(fmt_endpoint(s.server) == "10.0.0.9:53");
+        CHECK(s.packets == 5);  // #2 #3 #5 #7 #8 (the empty one counts, it has no segment)
+        REQUIRE(s.segments.size() == 4);
+        CHECK(s.segments[0].packet == 1);
+        CHECK(s.segments[0].dir == 0);
+        CHECK(s.segments[1].packet == 2);
+        CHECK(s.segments[1].dir == 1);
+        CHECK(s.segments[2].packet == 6);
+        CHECK(s.segments[2].stream_off == 2);
+        CHECK(s.segments[3].packet == 7);
+        CHECK(s.segments[3].stream_off == 7);
+        CHECK(s.bytes[0] == 4);
+        CHECK(s.bytes[1] == 14);
+        TcpStreamDoc seq, inter;
+        build_tcp_stream_doc(*cap.res->snap, s, false, seq);
+        build_tcp_stream_doc(*cap.res->snap, s, true, inter);
+        CHECK(seq.name == "UDP 10.0.0.5:5353 > 10.0.0.9:53");
+        CHECK(inter.name == "UDP 10.0.0.5:5353 > 10.0.0.9:53 (interleaved)");
+        CHECK(text(seq) == "q1q2answer1answer2");
+        CHECK(text(inter) == "q1answer1q2answer2");
+        REQUIRE(inter.bookmarks.size() == 4);
+        CHECK(inter.bookmarks[0].name == "#2 C>S");
+        CHECK(inter.bookmarks[1].name == "#3 S>C");
+        CHECK(inter.bookmarks[1].offset == 2);
+        CHECK(inter.bookmarks[1].length == 7);
+        CHECK(tcp_stream_summary(s) == "4 bytes client -> server, 14 bytes server -> client, 5 datagrams");
+    }
+}
+
+TEST_CASE("udp stream: errors, IPv6, IP fragments are skipped, max_bytes cap, the job") {
+    std::vector<Bytes> f;
+    f.push_back(udp_frame("2001:db8::1", 40000, "2001:db8::2", 53, str("v6 query")));
+    f.push_back(udp_frame("2001:db8::2", 53, "2001:db8::1", 40000, str("v6 answer")));
+    f.push_back(tcp_frame("10.0.0.1", 1, "10.0.0.2", 2, 1, 1, ACK, str("x")));
+    f.push_back(udp_frame("2001:db8::1", 40000, "2001:db8::2", 53, str("more")));
+    // An IPv4 first fragment (MF set): skipped, like a non-first one.
+    Bytes v4 = udp_frame("10.0.0.1", 7, "10.0.0.2", 9, str("frag"));
+    v4[14 + 6] = 0x20;  // MF, offset 0
+    f.push_back(v4);
+    f.push_back(udp_frame("10.0.0.1", 7, "10.0.0.2", 9, str("whole")));
+    Capture cap(pcap_file(f));
+    TcpStream s;
+    CHECK_FALSE(follow_udp_stream(*cap.res->snap, cap.packets(), 2, s));
+    CHECK(s.error == "packet #3 is not a UDP packet");
+    CHECK_FALSE(follow_udp_stream(*cap.res->snap, cap.packets(), 99, s));
+    CHECK(s.error == "no such packet");
+    CHECK_FALSE(follow_udp_stream(*cap.res->snap, cap.packets(), 4, s));
+    CHECK(s.error == "packet #5 is not a UDP packet");
+    REQUIRE(follow_udp_stream(*cap.res->snap, cap.packets(), 5, s));
+    REQUIRE(s.segments.size() == 1);
+    CHECK(s.segments[0].packet == 5);
+    CHECK(s.packets == 1);
+    REQUIRE(follow_udp_stream(*cap.res->snap, cap.packets(), 1, s));
+    CHECK(fmt_endpoint(s.client) == "[2001:db8::1]:40000");
+    CHECK(s.packets == 3);
+    CHECK(s.bytes[0] == 8 + 4);
+    CHECK(s.bytes[1] == 9);
+    // The cap cuts a datagram and stops.
+    REQUIRE(follow_udp_stream(*cap.res->snap, cap.packets(), 0, s, 10));
+    CHECK(s.truncated);
+    CHECK(s.bytes[0] + s.bytes[1] == 10);
+    REQUIRE(s.segments.size() == 2);
+    CHECK(s.segments[1].len == 2);
+    CHECK(tcp_stream_summary(s).find("cut at 10 bytes") != std::string::npos);
+    // The job follows UDP when asked.
+    TcpStreamJob job;
+    job.start(cap.res, 1, true, kTcpStreamMax, true);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == 0) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(job.result());
+    CHECK(job.result()->stream.udp);
+    CHECK(text(job.result()->doc) == "v6 queryv6 answermore");
+    job.start(cap.res, 2, true, kTcpStreamMax, true);  // a TCP packet: UDP refuses it
+    while (job.generation() == 1) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(job.result());
+    CHECK(job.result()->stream.error == "packet #3 is not a UDP packet");
+}
+
+// ---- conversations ("Stream" column) -------------------------------------------------------------
+
+TEST_CASE("conversations: TCP and UDP numbered separately, both directions share a number") {
+    std::vector<Bytes> f;
+    f.push_back(tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 1, 0, SYN));              // 0 tcp 0
+    f.push_back(udp_frame("10.0.0.3", 53, "10.0.0.4", 4000, str("a")));                // 1 udp 0
+    f.push_back(tcp_frame("10.0.0.2", 80, "10.0.0.1", 51000, 9, 2, SYN | ACK));         // 2 tcp 0
+    f.push_back(arp_frame());                                                           // 3 none
+    f.push_back(tcp_frame("10.0.0.1", 51001, "10.0.0.2", 80, 1, 0, SYN));              // 4 tcp 1
+    f.push_back(udp_frame("10.0.0.4", 4000, "10.0.0.3", 53, str("b")));                // 5 udp 0
+    f.push_back(udp_frame("10.0.0.1", 51000, "10.0.0.2", 80, str("c")));               // 6 udp 1 (ports of tcp 0)
+    f.push_back(icmp_frame("10.0.0.1", "10.0.0.2"));                                    // 7 none
+    f.push_back(udp_frame("2001:db8::1", 1, "2001:db8::2", 2, str("v6")));             // 8 udp 2
+    f.push_back(udp_frame("2001:db8::2", 2, "2001:db8::1", 1, str("v6"), 5));          // 9 udp 2 (VLAN ignored)
+    Capture cap(pcapng_file(f));
+    REQUIRE(cap.packets().size() == f.size());
+    Conversations c;
+    std::atomic<uint64_t> done{0};
+    number_conversations(*cap.res->snap, cap.packets(), c, nullptr, &done);
+    CHECK(done.load() == f.size());
+    const std::vector<uint32_t> want = {0, 0, 0, kNoStream, 1, 0, 1, kNoStream, 2, 2};
+    CHECK(c.stream == want);
+    const std::vector<uint8_t> udp = {0, 1, 0, 0, 0, 1, 1, 0, 1, 1};
+    CHECK(c.is_udp == udp);
+    CHECK(c.count[0] == 2);
+    CHECK(c.count[1] == 3);
+
+    // Continuing over a longer index numbers only the new packets (live tail), the same as from scratch.
+    Conversations part;
+    std::vector<Packet> first;
+    for (size_t i = 0; i < 5; ++i) first.push_back(cap.packets()[i]);
+    number_conversations(*cap.res->snap, first, part);
+    CHECK(part.stream.size() == 5);
+    number_conversations(*cap.res->snap, cap.packets(), part, nullptr, &done);
+    CHECK(done.load() == 5);
+    CHECK(part.stream == want);
+    CHECK(part.count[1] == 3);
+
+    // The job, from scratch and continuing a previous result.
+    ConversationJob job;
+    auto small = std::make_shared<PcapIndexJob::Result>(*cap.res);
+    small->index.packets.resize(3);
+    job.start(small);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == 0) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto r1 = job.result();
+    REQUIRE(r1);
+    CHECK(r1->index == small);
+    CHECK(r1->conv.stream == std::vector<uint32_t>{0, 0, 0});
+    job.start(cap.res, r1);
+    while (job.generation() == 1) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(job.result());
+    CHECK(job.result()->conv.stream == want);
+    CHECK(job.result()->index == cap.res);
+    CHECK_FALSE(job.result()->cancelled);
+    CHECK(r1->conv.stream.size() == 3);  // the previous result is untouched
 }

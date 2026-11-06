@@ -42,7 +42,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   history survives saves and restarts. Typing is grouped into one step per run of keys: a pause
   of more than 500 ms, or more than 32 typed bytes, starts a new step (both in Settings).
   Edit > Read-only, the Structure panel's parser and Parse at are undo steps too (they change no
-  byte; `Ctrl+Z` turns read-only off again); moving the caret or scrolling is not.
+  byte; `Ctrl+Z` turns read-only off again, and picking a parser after a few undos keeps the
+  edits redoable); moving the caret or scrolling is not.
 - **History panel** (View > History): every state of the document, oldest first, with the
   action's name (Typing, Paste, Fill, Decode XOR 0x5A, Read-only on, Parser: PNG image, ...), the
   bytes it changed and when ("just now", "5 min ago", "yesterday 14:03"; hover for the full date).
@@ -68,6 +69,13 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   last byte you dragged to (inside the selection). The Inspector, the status bar's Offset/Byte
   and inspector edits all work on the **first selected byte** (else the caret byte), and ranges
   are shown the same way everywhere, inclusive: `0x00000010-0x0000001F (16 bytes)`.
+- **Multi-selection.** `Alt+click` / `Alt+drag` adds a range (`Alt+click` on a selected byte removes
+  its range), *Add Selection* (`Ctrl+Shift+A`) keeps the current selection and lets you select the
+  next, and *Select All Matches* (`Alt+F3`, or "Select All" in Search Results) selects every Find
+  All hit (up to 100,000). Copy / Copy As (one line per range), Cut, Delete, Fill, Paste (a value
+  of every range's length) and *Bookmark Selections* act on all ranges as one undo step; Hash,
+  Strings, Parse Selection and XOR use the primary selection. `Esc` or a plain click ends it; the
+  extra ranges are not kept across restarts. Scripts: `doc:selections()` / `doc:select_ranges{}`.
 - **Data inspector.** Integers (8 to 64 bit, plus 24 bit), half/float/double, LEB128 and zigzag,
   binary, characters (ASCII, UTF-8, UTF-16), GUID, and Unix, FILETIME and DOS timestamps.
   Little or big endian. Double-click a value to edit it.
@@ -92,29 +100,32 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   value, e.g. rel32) and a base address (target = value - base) are in Search > Follow Pointer
   Settings and the Settings window. The Structure panel's integer fields follow with their own
   declared type. Every big jump (Go to, search hits, bookmarks, Structure / Strings / Packets
-  rows, Bitmap clicks, follow) is recorded: `Alt+Left` / `Alt+Right` or the mouse back / forward
-  buttons walk the history.
+  rows, Bitmap clicks, follow, script `doc:jump` / `doc:select`) is recorded: `Alt+Left` /
+  `Alt+Right` or the mouse back / forward buttons walk the history.
 - **Strings panel.** ASCII, UTF-16LE and UTF-16BE strings of the file or the selection, with a
   minimum length, scanned in the background (progress, Cancel), up to a million results with a
   live filter (a UTF-16 string is listed once, not again as its one-byte-shifted reading in the
   other byte order). Click a row to select the string.
 - **XOR / ADD / ROL search** (Search > XOR / ADD / ROL Search..., View > XOR Search): finds
   copies of a known plaintext (`This program`, `MZ`, `PE\0\0`, `http`, or your own text / hex)
-  hidden by a 1-byte XOR, ADD/SUB or rotate, or by a repeating XOR key of 2..16 bytes, in the whole
-  file or the selection, in the background. Each hit shows its transform, key and the decoded
-  bytes; click it to select the match and choose its key. *Guess key* ranks likely XOR keys of a
-  zero- or space-heavy selection. **Decode selection** applies the chosen key as one undo step.
-  Scripts get the same with `hx.xor_scan` / `hx.xor_guess_key`.
+  hidden by a 1-byte XOR, ADD/SUB or rotate, or by a repeating XOR or ADD key of 2..16 bytes, in the
+  whole file or the selection, in the background. Each hit shows its transform, key and the decoded
+  bytes; click it to select the match and choose its key. *Guess key* ranks likely XOR (or ADD) keys
+  of a zero- or space-heavy selection. **Decode selection** applies the chosen key as one undo step.
+  Scripts get the same with `hx.xor_scan` / `hx.xor_guess_key` / `doc:apply_transform`.
 - **Minimap.** A strip right of the hex view shows the whole file top to bottom as an entropy
   heat map (dark = zeros, blue/teal = structured data and text, orange/red = compressed or
   random) or as the byte-class mix of each row (View > Minimap). It is scanned in the
   background (sampled, so a 3 TiB file takes seconds), rescanned a second after edits (only
-  where the bytes changed), and a
+  where the bytes changed); while idle it reads more between the samples of empty-looking areas,
+  so a small region inside a huge zero-filled disk image shows up after a while (a tick on the
+  right edge), and process memory is re-read around the visible bytes every 2 s. A
   click or drag scrolls there. Hover it for the range, entropy and class percentages.
 - **Byte-class colors** (View > Color Bytes by Class): hex digits and text in the color of their
   class: zero, whitespace, printable, control, high (0x80-0xFE) and 0xFF.
 - **Bitmap panel** (View > Bitmap): the bytes as pixels (gray 1/4/8-bit, RGB/BGR 24-bit,
-  RGBA/BGRA/ARGB 32-bit, RGB565/555, byte classes) with an adjustable width, zoom and start
+  RGBA/BGRA/ARGB 32-bit, RGB565/555, byte classes) with an adjustable width, zoom (1/16x to
+  16x: below 1x a screen pixel averages its block, for very wide images) and start
   (follow the hex view, follow the cursor, or a fixed offset; right-click > Show as Bitmap Here).
   Spot images, tables and padding at a glance; click a pixel to jump there, drag to select.
 - **Disassembly panel** (View > Disassembly): an x86-64 listing (or 32-bit x86) at the caret,
@@ -132,9 +143,10 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   `F7` / `Shift+F7` for the next / previous difference. A **shift** lines up files where one has
   an extra header: put the caret on the same content in both and run *Compare: Align at Cursors*,
   or type it (`0x200`, `-16`). Runs in the background; edits recompare automatically.
-  **Find Shift** finds it for you: after the first difference it looks for the next distinctive
-  64-byte block of either file within +-16 MiB of the other (padding is skipped), sets the shift
-  and shows the match ("B has 512 bytes more at B 0x0"). Compare With > **File on Disk** compares
+  **Find Shift** finds it for you: after the first misalignment from the A caret on (plain
+  changes are passed over) it looks for the next distinctive 64-byte block of either file within
+  +-16 MiB of the other (padding is skipped), sets the shift and shows the match ("B has 512 bytes
+  more at B 0x0"); run it again for the next insertion or deletion further on. Compare With > **File on Disk** compares
   the document with its saved file ("name (on disk)"): exactly your unsaved edits.
 - **Restore from .backup** (File menu, when `<file>.backup` exists): *Compare with Backup* shows
   the original side by side; *Revert to Backup* replaces the content with the backup as one
@@ -149,14 +161,19 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
   its payload). `python tools/make_pcap.py demo.pcapng` writes a demo capture.
   The filter is a small expression language: `ip.src == 10.0.0.1`, `ip.addr == 2001:db8::/32`,
   `tcp.port == 80 and not udp`, `frame.len > 1000 or (arp || icmp)`, `eth.type == 0x86dd`,
-  `"text"` (fields: `ip.src/dst/addr`, `tcp.port/srcport/dstport`, `udp.port/srcport/dstport`,
-  `frame.len`, `eth.type`, `proto`; hover the box for the list); a mistake is marked in red
-  where it is and the previous filter stays. **Follow TCP Stream** (right-click a TCP packet, or
-  the toolbar) reassembles the connection by sequence number (out-of-order, retransmitted and
+  `tcp.flags == syn+ack`, `tcp.flags.rst`, `vlan == 10`, `frame.number > 100`,
+  `"text"` (fields: `ip.src/dst/addr`, `ip.proto`, `tcp.port/srcport/dstport`, `tcp.seq/ack`,
+  `tcp.flags` (+ `.syn` / `.ack` / ...), `udp.port/srcport/dstport`, `frame.len`,
+  `frame.number`, `eth.type`, `vlan`, `proto`; hover the box for the list); a mistake is marked
+  in red where it is and the previous filter stays. A **Stream** column numbers the TCP / UDP
+  conversations. **Follow TCP Stream** (right-click a TCP packet, or the toolbar's Follow
+  Stream) reassembles the connection by sequence number (out-of-order, retransmitted and
   overlapping segments, sequence wraparound) into a new read-only tab, client -> server then
   server -> client or interleaved in arrival order, with a bookmark per segment ("#12 C>S")
-  to find the packet again (up to 256 MiB per stream). **Open Packet / Payload as Tab** does the
-  same for a single packet.
+  to find the packet again (up to 256 MiB per stream); **Follow UDP Stream** does the same with
+  the datagrams of a UDP conversation. **Open Packet / Payload as Tab** does the same for a
+  single packet. Under Live Tail a growing capture is indexed incrementally (only the new
+  records). Scripts read the packets with `doc:packets{ filter = ... }`.
 - **Live tail** (View > Live Tail) for growing files such as logs and captures: appended data
   shows up within half a second and the view follows it while the caret is at the end
   (`Ctrl+End`). Edits and undo keep working; a file that is rewritten instead of appended to
@@ -172,7 +189,8 @@ Built with C++20, Dear ImGui (docking), GLFW, OpenGL 3 and Lua 5.5. It runs on W
 - **Hashes panel.** CRC-8/16/32/32C, Adler-32, Fletcher-16, FNV-1a, Sum-8, XOR-8, MD5, SHA-1,
   SHA-256 and SHA-512 of the selection (or the whole file), computed in the background and
   automatically up to 64 MiB. Paste an expected value to highlight the matching row. Scripts get
-  `hx.hash(algo, bytes)` and `doc:hash(algo, off, len)`.
+  `hx.hash(algo, bytes)` and `doc:hash(algo, off, len)`, and can add algorithms of their own
+  (`hx.hash_algorithm`, listed in the panel next to the built-ins).
 - **Search.** Hex with wildcards (`DE ?? BE`, `4?`), text, UTF-16, optionally case-insensitive.
   Searches run in the background. Find All lists every match and highlights them.
 - **Smart Go to.** `0x1F00`, `1F00h`, `#1234` (decimal), `+0x10` (relative), `end-0x100`, `50%`,
@@ -221,7 +239,9 @@ also keeps them as build artifacts for 7 days.
 - **Windows:** `hexer-windows-x64.zip`. Unzip it anywhere and run `hexer\hexer.exe`; it needs no
   installer and no Visual C++ runtime. Keep the `scripts` folder next to the exe.
 - **Linux:** `hexer-x86_64.AppImage` (`chmod +x` it, then run it), or `hexer-linux-x86_64.tar.gz`
-  (run `hexer-linux-x86_64/hexer`, with `scripts/` next to it). Built on Ubuntu 22.04, so glibc
+  (run `hexer-linux-x86_64/hexer`, with `scripts/` next to it); the AppImage carries AppStream
+  metadata for software centers. CI also builds `aarch64` packages (experimental: not yet
+  verified on hardware). Built on Ubuntu 22.04, so glibc
   2.35 or newer. File dialogs go through xdg-desktop-portal (GNOME, KDE and most desktops have it).
 
 ## Building
@@ -299,6 +319,8 @@ hexer [options] [files...]
 | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Cut / copy / paste (in overwrite mode a paste overwrites from the selection start and keeps the size) |
 | `Ctrl+Shift+C` | Copy as (hex, C array, Python, Base64, escaped; `1`-`7` picks a format) |
 | `Ctrl+A` | Select all |
+| `Alt+click` / `Alt+drag` | Add a range to the multi-selection (on a selected byte: remove its range); `Esc` clears the extra ranges |
+| `Ctrl+Shift+A` / `Alt+F3` | Add Selection (keep it, select the next) / Select All Matches (every Find All hit) |
 | `Ins` | Toggle insert / overwrite |
 | `Delete` / `Backspace` | Delete the selection, else the byte at / before the cursor (without a selection, `Backspace` only moves left in overwrite mode) |
 | `Tab` | Switch between the hex and text columns |

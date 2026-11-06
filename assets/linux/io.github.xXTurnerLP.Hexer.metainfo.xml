@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (software centers, AppImage catalogues). Installed to share/metainfo by
+     src/meson.build on Linux, so it lands in the AppImage's AppDir; CI validates it with
+     appstreamcli. Add a <release> entry for every tagged version (newest first). -->
+<component type="desktop-application">
+  <id>io.github.xXTurnerLP.Hexer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Hexer</name>
+  <summary>Hex editor for huge files, process memory and disks</summary>
+  <description>
+    <p>
+      Hexer is a fast, dark-mode hex editor. It streams files straight from disk, so a
+      multi-terabyte disk image opens as fast as a small packet capture, and every edit can be
+      undone, even after a save or a restart.
+    </p>
+    <ul>
+      <li>Overwrite, insert, delete, fill and paste with a full undo history</li>
+      <li>Hex patterns with wildcards, text and UTF-16 search in the background</li>
+      <li>Data inspector, bookmarks, side-by-side compare, strings, hashes and checksums</li>
+      <li>Lua parsers that turn raw bytes into an editable structure tree</li>
+      <li>Process memory and raw disks, an entropy minimap, packet captures and x86 disassembly</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">hexer.desktop</launchable>
+  <provides>
+    <binary>hexer</binary>
+  </provides>
+  <url type="homepage">https://github.com/xXTurnerLP/Hexer</url>
+  <url type="bugtracker">https://github.com/xXTurnerLP/Hexer/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-06"/>
+  </releases>
+</component>

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "core/bitmap.h"
 #include "core/nav.h"
 #include "core/os_file.h"
 
@@ -139,7 +140,10 @@ bool Settings::load(const std::string& path) {
         }
         else if (key == "bitmap_format") bitmap_format = v;
         else if (key == "bitmap_width") parse_int(v, 1, 8192, bitmap_width);
-        else if (key == "bitmap_zoom") parse_int(v, 1, 16, bitmap_zoom);
+        else if (key == "bitmap_zoom") {  // a zoom level: 1..16, -2..-16 = 1/2x..1/16x
+            int z = 0;
+            if (parse_int(v, kBitmapMinZoom, 16, z)) bitmap_zoom = bitmap_zoom_clamp(z);
+        }
         else if (key == "disasm_mode") {
             const std::string m = lower(v);
             if (m == "auto") disasm_mode = 0;
@@ -202,6 +206,7 @@ bool Settings::load(const std::string& path) {
         else if (key == "xor_add") parse_bool(v, xor_add);
         else if (key == "xor_rol") parse_bool(v, xor_rol);
         else if (key == "xor_key") parse_bool(v, xor_key);
+        else if (key == "xor_add_key") parse_bool(v, xor_add_key);
         else if (key == "xor_max_key_len") parse_int(v, 2, 16, xor_max_key_len);
         else if (key == "bitmap_fit") parse_bool(v, bitmap_fit);
         else if (key == "bitmap_alpha") parse_bool(v, bitmap_alpha);
@@ -308,6 +313,7 @@ bool Settings::save(const std::string& path) const {
     put("xor_add", b(xor_add));
     put("xor_rol", b(xor_rol));
     put("xor_key", b(xor_key));
+    put("xor_add_key", b(xor_add_key));
     put("xor_max_key_len", std::to_string(xor_max_key_len));
     put("bitmap_fit", b(bitmap_fit));
     put("bitmap_alpha", b(bitmap_alpha));

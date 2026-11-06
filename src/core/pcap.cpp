@@ -127,21 +127,28 @@ void fail(PcapIndexResult& out, uint64_t off, const std::string& msg) {
     out.error_msg = msg;
 }
 
+// `resume`: continue after out.scanned with out.resume (index_pcap_append), else from the header.
 void index_classic(SeqReader& rd, PcapIndexResult& out, size_t max_packets, const std::atomic<bool>* cancel,
-                   std::atomic<uint64_t>* progress) {
-    uint8_t gh[24];
-    if (!rd.read(0, gh, 24)) return fail(out, 0, rd.io() ? "read error" : "file too short for a pcap header");
-    const uint32_t m = rd32(gh, false);
-    const bool be = m == 0xD4C3B2A1 || m == 0x4D3CB2A1;
-    const bool ns = m == 0xA1B23C4D || m == 0x4D3CB2A1;
-    CaptureInterface ifc;
-    ifc.snaplen = rd32(gh + 16, be);
-    ifc.linktype = uint16_t(rd32(gh + 20, be) & 0xFFFF);  // upper bits: FCS info
-    ifc.tsresol = ns ? 9 : 6;
-    out.interfaces.push_back(ifc);
-    out.time_decimals = ns ? 9 : 6;
-    const uint64_t size = rd.size();
+                   std::atomic<uint64_t>* progress, bool resume) {
     uint64_t off = 24;
+    if (resume) {
+        off = out.scanned;
+    } else {
+        uint8_t gh[24];
+        if (!rd.read(0, gh, 24)) return fail(out, 0, rd.io() ? "read error" : "file too short for a pcap header");
+        const uint32_t m = rd32(gh, false);
+        out.resume.be = m == 0xD4C3B2A1 || m == 0x4D3CB2A1;
+        out.resume.ns = m == 0xA1B23C4D || m == 0x4D3CB2A1;
+        CaptureInterface ifc;
+        ifc.snaplen = rd32(gh + 16, out.resume.be);
+        ifc.linktype = uint16_t(rd32(gh + 20, out.resume.be) & 0xFFFF);  // upper bits: FCS info
+        ifc.tsresol = out.resume.ns ? 9 : 6;
+        out.interfaces.push_back(ifc);
+        out.time_decimals = out.resume.ns ? 9 : 6;
+    }
+    const bool be = out.resume.be, ns = out.resume.ns;
+    const CaptureInterface ifc = out.interfaces.at(0);
+    const uint64_t size = rd.size();
     while (off < size) {
         if (cancelled(cancel)) {
             out.cancelled = true;
@@ -204,14 +211,18 @@ void parse_idb_options(const uint8_t* o, size_t n, bool be, CaptureInterface& if
 }
 
 void index_ng(SeqReader& rd, PcapIndexResult& out, size_t max_packets, const std::atomic<bool>* cancel,
-              std::atomic<uint64_t>* progress) {
+              std::atomic<uint64_t>* progress, bool resume) {
     const uint64_t size = rd.size();
-    uint64_t off = 0;
+    uint64_t off = resume ? out.scanned : 0;
     Section sec;
-    bool have_section = false;
-    uint32_t section_no = 0;
+    bool have_section = resume && out.resume.have_section;
+    uint32_t section_no = resume ? out.resume.section_no : 0;
+    if (resume) {
+        sec.be = out.resume.be;
+        sec.ifaces = out.resume.ifaces;
+    }
     std::vector<uint8_t> opts;
-    int decimals = 6;
+    int decimals = resume ? out.time_decimals : 6;
     while (off < size) {
         if (cancelled(cancel)) {
             out.cancelled = true;
@@ -347,6 +358,10 @@ void index_ng(SeqReader& rd, PcapIndexResult& out, size_t max_packets, const std
     }
     out.time_decimals = std::min(9, decimals);
     out.scanned = off;
+    out.resume.be = sec.be;
+    out.resume.have_section = have_section;
+    out.resume.section_no = section_no;
+    out.resume.ifaces = std::move(sec.ifaces);
 }
 
 CaptureFormat detect_header(const uint8_t* h, uint64_t size) {
@@ -374,14 +389,49 @@ CaptureFormat pcap_detect(const Document& doc) {
     return detect_header(h, doc.size());
 }
 
+namespace {
+
+void run_index(const Snapshot& snap, PcapIndexResult& out, size_t max_packets, const std::atomic<bool>* cancel,
+               std::atomic<uint64_t>* progress, bool resume) {
+    SeqReader rd(snap);
+    if (out.format == CaptureFormat::Pcap) index_classic(rd, out, max_packets, cancel, progress, resume);
+    else if (out.format == CaptureFormat::PcapNg) index_ng(rd, out, max_packets, cancel, progress, resume);
+    else fail(out, 0, "not a pcap / pcapng capture");
+    // Remember the bytes before the end of the last complete record: a later append checks them.
+    const uint32_t n = uint32_t(std::min<uint64_t>(sizeof out.resume.tail, out.scanned));
+    out.resume.tail_len = n && snap.read_valid(out.scanned - n, out.resume.tail, n) == n ? n : 0;
+}
+
+}  // namespace
+
 void index_pcap(const Snapshot& snap, PcapIndexResult& out, size_t max_packets, const std::atomic<bool>* cancel,
                 std::atomic<uint64_t>* progress) {
     out = PcapIndexResult{};
     out.format = pcap_detect(snap);
-    SeqReader rd(snap);
-    if (out.format == CaptureFormat::Pcap) index_classic(rd, out, max_packets, cancel, progress);
-    else if (out.format == CaptureFormat::PcapNg) index_ng(rd, out, max_packets, cancel, progress);
-    else fail(out, 0, "not a pcap / pcapng capture");
+    run_index(snap, out, max_packets, cancel, progress, false);
+}
+
+bool index_pcap_append(const Snapshot& snap, PcapIndexResult& out, size_t max_packets,
+                       const std::atomic<bool>* cancel, std::atomic<uint64_t>* progress) {
+    const uint64_t header = out.format == CaptureFormat::Pcap ? 24 : 12;
+    bool ok = out.format != CaptureFormat::None && out.format == pcap_detect(snap) && !out.cancelled &&
+              out.scanned >= header && out.scanned <= snap.size() && out.resume.tail_len > 0 &&
+              (out.format != CaptureFormat::Pcap || !out.interfaces.empty());
+    if (ok) {
+        uint8_t now[sizeof out.resume.tail];
+        const uint32_t n = out.resume.tail_len;
+        ok = snap.read_valid(out.scanned - n, now, n) == n && std::memcmp(now, out.resume.tail, n) == 0;
+    }
+    if (!ok) {
+        index_pcap(snap, out, max_packets, cancel, progress);
+        return false;
+    }
+    // A record that was cut short at the old end (or any stop) is read again from out.scanned.
+    out.truncated = out.error = false;
+    out.error_msg.clear();
+    out.error_offset = 0;
+    run_index(snap, out, max_packets, cancel, progress, true);
+    return true;
 }
 
 // ---- background job -----------------------------------------------------------------------------
@@ -424,6 +474,16 @@ std::shared_ptr<const PcapIndexJob::Result> PcapIndexJob::result() const {
 }
 
 void PcapIndexJob::start(std::shared_ptr<const Snapshot> snap, size_t max_packets) {
+    launch(std::move(snap), nullptr, max_packets);
+}
+
+void PcapIndexJob::start_append(std::shared_ptr<const Snapshot> snap, std::shared_ptr<const Result> prev,
+                                size_t max_packets) {
+    launch(std::move(snap), std::move(prev), max_packets);
+}
+
+void PcapIndexJob::launch(std::shared_ptr<const Snapshot> snap, std::shared_ptr<const Result> prev,
+                          size_t max_packets) {
     auto run = std::make_shared<Run>();
     run->total = snap ? snap->size() : 0;
     {
@@ -440,11 +500,19 @@ void PcapIndexJob::start(std::shared_ptr<const Snapshot> snap, size_t max_packet
         }
     }
     running_ = true;
-    std::thread th([this, run, snap = std::move(snap), max_packets]() {
+    std::thread th([this, run, snap = std::move(snap), prev = std::move(prev), max_packets]() {
         auto r = std::make_shared<Result>();
         r->snap = snap;
-        if (snap) index_pcap(*snap, r->index, max_packets, &run->cancel, &run->done);
-        else r->index.cancelled = run->cancel.load();
+        if (snap && prev) {
+            r->index = prev->index;  // a copy: the previous result stays valid for its readers
+            r->prev_packets = r->index.packets.size();
+            r->incremental = index_pcap_append(*snap, r->index, max_packets, &run->cancel, &run->done);
+            if (!r->incremental) r->prev_packets = 0;
+        } else if (snap) {
+            index_pcap(*snap, r->index, max_packets, &run->cancel, &run->done);
+        } else {
+            r->index.cancelled = run->cancel.load();
+        }
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (run_ == run) {  // superseded runs publish nothing

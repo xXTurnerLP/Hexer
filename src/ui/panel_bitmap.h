@@ -3,8 +3,9 @@
 // sprites and structure. Self-contained (no App dependency): the host owns one BitmapPanel and calls
 // draw() inside its own Begin/End every frame with the active document.
 //
-//   * Toolbar: pixel format, width (1..8192, -/+, presets, x2 and /2), zoom (1x..16x, nearest) or
-//     fit-to-width, source ("Follow hex view" = start at the hex view's top row, "Follow cursor",
+//   * Toolbar: pixel format, width (1..8192, -/+, presets, x2 and /2), zoom (1/16x..1/2x: a screen
+//     pixel averages a block of image pixels, for very wide images; 1x..16x, nearest) or
+//     fit-to-width (also downscaled), source ("Follow hex view" = start at the hex view's top row, "Follow cursor",
 //     "Fixed offset" with a Goto-style expression field).
 //   * The image scrolls through the whole file by its own 64-bit row index (mouse wheel, slim custom
 //     scrollbar, PageUp/PageDown/Home/End while the panel is focused). Scrolling a follow mode
@@ -13,7 +14,8 @@
 //   * Hover shows offset / pixel / bytes / color in the status line; click = cb.jump(offset);
 //     drag = cb.select(range of the dragged pixels). The hex caret is outlined when visible.
 //   * Only the visible window is decoded (at most kMaxPixels x kMaxPixels pixels and kMaxBytes bytes
-//     per refresh, read through Document::read), and only when offset / width / format / zoom /
+//     per refresh, read through Document::read; downscaled: the rows of each block within that byte
+//     budget, else evenly spaced ones), and only when offset / width / format / zoom /
 //     panel size / document generation change. The pixels go to an ImGui-managed user texture
 //     (ImTextureData, uploaded by the renderer backend); nothing is drawn while the backend has not
 //     created it yet (a headless context never does).
@@ -55,8 +57,9 @@ public:
 
     PixelFormat format = PixelFormat::Gray8;
     int width = 256;               // pixels per row
-    int zoom = 2;                  // 1..kMaxZoom (ignored while fit_width)
-    bool fit_width = false;        // largest integer zoom at which `width` fits the panel
+    int zoom = 2;                  // a zoom level (core/bitmap.h): 1..kMaxZoom, -2..-16 = 1/2x..1/16x
+                                   // (ignored while fit_width)
+    bool fit_width = false;        // largest zoom level at which `width` fits the panel
     bool use_alpha = false;        // alpha formats: composite over a checkerboard (else opaque)
     BitmapSource source = BitmapSource::FollowView;
     ImFont* mono = nullptr;        // font for offsets (nullptr = current font)
@@ -101,16 +104,22 @@ public:
     float image_x() const { return image_x_; }
     float image_y() const { return image_y_; }
     bool decoded() const { return have_key_; }
-    int shown_zoom() const { return key_.zoom; }
+    int shown_zoom() const { return key_.zoom; }   // screen pixels per cell (1 when downscaled)
+    int shown_step() const { return key_.step; }   // image pixels per cell side (> 1: downscaled)
     int shown_cols() const { return key_.cols; }
     int shown_rows() const { return key_.rows; }
     const std::vector<uint32_t>& shown_pixels() const { return pixels_; }
+    // Bytes gathered and pixels decoded by the last refresh (before a downscale): both stay
+    // within the kMaxBytes budget (rows past the end of the data are not gathered).
+    size_t read_buffer_bytes() const { return bytes_.size(); }
+    size_t decoded_pixel_count() const { return key_.step > 1 ? scaled_.size() : pixels_.size(); }
 
 private:
     struct Key {                   // what the current texture contents were built from
         uint64_t doc_id = 0, gen = 0, size = 0, base = 0;
         uint64_t col0 = 0;
-        int width = 0, cols = 0, rows = 0, zoom = 0;
+        int width = 0, cols = 0, rows = 0, zoom = 0;  // cols x rows cells of zoom x zoom screen px
+        int step = 1;                                 // ... each averaging step x step image pixels
         PixelFormat format = PixelFormat::Gray8;
         bool alpha = false;
         bool operator==(const Key&) const = default;
@@ -140,7 +149,8 @@ private:
     Key key_;
     bool have_key_ = false;
     std::vector<uint8_t> bytes_;   // gathered bytes of the visible window
-    std::vector<uint32_t> pixels_; // decoded window (cols x rows)
+    std::vector<uint32_t> pixels_; // decoded window (cols x rows cells)
+    std::vector<uint32_t> scaled_; // downscale scratch
     ImTextureData* tex_ = nullptr;
     std::vector<ImTextureData*> retired_;  // waiting for the backend to destroy the GPU texture
     ImGuiContext* tex_ctx_ = nullptr;      // context the textures are registered with

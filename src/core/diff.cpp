@@ -424,11 +424,19 @@ ShiftResult find_shift(const Snapshot& a, const Snapshot& b, int64_t shift, cons
     r.diff_b = o.b_lo;
     if (o.common == 0 && (a.size() == 0 || b.size() == 0)) return r;  // NoDifference: nothing to align
 
-    // 1. The first differing aligned byte (no overlap at all: its start counts as the difference).
-    if (o.common) {
+    // 1. The first differing aligned byte at or after opt.from (no overlap at all: its start counts
+    // as the difference). One that realigns within change_scan bytes is a plain change: passed
+    // over, the search goes on behind the block that lines up again.
+    std::vector<uint8_t> ba(size_t(std::min<uint64_t>(kBlock, o.common))), bb(ba.size());
+    ShiftOptions quick = opt;
+    quick.probe_scan = std::min(opt.change_scan, opt.probe_scan);
+    uint64_t start = o.common && opt.from > o.a_lo ? std::min(opt.from - o.a_lo, o.common) : 0;
+    uint64_t first_a = 0, first_b = 0;  // the first change passed over
+    while (o.common) {
         bool differs = false;
-        std::vector<uint8_t> ba(size_t(std::min<uint64_t>(kBlock, o.common))), bb(ba.size());
-        for (uint64_t pos = 0; pos < o.common && !differs;) {
+        r.diff_a = o.a_lo + start;
+        r.diff_b = o.b_lo + start;
+        for (uint64_t pos = start; pos < o.common && !differs;) {
             if (cancel && cancel->load(std::memory_order_relaxed)) {
                 r.status = ShiftResult::Cancelled;
                 return r;
@@ -453,7 +461,26 @@ ShiftResult find_shift(const Snapshot& a, const Snapshot& b, int64_t shift, cons
             r.diff_b = o.b_lo + pos + i;
             pos += i;
         }
-        if (!differs) return r;  // NoDifference
+        uint64_t q = 0;
+        if (differs && !(opt.change_scan && aligned_match(a, b, r.diff_a, r.diff_b, quick, q, progress)))
+            break;  // a misalignment (or a long change): search for its shift
+        if (differs) {
+            if (r.changes == 0) {
+                first_a = r.diff_a;
+                first_b = r.diff_b;
+            }
+            r.match_a = q;
+            r.match_b = offset_add(q, shift);
+            r.limit = ++r.changes >= opt.max_changes;
+        }
+        if (!differs || r.limit) {
+            if (r.changes == 0) return r;  // NoDifference
+            r.status = ShiftResult::Found;  // only changes: no shift needed
+            r.diff_a = first_a;
+            r.diff_b = first_b;
+            return r;
+        }
+        start = q - o.a_lo + opt.block;  // behind the block that lines up again
     }
 
     // 2. Probes of each side (the first distinctive blocks after the difference: an edit inside one

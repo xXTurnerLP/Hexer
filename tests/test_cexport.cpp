@@ -410,6 +410,116 @@ TEST_CASE("cexport: round trip C -> parser -> C header -> parser keeps the tree"
     }
 }
 
+TEST_CASE("cexport: #define masks for flags, fmt = char as char, mixed byte order annotated") {
+    Run r;
+    const char* lua = R"LUA(
+        local PERM = { [0] = "READ", [3] = "EXEC", [20] = "TOO_WIDE" }
+        hx.parser { name = "mix", parse = function(p)
+            p:struct("Mix", function()
+                p:u32be("magic", { fmt = "hex" })
+                p:u16le("len")
+                p:i16be("delta")
+                p:u32le("x")
+                p:u16le("perm", { flags = PERM })
+                p:u8("c", { fmt = "char" })
+                p:u32le("tag", { fmt = "char" })
+                p:f32be("ratio")
+                p:struct("in", function() p:u8("PERM_READ") p:u16le("y") p:u16le("z") end)
+            end)
+        end }
+    )LUA";
+    ParseResult res = r.parse(lua, "mix", std::string(4 + 2 + 2 + 4 + 2 + 1 + 4 + 4 + 5, '\x41'));
+    REQUIRE_MESSAGE(res.error.empty(), res.error);
+    const std::string h = fields_to_c_header(res.fields, -1, "mix");
+    INFO(h);
+    // Flags: one mask per named bit that fits, before the struct; names unique in the header.
+    // PERM_READ is a member's name (in_t): that mask gets a suffix.
+    CHECK(contains(h, "// Mix.perm flags\n#define PERM_READ_2 0x1\n#define PERM_EXEC 0x8\n\n"));
+    CHECK_FALSE(contains(h, "TOO_WIDE 0x"));
+    CHECK(h.find("#define PERM_EXEC") < h.find("typedef struct Mix"));
+    CHECK(contains(h, "flags: READ = 0x1, EXEC = 0x8"));
+    // fmt = "char": a 1-byte one is a char, wider ones stay integers.
+    CHECK(contains(h, "    char c;"));
+    CHECK(contains(h, "uint32_t tag;"));
+    CHECK(contains(h, "chars"));
+    // 7 LE numbers vs 3 BE: the struct is @le, the BE members are annotated one by one.
+    CHECK(contains(h, "// @le\ntypedef struct Mix {"));
+    CHECK(contains(h, "    /* @be */ uint32_t magic;"));
+    CHECK(contains(h, "    /* @be */ int16_t delta;"));
+    CHECK(contains(h, "    /* @be */ float ratio;"));
+    CHECK(contains(h, "    uint16_t len;"));
+    CHECK(contains(h, "Mixed byte order"));
+    // ... and C struct -> parser reads them back with the same byte orders.
+    std::string lua2, err;
+    CStructOptions o;
+    o.name = "again";
+    REQUIRE_MESSAGE(cstruct_to_lua(h, o, lua2, &err), err);
+    CHECK(contains(lua2, "p:u32be(\"magic\""));
+    CHECK(contains(lua2, "p:i16be(\"delta\""));
+    CHECK(contains(lua2, "p:f32be(\"ratio\""));
+    CHECK(contains(lua2, "p:u16le(\"len\""));
+    CHECK(contains(lua2, "p:u8(\"c\", { fmt = \"char\" })"));
+    Run b;
+    const ParseResult r2 = b.parse(lua2, "again", std::string(4 + 2 + 2 + 4 + 2 + 1 + 4 + 4 + 5, '\x41'));
+    REQUIRE_MESSAGE(r2.error.empty(), r2.error);
+    auto leaves = [](const ParseResult& pr) {  // "name @offset type" of every leaf
+        std::string out;
+        for (const Field& f : pr.fields)
+            if (f.children.empty()) out += f.name + " @" + std::to_string(f.offset) + " " + f.type + "\n";
+        return out;
+    };
+    CHECK(leaves(r2) == leaves(res));  // the same byte orders (u32be / u16le ...) at the same offsets
+    // No mixed struct: no per-member annotations.
+    Run s;
+    ParseResult plain = s.parse(R"(hx.parser { name = "le", parse = function(p) p:u16le("a") p:u8("b") end })", "le",
+                                std::string(3, '\0'));
+    REQUIRE(plain.error.empty());
+    const std::string hp = fields_to_c_header(plain.fields, -1, "le");
+    CHECK_FALSE(contains(hp, "@be"));
+    CHECK_FALSE(contains(hp, "@le"));
+    CHECK_FALSE(contains(hp, "Mixed byte order"));
+}
+
+TEST_CASE("cexport: mixed byte order round trip C -> parser -> C header -> parser") {
+    const char* c = R"C(
+        enum Kind : uint16_t { K_A = 1, K_B = 0x100 };
+        // @be
+        struct Net {
+            uint32_t magic;
+            uint16_t len;
+            /* @le */ uint32_t host_order;
+            /* @le */ enum Kind kind;
+            /* @le */ uint16_t lo : 4;
+            /* @le */ uint16_t hi : 12;
+            int16_t delta;
+            char c;
+            uint32_t after; // @le: a trailing comment does not change the next member
+            uint32_t next;
+        };
+    )C";
+    CStructOptions o;
+    o.name = "net";
+    std::string lua, err;
+    REQUIRE_MESSAGE(cstruct_to_lua(c, o, lua, &err), err);
+    INFO(lua);
+    CHECK(contains(lua, "p:u32le(\"host_order\""));
+    CHECK(contains(lua, "p:u16le(\"kind\""));
+    CHECK(contains(lua, "p:u32be(\"after\""));
+    CHECK(contains(lua, "p:u32be(\"next\""));
+    CHECK(contains(lua, "p:peek(\"<I2\")"));  // the bit-field unit is little-endian
+    std::string data;
+    for (int i = 0; i < 40; ++i) data += char(uint8_t(i * 13 + 5));
+    std::string h;
+    round_trip(c, data, o, &h);
+    INFO(h);
+    CHECK(contains(h, "// @be\ntypedef struct Net {"));
+    CHECK(contains(h, "    /* @le */ uint32_t host_order;"));
+    CHECK(contains(h, "    /* @le */ enum kind_e kind;"));
+    CHECK(contains(h, "    /* @le */ uint16_t lo : 4;"));
+    CHECK(contains(h, "    char c;"));
+    CHECK(contains(h, "    uint32_t next;"));
+}
+
 TEST_CASE("inspector: bit locations and undoable bit toggles") {
     int bi = -1;
     uint8_t m = 0;

@@ -643,6 +643,20 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_end) {
 void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, uint64_t edit_end,
                          bool view_step) {
     persist_gen_++;
+    if (view_step && group_depth_ == 0) {
+        // A view step changes no bytes, so the undone content steps stay redoable on top of it
+        // (their entries are whole states; this entry's bytes are the next one's, as always). Only
+        // the undone view steps are replaced: the new choice supersedes them.
+        redo_.erase(std::remove_if(redo_.begin(), redo_.end(),
+                                   [](const UndoEntry& r) { return r.view_only; }),
+                    redo_.end());
+        coalesce_open_ = false;
+        UndoEntry e = capture_view();
+        e.label = label;
+        e.time_ms = g_clock.load()();
+        push_entry(undo_, std::move(e));
+        return;
+    }
     bool dropped_redo = !redo_.empty();
     if (dropped_redo && group_depth_ > 0 && !group_pushed_) {
         group_redo_ = std::move(redo_);  // set aside until the group closes (abort_group restores it)
@@ -688,7 +702,7 @@ void Document::push_undo(const char* label, bool coalesce, uint64_t edit_begin, 
             return;
         }
     }
-    UndoEntry e = view_step ? capture_view() : capture();
+    UndoEntry e = capture();
     e.label = label;
     e.time_ms = now;
     if (coalesce) {
@@ -704,6 +718,7 @@ void Document::clamp_view() {
     uint64_t n = table_.size();
     if (view_.cursor > n) view_.cursor = n;
     if (view_.anchor > n) view_.anchor = n;
+    range_clamp(view_.extra_sel, n);
 }
 
 void Document::after_change() {
@@ -888,6 +903,74 @@ bool Document::fill(uint64_t offset, uint64_t len, const uint8_t* pattern, size_
         ins.push_back(tail);
     }
     splice(offset, std::min(len, table_.size() - offset), ins);
+    after_change();
+    return true;
+}
+
+bool Document::fill_ranges(const std::vector<ByteRange>& ranges, const uint8_t* pattern, size_t pattern_len,
+                           const std::string& label, std::string* err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    apply_pending();
+    if (busy_.load()) return fail(err, "A save is in progress");
+    if (read_only_) return fail(err, "Document is read-only");
+    if (pattern_len && !pattern) return fail(err, "No fill pattern");
+    const uint64_t size = table_.size();
+    uint64_t max_len = 0;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        const ByteRange& r = ranges[i];
+        if (r.begin >= r.end || r.end > size || (i && r.begin < ranges[i - 1].end))
+            return fail(err, "Invalid ranges (they must be sorted, not overlapping and inside the document)");
+        max_len = std::max(max_len, r.len());
+    }
+    if (ranges.empty()) return true;
+
+    // As in fill(): one block of the pattern repeated `unit` bytes (a multiple of the pattern
+    // length, so repeating the block keeps the phase); every range starts with the block's start.
+    std::vector<uint8_t> buf;
+    if (pattern_len) {
+        uint64_t unit = max_len;
+        if (max_len > AddBuffer::kChunkSize) {
+            uint64_t target = std::clamp<uint64_t>(max_len / 4096, AddBuffer::kChunkSize, kFillMaxUnit);
+            unit = std::min(max_len, std::max<uint64_t>(pattern_len, target / pattern_len * pattern_len));
+        }
+        buf.resize(static_cast<size_t>(unit));
+        for (size_t i = 0; i < buf.size(); ++i) buf[i] = pattern[i % pattern_len];
+    }
+    push_undo(label.empty() ? (pattern_len ? "Fill" : "Delete") : label.c_str(), false, ranges.front().begin,
+              ranges.back().end);
+    Piece block;
+    if (pattern_len) block = add_.append(buf.data(), buf.size());
+
+    const std::vector<Piece>& ps = table_.pieces();
+    std::vector<Piece> out;
+    out.reserve(ps.size() + ranges.size() * (pattern_len ? 3 : 1) + 1);
+    size_t pi = 0;        // old piece holding `pos`
+    uint64_t pstart = 0;  // its logical start
+    auto copy = [&](uint64_t from, uint64_t to) {  // the old bytes [from, to)
+        while (pi < ps.size() && pstart + ps[pi].len <= from) pstart += ps[pi++].len;
+        for (uint64_t at = from; at < to && pi < ps.size();) {
+            const uint64_t off = at - pstart, n = std::min(ps[pi].len - off, to - at);
+            Piece p = ps[pi];
+            p.start += off;
+            p.len = n;
+            out.push_back(p);
+            at += n;
+            if (off + n == ps[pi].len) pstart += ps[pi++].len;
+        }
+    };
+    uint64_t pos = 0;
+    for (const ByteRange& r : ranges) {
+        copy(pos, r.begin);
+        for (uint64_t left = pattern_len ? r.len() : 0; left;) {
+            Piece p = block;
+            p.len = std::min(left, block.len);
+            out.push_back(p);
+            left -= p.len;
+        }
+        pos = r.end;
+    }
+    copy(pos, size);
+    table_.assign(std::move(out));
     after_change();
     return true;
 }

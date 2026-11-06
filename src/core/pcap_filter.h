@@ -14,11 +14,19 @@
 //                              IPv6 packet and vice versa; < > compare addresses byte by byte
 //   tcp.port tcp.srcport tcp.dstport  udp.port udp.srcport udp.dstport   0..65535
 //   frame.len                  length on the wire (Packet::orig_len)
+//   frame.number               1-based packet number (filter_packets passes it; 0 = unknown: false)
 //   eth.type                   EtherType after VLAN tags (0x0800, 0x86dd, 2054); Ethernet / SLL only
+//   vlan (= vlan.id)           outermost 802.1Q / 802.1ad VLAN id, 0..4095 (false without a tag)
+//   ip.proto                   IP protocol / IPv6 next header of the L4: 6 = TCP, 17 = UDP, ...
+//   tcp.seq tcp.ack            raw 32-bit sequence / acknowledgment numbers
+//   tcp.flags                  the flags byte: a number (0x12) or flag names joined by '+'
+//                              (syn+ack = exactly SYN and ACK); names fin syn rst psh ack urg ece cwr
+//   tcp.flags.syn (.fin .rst .psh .ack .urg .ece .cwr)   1 when set, 0 when not; alone = "is set"
 //   proto                      == / != one of tcp udp icmp icmpv6 arp ip (= ipv4) ipv6 ("has this layer")
 // ip.addr / tcp.port / udp.port stand for both ends: == (and < ...) is true when either end matches,
 // != when neither does. A protocol name alone ("tcp", "not arp") is proto == name; a quoted
 // "text" matches the Proto / Summary columns (case-insensitive substring, like the old filter).
+// TCP fields (ports, seq, ack, flags) need a decoded TCP header, UDP ports a UDP header.
 // Numbers are decimal or 0x hex. Keywords and field names are case-insensitive. Nesting is limited
 // to 64 levels and a filter to about 1000 terms (an error beyond: match() recurses).
 #include <atomic>
@@ -41,10 +49,12 @@ public:
     bool parse(const std::string& text, std::string* err = nullptr, size_t* err_pos = nullptr);
     bool empty() const { return nodes_.empty(); }
     const std::string& text() const { return text_; }  // as last parsed successfully
-    bool match(const Packet& p, const PacketInfo& pi) const;
+    // `number` = the packet's 1-based frame number (frame.number; 0 = unknown).
+    bool match(const Packet& p, const PacketInfo& pi, uint64_t number = 0) const;
 
     enum class Field : uint8_t { IpSrc, IpDst, IpAddr, TcpPort, TcpSrcPort, TcpDstPort, UdpPort, UdpSrcPort,
-                                 UdpDstPort, FrameLen, EthType, Proto };
+                                 UdpDstPort, FrameLen, EthType, Proto, FrameNumber, Vlan, IpProto, TcpSeq,
+                                 TcpAck, TcpFlags, TcpFlag };
     enum class Op : uint8_t { Eq, Ne, Lt, Gt, Le, Ge };
     enum class Kind : uint8_t { And, Or, Not, Compare, Text };
     struct Node {
@@ -56,11 +66,12 @@ public:
         uint8_t ip_version = 0;    // address values: 4 / 6
         uint8_t prefix = 0;        // address prefix length (32 / 128 = the whole address)
         uint8_t addr[16] = {};
+        uint8_t mask = 0;          // TcpFlag: the flag bit
         std::string text;          // Kind::Text: lower-cased needle
     };
 
 private:
-    bool eval(int n, const Packet& p, const PacketInfo& pi) const;
+    bool eval(int n, const Packet& p, const PacketInfo& pi, uint64_t number) const;
     std::vector<Node> nodes_;
     int root_ = -1;
     std::string text_;
@@ -71,13 +82,16 @@ bool parse_ip_literal(const std::string& s, uint8_t addr[16], uint8_t& version);
 
 constexpr size_t kFilterRead = 2048;  // bytes dissected per packet for filtering (= the table rows)
 
-// Blocking: indices of the packets in [begin, end) matching `f`, ascending, appended to `out`.
+// Blocking: indices of the packets in [begin, end) matching `f`, ascending, appended to `out`
+// (frame.number = index + 1).
 // `done` (if non-null) counts the packets tested.
 void filter_packets(const Snapshot& snap, const std::vector<Packet>& packets, const PacketFilter& f, size_t begin,
                     size_t end, std::vector<uint32_t>& out, const std::atomic<bool>* cancel = nullptr,
                     std::atomic<uint64_t>* done = nullptr);
 
 // Background filter over a finished index (the Packets panel uses it above kFilterSyncMax packets).
+// `begin` / `prefix` (live tail): only packets from `begin` on are tested and the matches start
+// with `prefix` (the matches below `begin` of an earlier run over the same packets).
 constexpr size_t kFilterSyncMax = 100000;
 struct PacketFilterResult {
     std::vector<uint32_t> matches;
@@ -87,7 +101,8 @@ struct PacketFilterResult {
 };
 class PacketFilterJob {
 public:
-    void start(std::shared_ptr<const PcapIndexJob::Result> index, const PacketFilter& f);
+    void start(std::shared_ptr<const PcapIndexJob::Result> index, const PacketFilter& f, size_t begin = 0,
+               std::vector<uint32_t> prefix = {});
     void cancel() { w_.cancel(); }
     bool running() const { return w_.running(); }
     double progress() const { return w_.progress(); }

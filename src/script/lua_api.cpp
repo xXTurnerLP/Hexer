@@ -20,7 +20,10 @@
 #include "core/exe_map.h"
 #include "core/hash.h"
 #include "core/highlight.h"
+#include "core/multisel.h"
 #include "core/os_file.h"
+#include "core/pcap.h"
+#include "core/pcap_filter.h"
 #include "core/search.h"
 #include "core/symbols.h"
 #include "core/util.h"
@@ -409,18 +412,90 @@ void move_view(lua_State* L, Document* d, uint64_t off, uint64_t len) {
     uint64_t size = d->size();
     off = std::min(off, size);
     len = std::min(len, size - off);
-    d->view().anchor = off;
-    d->view().cursor = off + len;
-    d->view().low_nibble = false;
-    d->view_generation++;
+    // The host first (the app's reveal_range: a Back / Forward history entry for the position
+    // being left, select, scroll); then the selection itself where the host did not set it.
     if (ScriptHost* host = impl_of(L).eng.host()) host->reveal(*d, off, len);
+    ViewState& v = d->view();
+    if (v.sel_begin() != off || v.sel_len() != len) {
+        v.anchor = off;
+        v.cursor = off + len;
+    }
+    v.low_nibble = false;
+    d->view_generation++;
 }
 
 int doc_select(lua_State* L) {
     Document* d = check_doc(L, 1);
     uint64_t off = check_u64(L, 2);
     uint64_t len = luaL_opt(L, check_u64, 3, 0);
+    d->view().extra_sel.clear();  // one selection: no extra ranges
     move_view(L, d, off, len);
+    return 0;
+}
+
+// doc:selections() -> { {offset=, length=}, ... }: every selected range (multi-selection), the one
+// holding the primary selection first, the others in file order; {} when nothing is selected.
+int doc_selections(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const std::vector<ByteRange> rs = selection_ranges_primary_first(d->view(), d->size());
+    lua_createtable(L, int(rs.size()), 0);
+    for (size_t i = 0; i < rs.size(); ++i) {
+        lua_createtable(L, 0, 2);
+        lua_pushinteger(L, lua_Integer(rs[i].begin));
+        lua_setfield(L, -2, "offset");
+        lua_pushinteger(L, lua_Integer(rs[i].len()));
+        lua_setfield(L, -2, "length");
+        lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    return 1;
+}
+
+// One entry of doc:select_ranges: {offset=, length=} or {off, len}.
+ByteRange check_range_entry(lua_State* L, int idx, lua_Integer n) {
+    if (!lua_istable(L, idx)) luaL_error(L, "select_ranges: entry %d is not a table ({offset=, length=} or {off, len})", int(n));
+    if (lua_getfield(L, idx, "offset") == LUA_TNIL) {
+        lua_pop(L, 1);
+        lua_rawgeti(L, idx, 1);
+    }
+    if (lua_getfield(L, idx, "length") == LUA_TNIL) {
+        lua_pop(L, 1);
+        lua_rawgeti(L, idx, 2);
+    }
+    // Numbers with an integer value (also 2.0, as luaL_checkinteger takes them for doc:select).
+    int off_ok = 0, len_ok = lua_isnil(L, -1);
+    const lua_Integer off_v = lua_type(L, -2) == LUA_TNUMBER ? lua_tointegerx(L, -2, &off_ok) : 0;
+    const lua_Integer len_v = lua_type(L, -1) == LUA_TNUMBER ? lua_tointegerx(L, -1, &len_ok) : 0;
+    if (!off_ok || !len_ok || off_v < 0 || len_v < 0)
+        luaL_error(L, "select_ranges: entry %d needs a non-negative integer offset and length", int(n));
+    const uint64_t off = uint64_t(off_v);
+    const uint64_t len = uint64_t(len_v);
+    lua_pop(L, 2);
+    return {off, len > UINT64_MAX - off ? UINT64_MAX : off + len};
+}
+
+// doc:select_ranges{ {offset=, length=}, ... }: the first range becomes the primary selection (caret
+// at its end, scrolled into view), the others the extra ranges of a multi-selection (merged when
+// they touch). Clamped to the document; at most kMaxSelections ranges.
+int doc_select_ranges(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    const lua_Integer n = luaL_len(L, 2);
+    if (n < 0 || uint64_t(n) > kMaxSelections)
+        luaL_error(L, "select_ranges: too many ranges (%d; at most %d)", int(n), int(kMaxSelections));
+    std::vector<ByteRange> rs;
+    rs.reserve(size_t(n));
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_rawgeti(L, 2, i);
+        rs.push_back(check_range_entry(L, lua_gettop(L), i));
+        lua_pop(L, 1);
+    }
+    if (ScriptHost* host = impl_of(L).eng.host(); host && !rs.empty()) {
+        // Revealed before the ranges are set, so the host records the jump from where it was.
+        const uint64_t size = d->size(), b = std::min(rs[0].begin, size);
+        host->reveal(*d, b, std::min(rs[0].end, size) - b);
+    }
+    set_selection_ranges(d->view(), rs, d->size());
+    d->view_generation++;
     return 0;
 }
 
@@ -441,7 +516,20 @@ int doc_hash(lua_State* L) {
     if (len > kMaxHash)
         return luaL_error(L, "doc:hash: at most 256 MiB per call (the Hashes panel hashes any size in the background)");
     char err[256] = {};
-    {
+    if (const int ref = find_hash_algorithm(algo) ? LUA_NOREF : find_lua_hash(impl_of(L), algo); ref != LUA_NOREF) {
+        // A Lua algorithm runs right here (raising: its errors are this call's).
+        std::shared_ptr<const Snapshot> snap = d->snapshot();
+        LuaHasher h(L, nullptr, ref);
+        uint64_t bad = UINT64_MAX;
+        bool hole = false;
+        if (hash_range(*snap, off, len, {&h}, nullptr, nullptr, &bad, &hole)) {
+            const std::string hex = to_hex(h.finish());
+            lua_pushlstring(L, hex.data(), hex.size());
+            return 1;
+        }
+        std::snprintf(err, sizeof err, "doc:hash: %s",
+                      (hole ? hash_hole_message(bad) : "read error at offset " + std::to_string(bad)).c_str());
+    } else {
         std::string out, e;
         if (hash_snapshot_hex(*d->snapshot(), algo, off, len, out, &e))
             lua_pushlstring(L, out.data(), out.size());
@@ -823,16 +911,173 @@ int doc_eq(lua_State* L) {
     return 1;
 }
 
+int doc_apply_transform(lua_State* L);  // with the XOR search functions below
+
+// ---- doc:packets ---------------------------------------------------------------------------------
+
+lua_Integer opt_int(lua_State* L, int idx, const char* key, lua_Integer def);  // (XOR section below)
+int opts_index(lua_State* L, int idx);
+
+constexpr lua_Integer kMaxLuaPackets = 1000000;  // doc:packets entries per call
+constexpr size_t kLuaPacketChunk = 65536;        // packets indexed at a time while collecting
+
+struct LuaPacket {
+    uint64_t number = 0;  // 1-based
+    Packet p;
+    PacketInfo pi;
+};
+
+// Blocking (run on a worker): the packets of `snap` from number `first` on matching `f`, at most
+// `max`, into `out`; *next = the number to continue at (0 = the capture ended). The index grows in
+// chunks (index_pcap_append), so a small page near the start never indexes the whole capture.
+void collect_packets(const Snapshot& snap, const PacketFilter& f, uint64_t first, size_t max,
+                     std::vector<LuaPacket>& out, uint64_t& next, bool& not_capture, const std::atomic<bool>& cancel) {
+    next = 0;
+    PcapIndexResult ix;
+    const auto limit = [&](uint64_t n) { return size_t(std::min<uint64_t>(kPcapMaxPackets, n)); };
+    index_pcap(snap, ix, limit(first - 1 + std::min<uint64_t>(max, kLuaPacketChunk)), &cancel);
+    if (ix.format == CaptureFormat::None) {
+        not_capture = true;
+        return;
+    }
+    uint64_t i = first - 1;
+    while (true) {
+        for (; i < ix.packets.size(); ++i) {
+            if ((i & 255) == 0 && cancel.load(std::memory_order_relaxed)) return;
+            if (out.size() >= max) {
+                next = i + 1;
+                return;
+            }
+            LuaPacket lp;
+            lp.number = i + 1;
+            lp.p = ix.packets[size_t(i)];
+            lp.pi = dissect_packet(snap, lp.p, kFilterRead);
+            if (f.match(lp.p, lp.pi, lp.number)) out.push_back(std::move(lp));
+        }
+        if (!ix.truncated || ix.packets.size() >= kPcapMaxPackets || cancel.load()) return;
+        index_pcap_append(snap, ix, limit(ix.packets.size() + kLuaPacketChunk), &cancel);
+    }
+}
+
+void set_int(lua_State* L, const char* k, lua_Integer v) {
+    lua_pushinteger(L, v);
+    lua_setfield(L, -2, k);
+}
+void set_str(lua_State* L, const char* k, const std::string& v) {
+    lua_pushlstring(L, v.data(), v.size());
+    lua_setfield(L, -2, k);
+}
+
+// doc:packets(opts?) -> list, next | nil, err   (see the API comment)
+int doc_packets(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    const int ot = opts_index(L, 2);
+    std::string ftext;
+    if (ot) {
+        lua_getfield(L, ot, "filter");
+        if (!lua_isnil(L, -1)) {
+            if (lua_type(L, -1) != LUA_TSTRING) return luaL_error(L, "doc:packets: option 'filter' must be a string");
+            ftext = lua_tostring(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+    const lua_Integer first = opt_int(L, ot, "first", 1);
+    const lua_Integer max = opt_int(L, ot, "max", 10000);
+    if (first < 1) return luaL_error(L, "doc:packets: first must be >= 1");
+    if (max < 1 || max > kMaxLuaPackets) return luaL_error(L, "doc:packets: max must be 1..1000000");
+    PacketFilter f;
+    std::string ferr;
+    size_t fpos = 0;
+    if (!f.parse(ftext, &ferr, &fpos))
+        return luaL_error(L, "doc:packets: filter: %s (column %d)", ferr.c_str(), int(fpos + 1));
+    std::vector<LuaPacket> out;
+    uint64_t next = 0;
+    bool not_capture = false, timed_out = false;
+    {
+        // On a worker so the script time limit can stop a huge capture (the hook cannot interrupt C).
+        std::shared_ptr<const Snapshot> snap = d->snapshot();
+        std::atomic<bool> cancel{false};
+        auto fut = std::async(std::launch::async, [&] {
+            collect_packets(*snap, f, uint64_t(first), size_t(max), out, next, not_capture, cancel);
+        });
+        Impl& im = impl_of(L);
+        const auto until = im.deadline_on ? im.deadline : std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        timed_out = fut.wait_until(until) != std::future_status::ready;
+        if (timed_out) cancel = true;
+        fut.get();
+    }
+    if (timed_out) return luaL_error(L, "doc:packets: time limit reached (page with first / max, or use the Packets panel)");
+    if (not_capture) {
+        lua_pushnil(L);
+        lua_pushstring(L, "not a pcap / pcapng capture");
+        return 2;
+    }
+    lua_createtable(L, int(out.size()), 0);
+    for (size_t k = 0; k < out.size(); ++k) {
+        const Packet& p = out[k].p;
+        const PacketInfo& pi = out[k].pi;
+        lua_createtable(L, 0, 24);
+        set_int(L, "number", lua_Integer(out[k].number));
+        set_int(L, "offset", lua_Integer(p.record_off));
+        set_int(L, "data", lua_Integer(p.data_off));
+        set_int(L, "length", lua_Integer(p.cap_len));
+        set_int(L, "wire_length", lua_Integer(p.orig_len));
+        const uint64_t pl = pi.payload_off < p.cap_len ? std::min<uint64_t>(pi.length, p.cap_len - pi.payload_off) : 0;
+        set_int(L, "payload", lua_Integer(p.data_off + pi.payload_off));
+        set_int(L, "payload_length", lua_Integer(pl));
+        if (p.ts_ns != kNoTimestamp) {
+            set_int(L, "time_ns", lua_Integer(p.ts_ns));
+            lua_pushnumber(L, lua_Number(p.ts_ns) / 1e9);
+            lua_setfield(L, -2, "time");
+        }
+        set_int(L, "interface", lua_Integer(p.iface));
+        set_int(L, "linktype", lua_Integer(p.linktype));
+        set_str(L, "proto", pi.proto);
+        set_str(L, "src", pi.src);
+        set_str(L, "dst", pi.dst);
+        set_str(L, "info", pi.info);
+        set_str(L, "summary", pi.summary);
+        if (pi.vlan != 0xFFFF) set_int(L, "vlan", pi.vlan);
+        if (pi.ip_version) {
+            set_int(L, "ip_version", pi.ip_version);
+            set_int(L, "ip_proto", pi.ip_proto);
+        }
+        if (pi.has_ports) {
+            set_int(L, "src_port", pi.src_port);
+            set_int(L, "dst_port", pi.dst_port);
+        }
+        if (pi.tcp_header) {
+            set_int(L, "tcp_seq", lua_Integer(pi.tcp_seq));
+            set_int(L, "tcp_ack", lua_Integer(pi.tcp_ack));
+            set_int(L, "tcp_flags", pi.tcp_flags);
+        }
+        if (pi.fragment) {
+            lua_pushboolean(L, 1);
+            lua_setfield(L, -2, "fragment");
+        }
+        if (pi.malformed) {
+            lua_pushboolean(L, 1);
+            lua_setfield(L, -2, "malformed");
+        }
+        lua_rawseti(L, -2, lua_Integer(k + 1));
+    }
+    if (next) lua_pushinteger(L, lua_Integer(next));
+    else lua_pushnil(L);
+    return 2;
+}
+
 const luaL_Reg kDocMethods[] = {
     {"size", doc_size},       {"name", doc_name},          {"path", doc_path},
     {"id", doc_id},           {"read", doc_read},          {"write", doc_write},
     {"insert", doc_insert},   {"erase", doc_erase},        {"replace", doc_replace},
     {"transaction", doc_transaction},                      {"cursor", doc_cursor},
     {"selection", doc_selection},                          {"select", doc_select},
+    {"selections", doc_selections},                        {"select_ranges", doc_select_ranges},
     {"goto", doc_goto},       {"jump", doc_goto},          {"find", doc_find},
     {"hash", doc_hash},       {"target", doc_target},      {"pid", doc_pid},
     {"disasm", doc_disasm},   {"symbols", doc_symbols},
-    {"modules", doc_modules},
+    {"apply_transform", doc_apply_transform},
+    {"modules", doc_modules},  {"packets", doc_packets},
     {"view_range", doc_view_range},                        {"bookmarks", doc_bookmarks},
     {"add_bookmark", doc_add_bookmark},                    {"remove_bookmark", doc_remove_bookmark},
     {nullptr, nullptr},
@@ -994,6 +1239,7 @@ int emit(lua_State* L, ParseCtx* c, const char* name, const char* type, uint64_t
     f.depth = parent >= 0 ? F[parent].depth + 1 : 0;
     if (o.comment) f.comment = o.comment;
     f.bits = o.bits;
+    f.fmt = o.fmt ? o.fmt : "";
     f.color = o.color;
     c->explicit_color.push_back(o.has_color ? 1 : 0);
     if (parent >= 0) F[parent].children.push_back(idx);
@@ -1899,6 +2145,13 @@ int l_hash(lua_State* L) {
     size_t n = 0;
     const char* data = luaL_checklstring(L, 2, &n);
     bool ok = false;
+    if (const int ref = find_hash_algorithm(algo) ? LUA_NOREF : find_lua_hash(impl_of(L), algo); ref != LUA_NOREF) {
+        LuaHasher h(L, nullptr, ref);  // a Lua algorithm: raising, in this state
+        h.update(reinterpret_cast<const uint8_t*>(data), n);
+        const std::string hex = to_hex(h.finish());
+        lua_pushlstring(L, hex.data(), hex.size());
+        return 1;
+    }
     {
         std::string hex = hash_hex(algo, reinterpret_cast<const uint8_t*>(data), n);
         ok = !hex.empty();
@@ -1986,6 +2239,7 @@ const char* xor_transform_lua(XorTransform t) {
     case XorTransform::Add: return "add";
     case XorTransform::Rol: return "rol";
     case XorTransform::XorKey: return "xor_key";
+    case XorTransform::AddKey: return "add_key";
     }
     return "?";
 }
@@ -2020,11 +2274,12 @@ size_t xor_scan_into(const Document& d, uint64_t start, uint64_t len, const char
 }
 
 // key_guess over [off, off+len) of `d` into `arr` (kXorMaxKeyLen entries); returns the count.
-size_t key_guess_into(const Document& d, uint64_t off, uint64_t len, uint8_t plain, uint32_t max_len,
+size_t key_guess_into(const Document& d, uint64_t off, uint64_t len, uint8_t plain, uint32_t max_len, bool add,
                       LuaKeyCand* arr) {
     std::vector<uint8_t> buf(static_cast<size_t>(len));
     const size_t got = len ? d.read(off, buf.data(), buf.size()) : 0;
-    const std::vector<KeyCandidate> c = key_guess(buf.data(), got, off, plain, max_len);
+    const std::vector<KeyCandidate> c =
+        key_guess(buf.data(), got, off, plain, max_len, add ? XorTransform::Add : XorTransform::Xor);
     const size_t n = std::min(c.size(), size_t(kXorMaxKeyLen));
     for (size_t k = 0; k < n; ++k) {
         arr[k].len = uint8_t(std::min<size_t>(c[k].key.size(), kXorMaxKeyLen));
@@ -2045,6 +2300,7 @@ int l_xor_scan(lua_State* L) {
     o.add8 = opt_bool(L, ot, "add", true);
     o.rol = opt_bool(L, ot, "rol", true);
     o.xor_multi = opt_bool(L, ot, "multi", false);
+    o.add_multi = opt_bool(L, ot, "add_multi", false);
     const lua_Integer mk = opt_int(L, ot, "max_key_len", lua_Integer(kXorMaxKeyLen));
     const lua_Integer max = opt_int(L, ot, "max", 10000);
     const lua_Integer start_i = opt_int(L, ot, "start", 0);
@@ -2110,12 +2366,21 @@ int l_xor_guess_key(lua_State* L) {
         return luaL_error(L, "hx.xor_guess_key: plain must be a byte value or a 1-character string");
     const lua_Integer max_len = opt_int(L, ot, "max_len", lua_Integer(kXorMaxKeyLen));
     if (max_len < 1 || max_len > lua_Integer(kXorMaxKeyLen)) return luaL_error(L, "hx.xor_guess_key: max_len must be 1..16");
+    bool add = false;
+    if (ot) {
+        lua_getfield(L, ot, "op");
+        const char* op = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : nullptr;
+        if (op && (!std::strcmp(op, "add") || !std::strcmp(op, "add_key"))) add = true;
+        else if (!lua_isnil(L, -1) && !(op && (!std::strcmp(op, "xor") || !std::strcmp(op, "xor_key"))))
+            return luaL_error(L, "hx.xor_guess_key: op must be \"xor\" or \"add\"");
+        lua_pop(L, 1);
+    }
     const uint64_t size = d->size();
     off = std::min(off, size);
     len = std::min(len, size - off);
     if (len > kMaxKeyGuess) return luaL_error(L, "hx.xor_guess_key: at most 16 MiB per call");
     auto* arr = static_cast<LuaKeyCand*>(lua_newuserdatauv(L, sizeof(LuaKeyCand) * kXorMaxKeyLen, 0));
-    const size_t n = key_guess_into(*d, off, len, uint8_t(plain), uint32_t(max_len), arr);
+    const size_t n = key_guess_into(*d, off, len, uint8_t(plain), uint32_t(max_len), add, arr);
     lua_createtable(L, int(n), 0);
     for (size_t k = 0; k < n; ++k) {
         lua_createtable(L, 0, 2);
@@ -2128,13 +2393,91 @@ int l_xor_guess_key(lua_State* L) {
     return 1;
 }
 
-// hx.hash_algorithms() -> { "Sum-8", ..., "SHA-512" } (display names, in display order)
+constexpr size_t kMaxTransformKey = 4096;  // doc:apply_transform key bytes
+
+// doc:apply_transform{ op=, key=, start=?, length=?, phase=?, decode=?, label=? }: XOR / ADD / SUB /
+// ROL / ROR a range in place as one undo step (core/xorscan.h apply_transform; see the API comment).
+int doc_apply_transform(lua_State* L) {
+    Document* d = check_doc(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    char err[320] = {};
+    {
+        lua_getfield(L, 2, "op");
+        const char* op_s = lua_tostring(L, -1);
+        const std::string op = op_s ? op_s : "";
+        lua_pop(L, 1);
+        bool decode = opt_bool(L, 2, "decode", false);
+        // Applying = encoding (add adds, rol rotates left); sub / ror are the decodes, decode flips.
+        const bool sum = op == "add" || op == "add_key" || op == "sub";
+        const bool rot = op == "rol" || op == "ror";
+        if (op == "sub" || op == "ror") decode = !decode;
+        if (!sum && !rot && op != "xor" && op != "xor_key")
+            return luaL_error(L, "doc:apply_transform: op must be \"xor\", \"add\", \"sub\", \"rol\" or \"ror\"");
+        std::vector<uint8_t> key;
+        lua_getfield(L, 2, "key");
+        if (lua_type(L, -1) == LUA_TNUMBER) {
+            int isnum = 0;
+            const lua_Integer k = lua_tointegerx(L, -1, &isnum);
+            if (!isnum || k < 0 || k > 255) return luaL_error(L, "doc:apply_transform: a numeric key must be 0..255");
+            key.push_back(uint8_t(k));
+        } else if (lua_type(L, -1) == LUA_TSTRING && (!rot || lua_rawlen(L, -1) == 1)) {  // rol: xor_scan's 1-byte key
+            size_t kn = 0;
+            const char* k = lua_tolstring(L, -1, &kn);
+            key.assign(k, k + kn);
+        } else {
+            return luaL_error(L, rot ? "doc:apply_transform: rol / ror take key = the bit count (1..7)"
+                                     : "doc:apply_transform: key (a string of key bytes or a byte value) is required");
+        }
+        lua_pop(L, 1);
+        if (key.empty() || key.size() > kMaxTransformKey) return luaL_error(L, "doc:apply_transform: key must be 1..4096 bytes");
+        if (rot && (key[0] < 1 || key[0] > 7)) return luaL_error(L, "doc:apply_transform: rol / ror key must be 1..7 bits");
+        const XorTransform t = rot ? XorTransform::Rol : keyed_transform(key.size(), sum);
+        // Range: start / length, else the selection.
+        lua_getfield(L, 2, "start");
+        lua_getfield(L, 2, "length");
+        const bool has_len = !lua_isnil(L, -1), ranged = has_len || !lua_isnil(L, -2);
+        lua_pop(L, 2);
+        uint64_t start = 0, len = 0;
+        if (ranged) {
+            const lua_Integer s_i = opt_int(L, 2, "start", 0), l_i = opt_int(L, 2, "length", -1);
+            if (s_i < 0) return luaL_error(L, "doc:apply_transform: start must be >= 0");
+            if (has_len && l_i < 0) return luaL_error(L, "doc:apply_transform: length must be >= 0");
+            start = uint64_t(s_i);
+            len = l_i < 0 ? (start < d->size() ? d->size() - start : 0) : uint64_t(l_i);
+        } else {
+            const ViewState& v = d->view();
+            if (!v.has_selection()) return luaL_error(L, "doc:apply_transform: nothing selected (pass start / length)");
+            start = v.sel_begin();
+            len = v.sel_len();
+        }
+        const lua_Integer ph = opt_int(L, 2, "phase", -1);
+        lua_getfield(L, 2, "phase");
+        if (!lua_isnil(L, -1) && ph < 0) return luaL_error(L, "doc:apply_transform: phase must be >= 0");
+        lua_pop(L, 1);
+        const uint64_t phase = ph < 0 ? start % key.size() : uint64_t(ph);
+        lua_getfield(L, 2, "label");
+        const std::string label = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";
+        lua_pop(L, 1);
+        std::string e;
+        if (!apply_transform(*d, start, len, t, key, phase, decode, &e, label))
+            std::snprintf(err, sizeof err, "doc:apply_transform: %s", e.c_str());
+    }
+    if (err[0]) return luaL_error(L, "%s", err);
+    return 0;
+}
+
+// hx.hash_algorithms() -> { "Sum-8", ..., "SHA-512", <Lua ones> } (display names, in display order)
 int l_hash_algorithms(lua_State* L) {
     const auto& all = hash_algorithms();
-    lua_createtable(L, int(all.size()), 0);
+    const auto& lua = impl_of(L).eng.hash_algorithms();
+    lua_createtable(L, int(all.size() + lua.size()), 0);
     for (size_t i = 0; i < all.size(); ++i) {
         lua_pushstring(L, all[i].name);
         lua_rawseti(L, -2, lua_Integer(i + 1));
+    }
+    for (size_t i = 0; i < lua.size(); ++i) {
+        lua_pushstring(L, lua[i].name.c_str());
+        lua_rawseti(L, -2, lua_Integer(all.size() + i + 1));
     }
     return 1;
 }
@@ -2215,6 +2558,7 @@ const luaL_Reg kHexerFuncs[] = {
     {"clear_highlights", l_clear_highlights},           {"color", l_color},
     {"hex", l_hex},           {"unhex", l_unhex},       {"crc32", l_crc32},
     {"hash", l_hash},         {"hash_algorithms", l_hash_algorithms},
+    {"hash_algorithm", l_hash_algorithm},
     {"run", l_run},           {"prompt", l_prompt},     {"disasm", l_disasm},
     {"xor_scan", l_xor_scan}, {"xor_guess_key", l_xor_guess_key},
     {nullptr, nullptr},

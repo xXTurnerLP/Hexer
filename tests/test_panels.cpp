@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 #include <functional>
 #include <initializer_list>
@@ -166,7 +167,8 @@ TEST_CASE("panels: Packets indexes a capture; row click, Up / Down / Home / End 
     // The index starts by itself and finishes on its worker thread.
     float x = 0, y = 0;
     const auto t0 = std::chrono::steady_clock::now();
-    while (!panel.row_pos(5, x, y)) {
+    // (The Stream column is numbered on a worker of its own after the index: wait for it too.)
+    while (!panel.row_pos(5, x, y) || panel.stream_of(doc->id(), 5) == kNoStream) {
         REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         gui.frame();
@@ -501,6 +503,158 @@ TEST_CASE("panels: Packets Follow TCP Stream / Open Packet as Tab / Filter Conve
     CHECK(notes.back().find("not a pcap") != std::string::npos);
 }
 
+TEST_CASE("panels: Packets live tail: appended records are indexed incrementally (selection, filter, Stream)") {
+    std::error_code ec;
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path(ec) /
+        ("hexer_panels_tail_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    REQUIRE(std::filesystem::create_directories(dir, ec));
+    std::vector<pcapfx::Bytes> frames;
+    for (int i = 0; i < 12; ++i) {
+        if (i % 3 == 2)
+            frames.push_back(pcapfx::tcp_frame("10.0.0.1", uint16_t(51000 + i % 2), "10.0.0.2", 80, 1, 1, pcapfx::ACK));
+        else
+            frames.push_back(pcapfx::udp_frame("10.0.0.3", uint16_t(4000 + i % 4), "10.0.0.4", 53, pcapfx::str("q")));
+    }
+    const pcapfx::Bytes full = pcapfx::pcap_file(frames);
+    const size_t first = 24 + 6 * 76;  // header + 6 records (frames padded to 60 bytes)
+    const std::filesystem::path path = dir / "live.pcap";
+    auto write = [&](size_t from, size_t to, bool append) {
+        std::ofstream f(path, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
+        f.write(reinterpret_cast<const char*>(full.data() + from), std::streamsize(to - from));
+    };
+    write(0, first, false);
+    {
+        auto doc = Document::open_file(path.string());
+        REQUIRE(doc);
+        REQUIRE(doc->refresh_appended() == GrowResult::Unchanged);
+        const uint64_t id = doc->id();
+        Gui gui;
+        PacketsPanel panel;
+        std::vector<std::string> notes;
+        PacketsPanelCallbacks cb;
+        cb.notify = [&](const std::string& m) { notes.push_back(m); };
+        gui.body = [&] { panel.draw(doc.get(), {}, cb); };
+        wait_index(gui, panel);
+        CHECK(panel.indexed_packets(id) == 6);
+        CHECK_FALSE(panel.last_index_incremental(id));
+        // Stream numbers (UDP ports 4000, 4001, 4003, 4002 in order of appearance -> 0..3; TCP 51000 /
+        // 51001 -> 0 / 1)
+        wait_for(gui, [&] { return panel.stream_of(id, 5) != kNoStream; });
+        CHECK(panel.stream_of(id, 0) == 0);
+        CHECK(panel.stream_of(id, 1) == 1);
+        CHECK(panel.stream_of(id, 2) == 0);  // TCP
+        CHECK(panel.stream_of(id, 3) == 2);
+        CHECK(panel.stream_of(id, 5) == 1);  // TCP 51001
+        // Select row 1, filter "udp".
+        float x = 0, y = 0;
+        REQUIRE(panel.row_pos(1, x, y));
+        gui.click(ImVec2(x, y));
+        CHECK(panel.selected_packet(id) == 1);
+        float fx = 0, fy = 0;
+        REQUIRE(panel.filter_box_pos(fx, fy));
+        gui.click(ImVec2(fx, fy));
+        type(gui, "udp");
+        wait_for(gui, [&] { return panel.shown_rows(id) != SIZE_MAX; });
+        CHECK(panel.shown_rows(id) == 4);
+        const size_t notes_before = notes.size();
+
+        // The capture grows (the second half of a record, then the rest): only the new records are read.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        write(first, full.size(), true);
+        const uint64_t g0 = doc->generation();
+        REQUIRE(doc->refresh_appended() == GrowResult::Grown);
+        panel.appended(id, g0, doc->generation());
+        wait_for(gui, [&] { return panel.indexed_packets(id) == 12 && panel.shown_rows(id) == 8; });
+        CHECK(panel.last_index_incremental(id));
+        CHECK(panel.selected_packet(id) == 1);  // kept
+        CHECK(panel.applied_filter(id) == "udp");
+        wait_for(gui, [&] { return panel.stream_of(id, 11) != kNoStream; });
+        CHECK(panel.stream_of(id, 1) == 1);
+        CHECK(panel.stream_of(id, 6) == 3);   // UDP 4002: new
+        CHECK(panel.stream_of(id, 8) == 0);   // TCP 51000 again
+        CHECK(panel.stream_of(id, 11) == 1);  // TCP 51001 again
+        CHECK(notes.size() == notes_before);  // an append is quiet
+
+        // An edit between two growths: the index is no longer the document's, no automatic append.
+        const uint8_t z = 0;
+        REQUIRE(doc->overwrite(30, &z, 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        write(0, 24 + 76, true);  // one more record (a copy of the first one)
+        const uint64_t g1 = doc->generation();
+        REQUIRE(doc->refresh_appended() == GrowResult::Grown);
+        panel.appended(id, g1, doc->generation());
+        for (int i = 0; i < 20; ++i) gui.frame();
+        CHECK(panel.indexed_packets(id) == 12);
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("panels: Packets Follow UDP Stream (palette request, toolbar Any) and its messages") {
+    Gui gui;
+    std::vector<pcapfx::Bytes> f;
+    f.push_back(pcapfx::udp_frame("10.0.0.5", 5353, "10.0.0.9", 53, pcapfx::str("ask")));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 100, 0, pcapfx::SYN));
+    f.push_back(pcapfx::udp_frame("10.0.0.9", 53, "10.0.0.5", 5353, pcapfx::str("reply")));
+    f.push_back(pcapfx::arp_frame());
+    const pcapfx::Bytes cap = pcapfx::pcap_file(f);
+    auto doc = Document::create_from_bytes("cap.pcap", cap.data(), cap.size());
+    PacketsPanel panel;
+    std::vector<std::string> notes, names;
+    std::vector<std::string> texts;
+    PacketsPanelCallbacks cb;
+    cb.notify = [&](const std::string& m) { notes.push_back(m); };
+    cb.open_tab = [&](const std::string& n, const std::vector<uint8_t>& b, const std::vector<Bookmark>&) {
+        names.push_back(n);
+        texts.emplace_back(b.begin(), b.end());
+    };
+    gui.body = [&] { panel.draw(doc.get(), {}, cb); };
+    const uint64_t id = doc->id();
+    wait_index(gui, panel);
+    float x = 0, y = 0;
+    REQUIRE(panel.row_pos(2, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 2);
+    panel.request_follow_stream(true, PacketsPanel::FollowProto::Udp);
+    wait_for(gui, [&] { return !names.empty() && !panel.stream_running(); });
+    CHECK(names[0] == "UDP 10.0.0.5:5353 > 10.0.0.9:53 (interleaved)");
+    CHECK(texts[0] == "askreply");
+    CHECK(notes.back() == "UDP stream: 3 bytes client -> server, 5 bytes server -> client, 2 datagrams");
+    CHECK(panel.applied_filter(id) ==
+          "ip.addr == 10.0.0.9 and ip.addr == 10.0.0.5 and udp.port == 53 and udp.port == 5353");
+    // The palette's TCP action on a UDP packet refuses; Any follows what the packet is.
+    panel.request_follow_stream(false, PacketsPanel::FollowProto::Tcp);
+    gui.frame();
+    gui.frame();
+    CHECK(notes.back() == "Follow TCP Stream: packet #3 is not a TCP packet");
+    panel.request_follow_stream(false, PacketsPanel::FollowProto::Any);
+    wait_for(gui, [&] { return names.size() == 2 && !panel.stream_running(); });
+    CHECK(names[1] == "UDP 10.0.0.5:5353 > 10.0.0.9:53");
+    CHECK(texts[1] == "askreply");
+    // UDP on a TCP packet / Any on ARP: refused with the protocol in the message.
+    float fx = 0, fy = 0;
+    REQUIRE(panel.filter_box_pos(fx, fy));
+    gui.click(ImVec2(fx, fy));
+    select_all(gui);
+    type(gui, "not udp");
+    wait_for(gui, [&] { return panel.shown_rows(id) == 2; });
+    REQUIRE(panel.row_pos(0, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 1);
+    panel.request_follow_stream(false, PacketsPanel::FollowProto::Udp);
+    gui.frame();
+    gui.frame();
+    CHECK(notes.back() == "Follow UDP Stream: packet #2 is not a UDP packet");
+    REQUIRE(panel.row_pos(1, x, y));
+    gui.click(ImVec2(x, y));
+    CHECK(panel.selected_packet(id) == 3);
+    panel.request_follow_stream(false, PacketsPanel::FollowProto::Any);
+    gui.frame();
+    gui.frame();
+    CHECK(notes.back() == "Follow Stream: packet #4 is not a TCP or UDP packet");
+    CHECK(names.size() == 2);
+}
+
 // =============================================================================================
 // Bitmap panel
 // =============================================================================================
@@ -575,6 +729,80 @@ TEST_CASE("panels: Bitmap decodes the visible window without a renderer; format 
     REQUIRE(f.doc->overwrite(0, red, 3));
     f.gui.frame();
     CHECK(f.px(0, 0) == rgba(255, 0, 0));
+}
+
+TEST_CASE("panels: Bitmap zoom below 1x averages blocks; Fit downscales a very wide image") {
+    // 4 rows of 4096 gray pixels: columns alternate black / white in blocks of 4, rows 2..3 are 0.
+    BitmapFixture f;
+    Bytes wide(4096 * 4, 0);
+    for (size_t x = 0; x < 4096; ++x) wide[x] = wide[4096 + x] = ((x / 4) % 2) ? 255 : 0;
+    f.doc = Document::create_from_bytes("wide.bin", wide.data(), wide.size());
+    f.panel.width = 4096;
+    f.panel.zoom = -4;
+    f.gui.frame();
+    REQUIRE(f.panel.decoded());
+    CHECK(f.panel.shown_step() == 4);
+    CHECK(f.panel.shown_zoom() == 1);
+    CHECK(f.px(0, 0) == rgba(0, 0, 0));
+    CHECK(f.px(1, 0) == rgba(128, 128, 128));  // 8 of the 16 pixels are white (2040 / 16, rounded)
+    CHECK((f.px(0, 1) >> 24) == 0);              // past the data: the missing marker
+    // A click on a cell = the first byte of its block.
+    f.gui.click(f.at(3, 0));
+    REQUIRE(f.jumps.size() == 1);
+    CHECK(f.jumps[0] == 12);
+    // Ctrl+wheel steps through the levels: 1/4x -> 1/2x -> 1x, and down to 1/16x at most.
+    ImGuiIO& io = ImGui::GetIO();
+    for (int i = 0; i < 2; ++i) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddMouseWheelEvent(0.0f, 1.0f);
+        f.gui.frame();
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        f.gui.frame();
+    }
+    CHECK(f.panel.zoom == 1);
+    for (int i = 0; i < 6; ++i) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddMouseWheelEvent(0.0f, -1.0f);
+        f.gui.frame();
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        f.gui.frame();
+    }
+    CHECK(f.panel.zoom == -16);
+    // Fit: the smallest downscale at which a whole row fits (4096 / 8 = 512 cells <= ~880 px).
+    f.panel.fit_width = true;
+    f.gui.frame();
+    CHECK(f.panel.zoom == -8);
+    CHECK(f.panel.shown_step() == 8);
+    CHECK(f.panel.shown_cols() == 512);
+    CHECK(f.px(0, 0) == rgba(64, 64, 64));  // 8 white of the 32 pixels there (rows 4..7 are past the end)
+    // The level is a setting like any zoom.
+    Settings s;
+    CHECK(f.panel.save_settings(s));
+    CHECK(s.bitmap_zoom == -8);
+    BitmapPanel other;
+    other.load_settings(s);
+    CHECK(other.zoom == -8);
+}
+
+TEST_CASE("panels: Bitmap downscale of a short wide image stays within the byte budget") {
+    // 20 rows of 8192 RGBA pixels (640 KiB) at 1/16x: the panel is many cell rows tall, but only
+    // the 2 cell rows that hold data are gathered (not panel rows x 16 sampled rows of 32 KiB).
+    BitmapFixture f;
+    Bytes img(size_t(8192) * 4 * 20, 0);
+    for (size_t i = 0; i < img.size(); i += 4) img[i] = img[i + 3] = 255;  // opaque red
+    f.doc = Document::create_from_bytes("short.bin", img.data(), img.size());
+    f.panel.format = PixelFormat::RGBA32;
+    f.panel.width = 8192;
+    f.panel.zoom = -16;
+    f.gui.frame();
+    REQUIRE(f.panel.decoded());
+    CHECK(f.panel.shown_step() == 16);
+    CHECK(f.panel.shown_rows() > 2);
+    CHECK(f.panel.read_buffer_bytes() <= BitmapPanel::kMaxBytes);
+    CHECK(f.panel.decoded_pixel_count() * 4 <= BitmapPanel::kMaxBytes * 2);
+    CHECK(f.px(0, 0) == rgba(255, 0, 0, 255));
+    CHECK(f.px(0, 1) == rgba(255, 0, 0, 255));  // rows 16..19 of the image
+    CHECK((f.px(0, 2) >> 24) == 0);              // past the data: the missing marker
 }
 
 TEST_CASE("panels: Bitmap sources: follow view / cursor, Show at Cursor (fixed offset)") {
@@ -680,6 +908,12 @@ TEST_CASE("panels: Strings / XOR / Bitmap / Packets options load from and save t
     CHECK(xp2.options.xor8);
     CHECK_FALSE(xp2.options.rol);
     CHECK(xp2.options.xor_multi);
+    CHECK_FALSE(xp2.options.add_multi);
+    xp.options.add_multi = true;  // multi-byte ADD keys
+    CHECK(xp.save_settings(s));
+    CHECK(s.xor_add_key);
+    xp2.load_settings(s);
+    CHECK(xp2.options.add_multi);
     CHECK(xp2.options.max_key_len == 5);
     s.xor_max_key_len = 99;  // a hand-edited value out of range is clamped
     xp2.load_settings(s);

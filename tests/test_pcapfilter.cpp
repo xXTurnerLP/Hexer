@@ -356,3 +356,137 @@ TEST_CASE("pcap filter: filter_packets and PacketFilterJob over an index") {
         CHECK(job.progress() == 1.0);
     }
 }
+
+TEST_CASE("pcap filter: vlan, ip.proto, tcp.seq / tcp.ack, tcp.flags (numbers and names), tcp.flags.<bit>") {
+    // vlan / vlan.id: the outermost tag; no tag = false for every operator
+    CHECK(m("vlan == 10", kVlan));
+    CHECK(m("vlan.id == 10", kVlan));
+    CHECK(m("vlan < 11 and vlan > 9", kVlan));
+    CHECK_FALSE(m("vlan != 10", kVlan));
+    CHECK_FALSE(m("vlan == 10", kUdp));
+    CHECK_FALSE(m("vlan != 10", kUdp));
+    CHECK(m("not vlan == 10", kUdp));
+    // ip.proto: IPv4 protocol / IPv6 next header; false without IP
+    CHECK(m("ip.proto == 6", kTcp));
+    CHECK(m("ip.proto == 17", kUdp));
+    CHECK(m("ip.proto == 17", kUdp6));
+    CHECK(m("ip.proto == 1", kIcmp));
+    CHECK(m("ip.proto == 0x11", kVlan));
+    CHECK_FALSE(m("ip.proto == 6", kUdp));
+    CHECK_FALSE(m("ip.proto != 6", kArp));
+    CHECK_FALSE(m("ip.proto < 255", kArp));
+    // tcp.seq / tcp.ack: raw 32-bit numbers, TCP only
+    const Bytes big = tcp_frame("10.0.0.1", 1, "10.0.0.2", 2, 0xFFFFFFF0u, 77, ACK);
+    CHECK(m("tcp.seq == 4294967280", big));
+    CHECK(m("tcp.seq == 0xFFFFFFF0", big));
+    CHECK(m("tcp.seq > 100 and tcp.ack == 77", big));
+    CHECK(m("tcp.ack <= 77", big));
+    CHECK_FALSE(m("tcp.ack == 78", big));
+    CHECK(m("tcp.seq == 1", kTcp));
+    CHECK_FALSE(m("tcp.seq == 1", kUdp));
+    CHECK_FALSE(m("tcp.seq != 1", kUdp));
+    // tcp.flags: the byte (kTcp has ACK | PSH = 0x18)
+    CHECK(m("tcp.flags == 0x18", kTcp));
+    CHECK(m("tcp.flags == 24", kTcp));
+    CHECK(m("tcp.flags == ack+psh", kTcp));
+    CHECK(m("tcp.flags == PSH+ACK", kTcp));
+    CHECK_FALSE(m("tcp.flags == ack", kTcp));  // exactly ACK: no
+    CHECK(m("tcp.flags != syn", kTcp));
+    CHECK(m("tcp.flags > 0x10", kTcp));
+    const Bytes synack = tcp_frame("10.0.0.2", 80, "10.0.0.1", 51000, 9, 1, SYN | ACK);
+    CHECK(m("tcp.flags == syn+ack", synack));
+    CHECK(m("tcp.flags == 0x12", synack));
+    CHECK_FALSE(m("tcp.flags == syn", synack));
+    CHECK_FALSE(m("tcp.flags == 0x12", kUdp));
+    // tcp.flags.<name>: alone = set, == 1 / == 0
+    CHECK(m("tcp.flags.syn", synack));
+    CHECK(m("tcp.flags.ack and tcp.flags.syn", synack));
+    CHECK_FALSE(m("tcp.flags.fin", synack));
+    CHECK(m("not tcp.flags.fin", synack));
+    CHECK(m("tcp.flags.fin == 0", synack));
+    CHECK(m("tcp.flags.SYN == 1", synack));
+    CHECK(m("tcp.flags.psh and tcp.flags.ack", kTcp));
+    CHECK_FALSE(m("tcp.flags.syn", kTcp));
+    CHECK_FALSE(m("tcp.flags.syn", kUdp));
+    CHECK_FALSE(m("tcp.flags.syn == 0", kUdp));  // no TCP header: false either way
+    for (const char* name : {"fin", "syn", "rst", "psh", "ack", "urg", "ece", "cwr"}) {
+        const int bit = int(std::string("fin syn rst psh ack urg ece cwr").find(name) / 4);
+        const Bytes f = tcp_frame("10.0.0.1", 1, "10.0.0.2", 2, 1, 1, uint8_t(1u << bit));
+        INFO(name);
+        CHECK(m(std::string("tcp.flags.") + name, f));
+        CHECK(m(std::string("tcp.flags == ") + name, f));
+        CHECK(m("tcp.flags == " + std::to_string(1u << bit), f));
+    }
+    // errors
+    CHECK(err_at("vlan == 4096", "out of range (0..4095)") == 8);
+    CHECK(err_at("ip.proto == 256", "0..255") == 12);
+    CHECK(err_at("tcp.seq == 4294967296", "0..4294967295") == 11);
+    CHECK(err_at("tcp.flags == 256", "0..255") == 13);
+    CHECK(err_at("tcp.flags == syn+bogus", "flag names") == 13);
+    CHECK(err_at("tcp.flags == syn+", "flag names") == 13);
+    CHECK(err_at("tcp.flags.syn == 2", "0 or 1") == 17);
+    CHECK(err_at("tcp.flags.nope", "unknown TCP flag 'nope'") == 10);
+    CHECK(err_at("tcp.flags.syn > ", "value") == 16);
+}
+
+TEST_CASE("pcap filter: frame.number (1-based; from filter_packets, unknown = false)") {
+    std::vector<Bytes> frames;
+    for (int i = 0; i < 10; ++i) frames.push_back(udp_frame("10.0.0.1", uint16_t(100 + i), "10.0.0.2", 53, str("q")));
+    Capture cap(pcap_file(frames));
+    REQUIRE(cap.packets().size() == 10);
+    auto run = [&](const std::string& expr) {
+        PacketFilter f;
+        REQUIRE(f.parse(expr));
+        std::vector<uint32_t> out;
+        filter_packets(*cap.res->snap, cap.packets(), f, 0, cap.packets().size(), out);
+        return out;
+    };
+    CHECK(run("frame.number == 1") == std::vector<uint32_t>{0});
+    CHECK(run("frame.number >= 9") == std::vector<uint32_t>{8, 9});
+    CHECK(run("frame.number > 2 and frame.number < 5") == std::vector<uint32_t>{2, 3});
+    CHECK(run("frame.number != 1 and frame.number <= 3") == std::vector<uint32_t>{1, 2});
+    CHECK(run("frame.number == 0").empty());
+    CHECK(run("frame.number == 18446744073709551615").empty());
+    // A sub-range still numbers by index
+    PacketFilter f;
+    REQUIRE(f.parse("frame.number == 6"));
+    std::vector<uint32_t> part;
+    filter_packets(*cap.res->snap, cap.packets(), f, 4, 8, part);
+    CHECK(part == std::vector<uint32_t>{5});
+    // match() without a number: frame.number is false for every operator
+    CHECK_FALSE(m("frame.number == 0", kUdp));
+    CHECK_FALSE(m("frame.number != 5", kUdp));
+    CHECK(m("not frame.number == 1", kUdp));
+    Packet p;
+    const PacketInfo pi = dissect(kUdp.data(), kUdp.size(), kLinkEthernet);
+    CHECK(f.match(p, pi, 6));
+    CHECK_FALSE(f.match(p, pi, 7));
+    CHECK(err_at("frame.number == x", "expected a number") == 16);
+}
+
+TEST_CASE("pcap filter: PacketFilterJob continues from `begin` with a prefix (live tail)") {
+    std::vector<Bytes> frames;
+    for (int i = 0; i < 100; ++i)
+        frames.push_back(i % 2 ? udp_frame("10.0.0.1", 1, "10.0.0.2", 2, str("u")) : arp_frame());
+    Capture cap(pcap_file(frames));
+    PacketFilter f;
+    REQUIRE(f.parse("udp"));
+    std::vector<uint32_t> all;
+    filter_packets(*cap.res->snap, cap.packets(), f, 0, 100, all);
+    REQUIRE(all.size() == 50);
+    // The prefix is taken as is (here: a marker value nobody would match) and only [60, 100) is tested.
+    PacketFilterJob job;
+    job.start(cap.res, f, 60, std::vector<uint32_t>{7777});
+    const auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == 0) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto r = job.result();
+    REQUIRE(r);
+    REQUIRE(r->matches.size() == 21);
+    CHECK(r->matches[0] == 7777);
+    CHECK(r->matches[1] == 61);
+    CHECK(r->matches.back() == 99);
+    CHECK(job.progress() == 1.0);
+}

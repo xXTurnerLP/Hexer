@@ -16,7 +16,9 @@
 //     frame, never one per range); scrollbar ticks are subsampled to at most kMaxTicks per side.
 //   * A side whose document is busy (being saved) shows a placeholder and is not read.
 //   * Find Shift (toolbar / request_find_shift()) runs find_shift() on a ShiftJob worker
-//     (progress + Cancel) and applies the proposed shift: both sides then show the matching block.
+//     (progress + Cancel) from the A caret on (ShiftOptions::from) and applies the proposed shift:
+//     both sides then show the matching block with the caret on it, so the next Find Shift finds
+//     the next misalignment (insertion / deletion) behind it.
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -141,6 +143,7 @@ private:
     std::string note_;                   // last navigation note ("No more differences")
     ShiftJob shift_job_;                 // Find Shift
     uint64_t shift_run_ = 0;             // ShiftJob run id of the last started search (0 = none)
+    uint64_t shift_from_ = 0;            // A offset it started at (ShiftOptions::from)
     uint64_t shift_gen_seen_ = 0;
     bool find_shift_requested_ = false;
     Side a_, b_;

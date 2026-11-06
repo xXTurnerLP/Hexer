@@ -64,10 +64,12 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       options; per tab: insert mode, Back / Forward history, Packets filter + "Parse with"; per
       session: Find pattern, Bitmap fixed start, the C Struct to Parser draft (see CLAUDE.md
       "Persistence")
-- [ ] Persistence follow-ups: script `doc:jump` / `doc:select` do not record Back / Forward
-      history (move_view sets the caret before ScriptHost::reveal); Regions / Modules filters and
-      in-panel tab choices (XOR, Regions) stay transient; Reset Layout re-shows the default panels
-      but leaves on-demand ones open
+- [x] Script `doc:jump` / `doc:select` / `doc:select_ranges` record Back / Forward history (the
+      host's reveal_range runs before the view moves, so Alt+Left returns); Reset Layout also closes
+      the on-demand panels (Bitmap, Packets, Regions, Disassembly, History, XOR: Settings' panel_*
+      defaults, settings.ini follows)
+- [ ] Persistence follow-ups: Regions / Modules filters and in-panel tab choices (XOR, Regions)
+      stay transient
 
 ## Later
 - [x] History panel (View > History: every undo state with its label and changed range; click to
@@ -77,11 +79,15 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Undo for view-level actions: the read-only toggle, the chosen parser (Structure combo, palette,
       C struct) and Parse at are cheap view steps (no piece list copy; undo while read-only works);
       not scrolling, caret moves or the Packets panel's per-packet parse
-- [ ] History: a "Parse at" step drops the redo states like any step (undo a few edits, pick a
-      parser: the redo is gone); view steps that only rearrange the view could keep them
+- [x] History: view steps (parser, Parse at, read-only) keep the redo stack's content steps (undo a
+      few edits, pick a parser: Redo re-applies the edits and keeps the parser); a new view step
+      only replaces the undone view steps; no session format change
 - [x] Hashes & checksums of selection (Hashes panel: 16 CRCs/checksums/hashes, background, expected
       value match; `hx.hash` / `doc:hash`)
-- [ ] Custom hash algorithms registered from Lua (`hx.hash_algorithm{...}`)
+- [x] Custom hash algorithms registered from Lua (`hx.hash_algorithm{name, init, update, final}`:
+      Hashes panel (a Lua state of its own per run on the HashJob worker, cancel stops Lua at
+      once, errors in the row + once in the console), `hx.hash` / `doc:hash` / `hx.hash_algorithms`;
+      example Adler-32 (Lua) in scripts/examples/hashes.lua, checked against the built-in)
 - [x] Entropy / byte-class minimap next to the scrollbar (View > Minimap: Off / Entropy / Byte Classes;
       background sampled scan, rescanned 1 s after edits; click / drag scrolls)
 - [x] Minimap: rescan only the buckets an edit touched (`EntropyJob::rescan`: the piece lists of
@@ -91,24 +97,32 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       FSCTL_QUERY_ALLOCATED_RANGES / SEEK_DATA, only data ranges are read, each gets a chunk; a
       4 KiB block in a 1 TiB sparse file shows; `peak` / `nonzero`: a tick on the right edge marks a
       dense 4 KiB chunk or a lone non-zero byte the bucket average hides)
-- [ ] Minimap: fully allocated huge zero areas (disk images) can still hide a small region between
-      samples; rescan process memory incrementally (its bytes change underneath without edits, so
-      reusing buckets would show stale data: today it is always rescanned)
+- [x] Minimap: fully allocated huge zero areas (disk images) no longer hide a small region between
+      samples: once the scan is done, sampled all-zero buckets are refined while idle (one more
+      4 KiB slot per gap and pass, bit-reversed order: midpoints first; a pass reads at most what
+      the scan did, then pauses >= 3x its time; up to 64 passes in the app, cancelled by any new
+      scan); process memory is refreshed incrementally (every 2 s the buckets around the visible
+      bytes + a rotating 1/64 of the rest, `EntropyJob::refresh`)
+- [ ] Minimap: refinement of buckets that are uniform but not zero (0xFF-erased flash dumps), and
+      of the visible buckets first
 - [x] Structure → C header export (Structure panel "C Header" / row context menu: packed typedefs,
       deduped layouts, arrays, enums, bit fields, padding, static_asserts, `// @be`; converts back
       through C struct → parser to the same tree)
 - [x] Bit-field / flags display in the Inspector (Bits row: a 0/1 toggle per bit at the selected
       integer row's width, undoable flips; Lua `opts.flags` names bits: "3 = READ|WRITE")
-- [ ] C header export: emit `#define` masks for flags; char fields (`fmt = "char"`) as `char`;
-      mixed-endianness structs (today: majority wins, the rest only get a BE comment)
+- [x] C header export: `#define MEMBER_FLAG 0x...` masks for flags fields; 1-byte `fmt = "char"`
+      fields as `char`; mixed byte order: the struct's majority annotation (`// @be` / `// @le`)
+      plus `/* @le */` / `/* @be */` before each minority member, which C struct -> parser reads
+      (an annotation comment on the member's own line), so the round trip keeps every byte order
 - [x] Diff/compare two files with synced scrolling (File > Compare With: a Compare tab, F7 / Shift+F7,
       shift for inserted headers, "Align at Cursors")
 - [x] Compare: keep the Compare tab (documents + shift) in the session
 - [x] Compare: find the shift automatically ("Compare: Find Shift": a distinctive 64-byte block
       after the first difference, rolling-hash search within +-16 MiB, background job); compare a
       document with its version on disk (Compare With > File on Disk, reloads after saves; session)
-- [ ] Compare: Find Shift for the next misalignment too (today it aligns at the first difference;
-      a change followed by an insertion reports "no shift found")
+- [x] Compare: Find Shift for the next misalignment too (from the A caret on, so after one Find
+      Shift the next one continues behind the match; plain changes that realign within 4 KiB are
+      passed over, so a change followed by an insertion finds the insertion)
 - [x] Headless tests for DiffView / PacketsPanel / BitmapPanel (view_diff, panel_packets and
       panel_bitmap moved to hexer_ui_view; test_diffview, test_panels)
 - [x] Open process memory and raw disks/devices (File > Open Process... / Open Disk..., Regions
@@ -146,13 +160,25 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
       retransmitted / overlapping segments, wraparound, ACKed gaps, connection reuse; a read-only tab,
       sequential or interleaved, one bookmark per segment, 256 MiB cap; the list gets the conversation
       filter) and Open Packet / Payload as Tab
-- [ ] Packets: Follow UDP stream; IPv4 / IPv6 fragment reassembly (fragments are skipped by Follow
-      TCP Stream); a "TCP stream # / conversation" column; a stream that starts without a SYN with
-      an out-of-order first segment loses the bytes before it
-- [ ] Packets: Lua access (`doc:packets()`, a filter from scripts); filter on more fields (vlan,
-      tcp.flags, tcp.seq, ip.proto, frame.number)
+- [x] Packets: Follow UDP Stream (the datagrams of one 4-tuple, both directions, in capture order;
+      same tab / bookmarks as TCP) and a "Stream" column (TCP / UDP conversation numbers, per
+      protocol from 0, on a ConversationJob worker after each index)
+- [ ] Packets: IPv4 / IPv6 fragment reassembly (fragments are skipped by Follow TCP / UDP Stream
+      and the Stream column); a stream that starts without a SYN with an out-of-order first segment
+      loses the bytes before it; split a Stream number at a port reuse (new SYN) like Wireshark;
+      `tcp.stream` / `udp.stream` filter fields
+- [x] Packets: Lua access (`doc:packets{ filter=, first=, max= }`: synchronous index + dissect,
+      paged, time-limited; scripts/examples/packets.lua); filter on more fields (vlan, ip.proto,
+      tcp.seq / tcp.ack, tcp.flags with names (`syn+ack`), tcp.flags.syn ..., frame.number)
 - [x] Split view of the same document (View > Split View, Ctrl+\, F6; kept in the session)
-- [ ] Multi-selection
+- [x] Multi-selection (core/multisel.h): Alt+click / Alt+drag adds a range (Alt+click on a selected
+      byte removes it), Add Selection (Ctrl+Shift+A), Select All Matches (Alt+F3 / Search Results
+      "Select All", up to 100k); Copy / Copy As (one line per range), Cut, Delete, Fill, Paste (equal
+      lengths) and Bookmark Selections as one undo step each (Document::fill_ranges: one pass);
+      status bar "N selections, size"; `doc:selections()` / `doc:select_ranges{}`; transient
+- [ ] Multi-selection: typing / Inspector edits into every range; scrollbar / minimap ticks for the
+      extra ranges; Find inside the selected ranges; keep the extras in undo steps (an undo of a
+      multi-range Delete restores only the primary selection today)
 - [x] C struct → parser: paste C definitions, get a Lua parser (apply at the cursor or save it)
 - [x] Parse at offset (Structure panel "Parse at", e.g. a PNG inside a dump)
 - [x] Remember the parse offset in the session (Parse at offset / range per tab)
@@ -164,7 +190,9 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [ ] Verify by hand: Ctrl+hover underline / tooltip and mouse X1/X2 (headless tests only)
 - [x] Bitmap view: render bytes as pixels (adjustable width / pixel format) to spot tables & images
       (View > Bitmap; format / width / zoom remembered in settings.ini)
-- [ ] Bitmap: zoom below 1x (downscale) for very wide images; remember the source mode
+- [x] Bitmap: zoom below 1x (1/2x .. 1/16x: a screen pixel averages its block, at most kMaxBytes
+      read per refresh; Fit picks a downscale for rows wider than the panel); the level and the
+      follow source are remembered in settings.ini (Fixed offset: per session)
 - [x] Byte-class coloring mode (zero / printable / whitespace / control / high bytes; View > Color
       Bytes by Class)
 - [x] Disassembly at cursor: x86-64 / x86-32 (Zydis), Disassembly panel following the caret,
@@ -188,12 +216,16 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Live tail mode for growing files (captures, logs): View > Live Tail, follows the end while the
       caret is there, a rewrite falls back to the "changed on disk" banner
 - [x] Live tail: remember the toggle in the session
-- [ ] Live tail: rescan the Packets index incrementally while a capture grows
+- [x] Live tail: rescan the Packets index incrementally while a capture grows (index_pcap_append:
+      only the records after the last one; a record cut short is read again; other bytes before
+      the old end / a shrink / a cancelled index = a full rescan; filter + Stream numbers continue)
 - [x] XOR / rotate brute-force helpers to find simple obfuscation (XOR Search panel: known
       plaintext with 1-byte XOR / ADD / ROL and 2..16-byte XOR keys, key guess, undoable decode)
 - [x] XOR search: Lua API (`hx.xor_scan(doc, plaintext, opts)` up to 256 MiB per call,
       `hx.xor_guess_key(doc, off, len, opts)` up to 16 MiB)
-- [ ] XOR search: multi-byte ADD keys; a Lua binding for the undoable decode (`apply_transform`)
+- [x] XOR search: multi-byte ADD keys (scan "ADD key" + key guess XOR / ADD; `add_multi`,
+      `op = "add"` in Lua) and `doc:apply_transform{op, key, start, length, phase, decode}` (the
+      undoable decode as one step; a scan hit decodes with its own transform / key)
 - [x] Script API: `doc:view_range()` (visible bytes); bookmark access from Lua (`doc:bookmarks()`,
       `doc:add_bookmark`, `doc:remove_bookmark`, undoable)
 - [x] "Restore from .backup" (File menu, when `<file>.backup` exists): Compare with Backup side by
@@ -205,12 +237,21 @@ Covered by unit tests and screenshot runs, but not yet exercised with real mouse
 - [x] Live font reload from the Settings window (font files / hinting apply right away; a path is
       loaded when its field is left)
 - [x] Settings: remember the Bookmarks panel's "All open files" toggle
-- [ ] Headless App-level tests (session extras round trip of split / tail / parse at / Compare,
-      the History and XOR panels' clicks): app.cpp is not linked by any test exe yet
+- [x] Headless App-level tests (tests/test_app.cpp: the App without a window / GL through
+      app_startup / app_frame / app_shutdown + run_named_action in ui/app_internal.h): session
+      round trips of tab order / active tab / split view / live tail / Parse at / the Compare tab,
+      History panel keys, XOR Search scan + key guess actions
+- [ ] Headless App tests: clicks on panel rows inside the App (XOR results, History rows) need
+      the rows' positions (no accessor inside app.cpp's panels; test_panels covers the panels alone)
 - [x] Linux CI (linux-gcc + linux-clang build and test on every push, 0 warnings)
 - [x] AppImage + Linux tar.gz; Windows portable zip (CI artifacts on every push, GitHub Release on
       `v*` tags; each package is smoke-tested with its own bundled scripts)
-- [ ] Linux packages: AppStream metainfo in the AppImage; an aarch64 build
+- [x] Linux packages: AppStream metainfo (assets/linux/io.github.xXTurnerLP.Hexer.metainfo.xml,
+      installed by meson to share/metainfo, so the AppImage carries it; `appstreamcli validate`
+      in CI, a warning only); an aarch64 leg of the package job (ubuntu-22.04-arm)
+- [ ] Linux packages: drop `continue-on-error` from the aarch64 leg once it has passed on CI; a
+      `<project_license>` in the metainfo once the project has a license; screenshots there once
+      some are hosted at a stable URL
 - [x] Compile the visual-analysis / compare / capture batch with GCC and Clang (-Wall -Wextra,
       green in CI)
 - [x] Run parsers on a worker thread (script/parse_job.h: a Lua state of its own per parse over a

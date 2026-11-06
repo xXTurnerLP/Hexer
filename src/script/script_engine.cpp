@@ -201,6 +201,7 @@ void ScriptEngine::Impl::close_state() {
     prompt_requested = false;
     parser_refs.clear();
     command_refs.clear();
+    hash_refs.clear();
     ref_pack = ref_unpack = ref_packsize = LUA_NOREF;
     deadline_on = false;
     timed_out = false;
@@ -214,6 +215,7 @@ void ScriptEngine::Impl::keep_parser_sources() {
     for (auto it = sources.begin(); it != sources.end();) {
         bool used = false;
         for (const ParserInfo& p : eng.parsers_) used = used || p.file == it->first;
+        for (const ScriptHashInfo& h : eng.hashes_) used = used || h.file == it->first;
         it = used ? std::next(it) : sources.erase(it);
     }
 }
@@ -361,6 +363,24 @@ void ScriptEngine::Impl::register_parser(ParserInfo info, int ref) {
         }
 }
 
+void ScriptEngine::Impl::register_hash(ScriptHashInfo info, int ref) {
+    ++eng.hash_gen_;
+    const std::string key = hash_name_key(info.name);
+    auto it = hash_refs.find(key);
+    if (it == hash_refs.end()) {
+        hash_refs.emplace(key, ref);
+        eng.hashes_.push_back(std::move(info));
+        return;
+    }
+    luaL_unref(L, LUA_REGISTRYINDEX, it->second);
+    it->second = ref;
+    for (ScriptHashInfo& h : eng.hashes_)
+        if (hash_name_key(h.name) == key) {
+            h = std::move(info);
+            break;
+        }
+}
+
 void ScriptEngine::Impl::register_command(ScriptCommand cmd, int ref) {
     auto it = command_refs.find(cmd.name);
     if (it == command_refs.end()) {
@@ -439,6 +459,8 @@ void ScriptEngine::reload() {
         log(ConsoleLine::Warn, "Command '" + impl_->prompt.command + "' cancelled: scripts reloaded");
     parsers_.clear();
     commands_.clear();
+    hashes_.clear();
+    ++hash_gen_;
     impl_->new_state();
     add_lib_paths();
     std::vector<ScriptFile> files = scan_scripts(dirs_);

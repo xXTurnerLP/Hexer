@@ -2,7 +2,10 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -13,11 +16,15 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/hash.h"
+#include "core/nav.h"
+#include "core/pcap.h"
 #include "core/os_file.h"
 #include "lauxlib.h"
 #include "lua.h"
 #include "lualib.h"
 #include "script/script_engine.h"
+#include "pcap_fixture.h"
 
 using namespace hx;
 namespace fs = std::filesystem;
@@ -40,7 +47,19 @@ struct FakeHost : ScriptHost {
         active = docs.back().get();
         return active;
     }
-    void reveal(Document&, uint64_t, uint64_t) override { ++reveals; }
+    // Like the app's reveal_range when `app_like`: the position being left goes onto `nav`
+    // (Back / Forward), then the range is selected with the caret at its start.
+    bool app_like = false;
+    NavHistory nav;
+    void reveal(Document& d, uint64_t off, uint64_t len) override {
+        ++reveals;
+        if (!app_like) return;
+        ViewState& v = d.view();
+        const NavEntry from{v.sel_begin(), v.sel_len()};
+        v.cursor = off;
+        v.anchor = off + len;
+        if (NavEntry{v.sel_begin(), v.sel_len()} != from) nav.push(from);
+    }
     bool has_view = false;           // doc:view_range(): what the "hex view" shows
     uint64_t view_first = 0, view_last = 0;
     bool view_range(Document&, uint64_t& first, uint64_t& last) override {
@@ -472,6 +491,80 @@ TEST_CASE("Doc API: read, numbers, edits, transaction undo, find") {
     d->set_read_only(true);
     fx.eng.exec("doc:write(0, 'x')");
     CHECK(fx.console_has("document is read-only", ConsoleLine::Error));
+}
+
+TEST_CASE("Doc API: doc:jump / doc:select / doc:select_ranges reveal from the old position (Back works)") {
+    Fixture fx;
+    fx.load("");
+    Document* d = fx.host.add(std::string(100, 'a'));
+    fx.host.app_like = true;
+    d->view().cursor = d->view().anchor = 5;
+    fx.eng.exec("doc:jump(60)");
+    CHECK(d->view().cursor == 60);
+    REQUIRE(fx.host.nav.back_stack().size() == 1);
+    CHECK(fx.host.nav.back_stack().back() == NavEntry{5, 0});  // the jump left 5: Back returns there
+    fx.eng.exec("doc:select(10, 4)");
+    CHECK(d->view().sel_begin() == 10);
+    CHECK(d->view().sel_len() == 4);
+    CHECK(d->view().cursor == 10);  // the host's selection stands (caret at the start, as in the app)
+    REQUIRE(fx.host.nav.back_stack().size() == 2);
+    CHECK(fx.host.nav.back_stack().back() == NavEntry{60, 0});
+    fx.eng.exec("doc:select(10, 4)");  // no move: no entry
+    CHECK(fx.host.nav.back_stack().size() == 2);
+    fx.eng.exec("doc:select_ranges{ {offset=30, length=2}, {50, 1} }");
+    REQUIRE(fx.host.nav.back_stack().size() == 3);
+    CHECK(fx.host.nav.back_stack().back() == NavEntry{10, 4});
+    CHECK(d->view().sel_begin() == 30);
+    CHECK(d->view().extra_sel == std::vector<ByteRange>{{50, 51}});
+    // Back restores the position before the script's last jump.
+    const NavEntry back = fx.host.nav.back(NavEntry{d->view().sel_begin(), d->view().sel_len()});
+    CHECK(back == NavEntry{10, 4});
+    // Without an app (a host that does not select), the script still moves the view itself.
+    fx.host.app_like = false;
+    fx.eng.exec("doc:select(70, 3)");
+    CHECK(d->view().anchor == 70);
+    CHECK(d->view().cursor == 73);
+}
+
+TEST_CASE("Doc API: multi-selection with doc:selections / doc:select_ranges") {
+    Fixture fx;
+    fx.load("");
+    Document* d = fx.host.add(std::string(100, 'a'));
+    fx.eng.exec("return #doc:selections()");
+    CHECK(fx.last_result() == "0");
+    const int reveals = fx.host.reveals;
+    fx.eng.exec("doc:select_ranges{ {offset=40, length=4}, {10, 2}, {offset=12, length=3}, {90, 50} }");
+    CHECK(d->view().sel_begin() == 40);
+    CHECK(d->view().sel_end() == 44);
+    CHECK(d->view().extra_sel == std::vector<ByteRange>{{10, 15}, {90, 100}});  // merged, clamped
+    CHECK(fx.host.reveals == reveals + 1);
+    fx.eng.exec("local t = {} for _, r in ipairs(doc:selections()) do t[#t + 1] = r.offset .. '+' .. r.length end "
+                "return table.concat(t, ' ')");
+    CHECK(fx.last_result() == "\"40+4 10+5 90+10\"");
+
+    // Bad entries raise and leave the selection as it was.
+    fx.eng.exec("doc:select_ranges{ {1, 2}, 'x' }");
+    CHECK(fx.console_has("entry 2 is not a table", ConsoleLine::Error));
+    fx.eng.exec("doc:select_ranges{ {-1, 2} }");
+    CHECK(fx.console_has("non-negative integer", ConsoleLine::Error));
+    fx.eng.exec("local t = {} for i = 1, 100001 do t[i] = {i, 1} end doc:select_ranges(t)");
+    CHECK(fx.console_has("too many ranges", ConsoleLine::Error));
+    CHECK(d->view().extra_sel.size() == 2);
+    // Integral floats are integers, as for doc:select (luaL_checkinteger); 1.5 is not.
+    fx.eng.exec("doc:select_ranges{ {offset = 60 / 2, length = 4 / 2}, {20.0, 1} }");
+    CHECK(d->view().sel_begin() == 30);
+    CHECK(d->view().sel_end() == 32);
+    CHECK(d->view().extra_sel == std::vector<ByteRange>{{20, 21}});
+    fx.eng.exec("doc:select_ranges{ {1.5, 2} }");
+    CHECK(fx.console_has("entry 1 needs a non-negative integer", ConsoleLine::Error));
+    CHECK(d->view().sel_begin() == 30);
+
+    // doc:select is one selection again; {} = only the caret.
+    fx.eng.exec("doc:select(3, 1)");
+    CHECK(d->view().extra_sel.empty());
+    fx.eng.exec("doc:select_ranges{ {5, 1}, {7, 1} } doc:select_ranges{}");
+    CHECK(d->view().extra_sel.empty());
+    CHECK(!d->view().has_selection());
 }
 
 TEST_CASE("Doc API: target kind and pid") {
@@ -2236,4 +2329,439 @@ end }
     CHECK(fx.console_has("no-such-hash", ConsoleLine::Error));
     fx.eng.exec("1 + 1");
     CHECK(fx.last_result() == "2");
+}
+
+// ---- hx.hash_algorithm ----------------------------------------------------------------------------
+
+namespace {
+
+HashJob::Result run_hash_job(HashJob& job, std::shared_ptr<const Snapshot> snap, std::vector<std::string> algos,
+                             std::vector<CustomHashAlgorithm> custom, uint64_t off = 0, uint64_t len = UINT64_MAX) {
+    const uint64_t gen = job.generation();
+    job.start(std::move(snap), off, len, std::move(algos), std::move(custom));
+    const auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == gen) {
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return job.result();
+}
+
+const char* const kHashScript = R"LUA(
+hx.hash_algorithm{ name = "Sum-16", init = function() return 0 end,
+  update = function(s, b) for i = 1, #b do s = s + b:byte(i) end return s & 0xFFFF end,
+  final = function(s) return string.format("%04X", s) end }
+-- state table changed in place (update returns nothing); final with 0x / odd length
+hx.hash_algorithm{ name = "Count bytes", init = function() return { n = 0 } end,
+  update = function(s, b) s.n = s.n + #b end,
+  final = function(s) return string.format("0x%x", s.n) end }
+hx.hash_algorithm{ name = "Broken final", init = function() return 0 end, update = function() end,
+  final = function() return "not hex" end }
+hx.hash_algorithm{ name = "Broken update", init = function() return 0 end,
+  update = function(s, b) if #b > 3 then error("too much data") end return s end,
+  final = function() return "00" end }
+)LUA";
+
+}  // namespace
+
+TEST_CASE("hx.hash_algorithm: hx.hash, doc:hash, hx.hash_algorithms, errors") {
+    Fixture fx;
+    fx.load(kHashScript);
+    REQUIRE(fx.errors() == 0);
+    REQUIRE(fx.eng.hash_algorithms().size() == 4);
+    CHECK(fx.eng.hash_algorithms()[0].name == "Sum-16");
+    CHECK(fx.eng.hash_algorithms()[0].file.find("test.lua") != std::string::npos);
+    std::string data(70000, '\0');
+    for (size_t i = 0; i < data.size(); ++i) data[i] = char(i * 7 + 1);
+    uint32_t sum = 0;
+    for (unsigned char c : data) sum = (sum + c) & 0xFFFF;
+    char want[16];
+    std::snprintf(want, sizeof want, "\"%04x\"", unsigned(sum));
+    fx.host.add(data);
+
+    fx.eng.exec("hx.hash('sum16', doc:read(0, doc:size()))");  // case / punctuation ignored, lowercase result
+    CHECK(fx.last_result() == want);
+    fx.eng.exec("doc:hash('Sum-16')");
+    CHECK(fx.last_result() == want);
+    fx.eng.exec("doc:hash('Count bytes', 10, 5)");
+    CHECK(fx.last_result() == "\"05\"");  // "0x5": odd length padded
+    fx.eng.exec("local t = hx.hash_algorithms() return #t .. ' ' .. t[#t - 3] .. ' ' .. t[#t]");
+    CHECK(fx.last_result() == "\"20 Sum-16 Broken update\"");
+    CHECK(fx.errors() == 0);
+    fx.eng.exec("doc:hash('Broken final')");
+    CHECK(fx.console_has("final() must return the digest as a hex string", ConsoleLine::Error));
+    fx.eng.exec("hx.hash('Broken update', 'abcd')");
+    CHECK(fx.console_has("too much data", ConsoleLine::Error));
+    fx.eng.exec("hx.hash('Broken update', 'abc')");
+    CHECK(fx.last_result() == "\"00\"");
+
+    // Registration errors; a later registration replaces the earlier one in place.
+    const int before = fx.errors();
+    fx.eng.exec("hx.hash_algorithm{ name = 'crc-32', init = print, update = print, final = print }");
+    CHECK(fx.console_has("is a built-in algorithm", ConsoleLine::Error));
+    fx.eng.exec("hx.hash_algorithm{ name = 'a,b', init = print, update = print, final = print }");
+    CHECK(fx.console_has("must not contain ','", ConsoleLine::Error));
+    fx.eng.exec("hx.hash_algorithm{ name = 'x', init = print, update = print }");
+    CHECK(fx.console_has("'final' (function) is required", ConsoleLine::Error));
+    CHECK(fx.errors() > before);
+    const uint64_t g = fx.eng.hash_algorithms_generation();
+    fx.eng.exec("hx.hash_algorithm{ name = 'SUM 16', init = function() return 1 end, update = function() end, "
+                "final = function() return 'ab' end }");
+    CHECK(fx.eng.hash_algorithms_generation() != g);
+    CHECK(fx.eng.hash_algorithms().size() == 4);
+    CHECK(fx.eng.hash_algorithms()[0].name == "SUM 16");
+    CHECK(fx.eng.hash_algorithms()[0].file == "<console>");
+    fx.eng.exec("hx.hash('Sum-16', 'xyz')");
+    CHECK(fx.last_result() == "\"ab\"");
+    // A reload forgets console definitions.
+    fx.eng.reload();
+    CHECK(fx.eng.hash_algorithms()[0].name == "Sum-16");
+}
+
+TEST_CASE("hx.hash_algorithm: HashJob runs script algorithms in Lua states of their own") {
+    Fixture fx;
+    fx.load(kHashScript);
+    REQUIRE(fx.errors() == 0);
+    std::string data((size_t(9) << 20) + 3, '\0');
+    for (size_t i = 0; i < data.size(); ++i) data[i] = char((i * 131) >> 3);
+    Document* d = fx.host.add(data);
+    fx.eng.exec("doc:hash('Sum-16')");
+    const std::string want = fx.last_result();
+    fx.eng.exec("doc:hash('Count bytes', 1)");
+    const std::string want_count = fx.last_result();
+    fx.eng.exec("doc:hash('Sum-16', 1)");
+    const std::string want_from1 = fx.last_result();
+
+    std::vector<CustomHashAlgorithm> custom = fx.eng.custom_hashes();
+    REQUIRE(custom.size() == 4);
+    HashJob job;
+    HashJob::Result r = run_hash_job(job, d->snapshot(), {"CRC-32"}, custom, 1);
+    REQUIRE(r.values.size() == 5);
+    CHECK(r.values[0].algo == "CRC-32");
+    CHECK(r.values[1].algo == "Sum-16");
+    CHECK("\"" + r.values[1].hex + "\"" == want_from1);
+    CHECK("\"" + r.values[2].hex + "\"" == want_count);
+    CHECK(r.values[3].hex.empty());
+    CHECK(r.values[3].error.find("final() must return the digest") != std::string::npos);
+    CHECK(r.values[4].hex.empty());
+    CHECK(r.values[4].error.find("too much data") != std::string::npos);
+    CHECK(r.values[4].error.find("test.lua") != std::string::npos);  // file:line of the script
+    r = run_hash_job(job, d->snapshot(), {}, {custom[0]});
+    REQUIRE(r.values.size() == 1);
+    CHECK("\"" + r.values[0].hex + "\"" == want);
+
+    // A console definition cannot be rebuilt on the worker: its value is an error.
+    fx.eng.exec("hx.hash_algorithm{ name = 'Typed in', init = function() return 0 end, update = function() end, "
+                "final = function() return '01' end }");
+    custom = fx.eng.custom_hashes();
+    REQUIRE(custom.size() == 5);
+    r = run_hash_job(job, d->snapshot(), {}, {custom[4]});
+    REQUIRE(r.values.size() == 1);
+    CHECK(r.values[0].error.find("defined in the console") != std::string::npos);
+    // A script that needs another script's global at load time does not load on its own.
+    fx.dir.write("b.lua", "assert(hx_from_a) hx.hash_algorithm{ name = 'Needs A', init = function() return 0 end, "
+                          "update = function() end, final = function() return '01' end }");
+    fx.dir.write("a.lua", "hx_from_a = true");
+    fx.eng.reload();
+    REQUIRE(fx.errors() == 0);
+    custom = fx.eng.custom_hashes();
+    const CustomHashAlgorithm* needs = nullptr;
+    for (const auto& c : custom)
+        if (c.name == "Needs A") needs = &c;
+    REQUIRE(needs);
+    r = run_hash_job(job, d->snapshot(), {}, {*needs});
+    REQUIRE(r.values.size() == 1);
+    CHECK(r.values[0].error.find("does not load on its own") != std::string::npos);
+}
+
+TEST_CASE("hx.hash_algorithm: cancelling a slow Lua hash stops it inside update()") {
+    Fixture fx;
+    fx.load("hx.hash_algorithm{ name = 'Slow', init = function() return 0 end, "
+            "update = function(s, b) while true do s = s + 1 end end, final = function() return '00' end }");
+    REQUIRE(fx.errors() == 0);
+    const std::string data(1000, 'x');
+    Document* d = fx.host.add(data);
+    HashJob job;
+    const uint64_t gen = job.generation();
+    job.start(d->snapshot(), 0, UINT64_MAX, {}, fx.eng.custom_hashes());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(job.running());
+    const auto t0 = std::chrono::steady_clock::now();
+    job.cancel();
+    while (job.generation() == gen) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));  // not the 10 s time limit
+    CHECK(job.result().cancelled);
+}
+
+TEST_CASE("examples: Adler-32 (Lua) equals the built-in Adler-32") {
+    Examples fx;
+    REQUIRE(fx.errors() == 0);
+    std::string data((size_t(5) << 20) + 999, '\0');
+    std::mt19937 rng(3);
+    for (char& c : data) c = char(rng());
+    Document* d = fx.host.add(data);
+    fx.eng.exec("hx.hash('Adler-32 (Lua)', '123456789') == hx.hash('adler32', '123456789') and "
+                "hx.hash('Adler-32 (Lua)', '') == hx.hash('adler32', '')");
+    CHECK(fx.last_result() == "true");
+    fx.eng.exec("doc:hash('Adler-32 (Lua)', 100) == doc:hash('Adler-32', 100)");
+    CHECK(fx.last_result() == "true");
+    fx.eng.exec("hx.hash('Adler-32 (Lua)', '123456789')");
+    CHECK(fx.last_result() == "\"091e01de\"");
+    const CustomHashAlgorithm* adler = nullptr;
+    const std::vector<CustomHashAlgorithm> custom = fx.eng.custom_hashes();
+    for (const auto& c : custom)
+        if (c.name == "Adler-32 (Lua)") adler = &c;
+    REQUIRE(adler);
+    HashJob job;
+    const HashJob::Result r = run_hash_job(job, d->snapshot(), {"Adler-32"}, {*adler}, 7);
+    REQUIRE(r.values.size() == 2);
+    CHECK(r.values[1].error.empty());
+    CHECK(r.values[0].hex == r.values[1].hex);
+}
+
+// ---- doc:apply_transform + multi-byte ADD keys --------------------------------------------------
+
+TEST_CASE("doc:apply_transform: xor / add / sub / rol / ror, one undo step, range and errors") {
+    Fixture fx;
+    fx.load("");
+    Document* d = fx.host.add("0123456789abcdef");
+    fx.eng.exec("doc:apply_transform{ op = 'xor', key = 0x20, start = 10, length = 6 }");
+    CHECK(bytes_of(*d) == "0123456789ABCDEF");
+    CHECK(d->undo_stack().size() == 1);
+    CHECK(d->undo_stack().back().label == "Encode XOR 0x20");
+    // A multi-byte key follows the absolute convention: byte x gets key[x % #key].
+    fx.eng.exec("doc:apply_transform{ op = 'add', key = '\\1\\2', start = 1, length = 3, label = 'Mine' }");
+    CHECK(bytes_of(*d) == "0335456789ABCDEF");  // '1'+2, '2'+1, '3'+2
+    CHECK(d->undo_stack().back().label == "Mine");
+    fx.eng.exec("doc:apply_transform{ op = 'add_key', key = '\\1\\2', start = 1, length = 3, decode = true }");
+    CHECK(bytes_of(*d) == "0123456789ABCDEF");
+    CHECK(d->undo_stack().back().label == "Decode ADD key 01 02");
+    // Without start / length: the selection. phase overrides the absolute convention.
+    fx.eng.exec("doc:select(4, 6)");
+    fx.eng.exec("doc:apply_transform{ op = 'sub', key = '\\1\\2', phase = 0 }");
+    CHECK(bytes_of(*d) == "0123335577ABCDEF");
+    fx.eng.exec("doc:apply_transform{ op = 'rol', key = 1, start = 0, length = 1 }");
+    CHECK(uint8_t(bytes_of(*d)[0]) == uint8_t('0' << 1));
+    fx.eng.exec("doc:apply_transform{ op = 'ror', key = 1, start = 0, length = 1 }");
+    fx.eng.exec("doc:apply_transform{ op = 'rol', key = 1, start = 1, length = 1, decode = true }");  // = ror
+    CHECK(uint8_t(bytes_of(*d)[0]) == uint8_t('0'));
+    CHECK(uint8_t(bytes_of(*d)[1]) == uint8_t(0x98));  // '1' = 0x31 rotated right
+    CHECK(fx.errors() == 0);
+    const size_t steps = d->undo_stack().size();
+    CHECK(steps == 7);
+    // Inside a command the transform is part of the command's step, under its label.
+    fx.load("hx.command{ name = 'twice', run = function(doc) "
+            "doc:apply_transform{ op = 'xor', key = 'K', start = 0, length = 2 } "
+            "doc:apply_transform{ op = 'xor', key = 'K', start = 0, length = 2 } end }");
+    const std::string before = bytes_of(*d);
+    fx.eng.run_command("twice");
+    CHECK(fx.errors() == 0);
+    CHECK(bytes_of(*d) == before);
+    CHECK(d->undo_stack().size() == steps + 1);
+    CHECK(d->undo_stack().back().label == "Script: twice");
+
+    // Errors.
+    fx.eng.exec("doc:select(0, 0)");
+    const char* bad[][2] = {
+        {"doc:apply_transform{ op = 'xor', key = 1 }", "nothing selected (pass start / length)"},
+        {"doc:apply_transform{ op = 'nand', key = 1, start = 0 }", "op must be"},
+        {"doc:apply_transform{ op = 'xor', start = 0 }", "key (a string of key bytes or a byte value) is required"},
+        {"doc:apply_transform{ op = 'xor', key = '', start = 0 }", "key must be 1..4096 bytes"},
+        {"doc:apply_transform{ op = 'add', key = 256, start = 0 }", "numeric key must be 0..255"},
+        {"doc:apply_transform{ op = 'rol', key = 8, start = 0 }", "must be 1..7 bits"},
+        {"doc:apply_transform{ op = 'rol', key = 'ab', start = 0 }", "bit count"},
+        {"doc:apply_transform{ op = 'xor', key = 1, start = 100 }", "doc:apply_transform: nothing selected"},
+        {"doc:apply_transform{ op = 'xor', key = 1, start = -1 }", "start must be >= 0"},
+        {"doc:apply_transform{ op = 'xor', key = 1, start = 0, length = -5 }", "length must be >= 0"},
+        {"doc:apply_transform{ op = 'xor', key = 'ab', start = 0, length = 2, phase = -1 }", "phase must be >= 0"},
+    };
+    for (const auto& b : bad) {
+        INFO(b[0]);
+        const int n = fx.errors();
+        fx.eng.exec(b[0]);
+        CHECK(fx.errors() > n);
+        CHECK(fx.console_has(b[1], ConsoleLine::Error));
+    }
+    d->set_read_only(true);
+    fx.eng.exec("doc:apply_transform{ op = 'xor', key = 1, start = 0 }");
+    CHECK(fx.console_has("doc:apply_transform: the document is read-only", ConsoleLine::Error));
+    CHECK(d->undo_stack().size() == steps + 1);
+}
+
+TEST_CASE("hx.xor_scan add_multi, hx.xor_guess_key op = add, decode a hit with doc:apply_transform") {
+    Fixture fx;
+    fx.load("");
+    std::string data(300, '\x11');
+    const std::string text = "This is a known plaintext", key = "K3y";
+    for (size_t i = 0; i < text.size(); ++i) data[101 + i] = char(uint8_t(text[i]) + uint8_t(key[(101 + i) % 3]));
+    Document* d = fx.host.add(data);
+    fx.eng.exec("#hx.xor_scan(doc, 'This is a known', { xor = false, add = false, rol = false, multi = true })");
+    CHECK(fx.last_result() == "0");
+    fx.eng.exec("local h = hx.xor_scan(doc, 'This is a known', { xor = false, add = false, rol = false, "
+                "add_multi = true }) return #h .. ' ' .. h[1].offset .. ' ' .. h[1].transform .. ' ' .. h[1].key .. "
+                "' ' .. h[1].phase .. ' ' .. h[1].text");
+    CHECK(fx.last_result() == R"("1 101 add_key K3y 2 ADD key 4B 33 79 \"K3y\"")");
+    fx.eng.exec("local h = hx.xor_scan(doc, 'This is a known', { add_multi = true })[1] "
+                "doc:apply_transform{ op = h.transform, key = h.key, start = h.offset, length = 25, decode = true }");
+    CHECK(fx.errors() == 0);
+    CHECK(bytes_of(*d).substr(101, text.size()) == text);
+    CHECK(d->undo_stack().size() == 1);
+
+    // Key guess: spaces ADDed with "ab" (with a carry, so the XOR guess is another key).
+    std::string sp(256, ' ');
+    for (size_t i = 0; i < sp.size(); ++i) sp[i] = char(' ' + (i % 2 ? 'b' : 'a'));
+    fx.host.add(sp);
+    fx.eng.exec("hx.xor_guess_key(doc, 1, 255, { plain = ' ', op = 'add' })[1].key");
+    CHECK(fx.last_result() == "\"ab\"");
+    fx.eng.exec("hx.xor_guess_key(doc, 1, 255, { plain = ' ' })[1].key == 'ab'");
+    CHECK(fx.last_result() == "false");
+    fx.eng.exec("hx.xor_guess_key(doc, 0, 4, { op = 'mul' })");
+    CHECK(fx.console_has("op must be \"xor\" or \"add\"", ConsoleLine::Error));
+}
+
+TEST_CASE("doc:apply_transform decodes a ROL hit of hx.xor_scan with its key string (the bit count)") {
+    Fixture fx;
+    fx.load("");
+    std::string data(64, '\0');
+    const std::string text = "Rotated plaintext";
+    for (size_t i = 0; i < text.size(); ++i) {
+        const uint8_t c = uint8_t(text[i]);
+        data[20 + i] = char(uint8_t((c << 3) | (c >> 5)));  // ROL 3
+    }
+    Document* d = fx.host.add(data);
+    fx.eng.exec("local h = hx.xor_scan(doc, 'Rotated plain', { xor = false, add = false })[1] "
+                "return h.transform .. ' ' .. #h.key .. ' ' .. h.key:byte()");
+    CHECK(fx.last_result() == "\"rol 1 3\"");
+    // The documented recipe: { op = h.transform, key = h.key, ... , decode = true }.
+    fx.eng.exec("local h = hx.xor_scan(doc, 'Rotated plain', { xor = false, add = false })[1] "
+                "doc:apply_transform{ op = h.transform, key = h.key, start = h.offset, length = 17, decode = true }");
+    CHECK(fx.errors() == 0);
+    CHECK(bytes_of(*d).substr(20, text.size()) == text);
+    CHECK(d->undo_stack().size() == 1);
+    // A longer string is still not a bit count.
+    fx.eng.exec("doc:apply_transform{ op = 'ror', key = '\\3\\3', start = 0, length = 1 }");
+    CHECK(fx.console_has("bit count", ConsoleLine::Error));
+    CHECK(d->undo_stack().size() == 1);
+}
+
+TEST_CASE("doc:packets: index entries, filter, paging, not a capture, errors") {
+    Fixture fx;
+    fx.load("");
+    std::vector<pcapfx::Bytes> f;
+    f.push_back(pcapfx::udp_frame("10.0.0.5", 5353, "10.0.0.9", 53, pcapfx::str("ask"), 7));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 100, 0, pcapfx::SYN));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 101, 1, pcapfx::PSH | pcapfx::ACK,
+                                  pcapfx::str("GET /")));
+    f.push_back(pcapfx::arp_frame());
+    for (int i = 0; i < 20; ++i) f.push_back(pcapfx::udp_frame("10.0.0.3", 4000, "10.0.0.4", 53, pcapfx::str("x")));
+    const pcapfx::Bytes cap = pcapfx::pcapng_file(f);
+    Document* d = fx.host.open_bytes("cap.pcapng", cap.data(), cap.size());
+    PcapIndexResult ix;
+    index_pcap(*d->snapshot(), ix);
+    REQUIRE(ix.packets.size() == 24);
+    auto run = [&](const std::string& lua) {
+        fx.eng.exec(lua);
+        return fx.last_result();
+    };
+    CHECK(run("local l, nx = doc:packets() return #l .. ' ' .. tostring(nx)") == "\"24 nil\"");
+    // A UDP packet with a VLAN tag
+    const Packet& p0 = ix.packets[0];
+    CHECK(run("local p = doc:packets()[1] return p.number .. ' ' .. p.offset .. ' ' .. p.data .. ' ' .. p.length .. ' ' "
+              ".. p.wire_length .. ' ' .. p.interface .. ' ' .. p.linktype") ==
+          "\"1 " + std::to_string(p0.record_off) + " " + std::to_string(p0.data_off) + " " +
+              std::to_string(p0.cap_len) + " " + std::to_string(p0.orig_len) + " 0 1\"");
+    CHECK(run("local p = doc:packets()[1] return p.proto .. '|' .. p.src .. '|' .. p.dst .. '|' .. p.info") ==
+          "\"UDP|10.0.0.5:5353|10.0.0.9:53|len=3 (VLAN 7)\"");
+    CHECK(run("local p = doc:packets()[1] return p.vlan .. ' ' .. p.ip_version .. ' ' .. p.ip_proto .. ' ' .. "
+              "p.src_port .. ' ' .. p.dst_port .. ' ' .. tostring(p.tcp_flags) .. ' ' .. tostring(p.fragment)") ==
+          "\"7 4 17 5353 53 nil nil\"");
+    CHECK(run("local p = doc:packets()[1] return doc:read(p.payload, p.payload_length)") == "\"ask\"");
+    CHECK(run("local p = doc:packets()[1] return p.time_ns .. ' ' .. p.time") == "\"0 0.0\"");
+    CHECK(run("return doc:packets()[1].summary") == "\"10.0.0.5:5353 -> 10.0.0.9:53  len=3 (VLAN 7)\"");
+    // TCP fields
+    CHECK(run("local p = doc:packets()[3] return p.tcp_seq .. ' ' .. p.tcp_ack .. ' ' .. p.tcp_flags .. ' ' .. "
+              "doc:read(p.payload, p.payload_length)") == "\"101 1 24 GET /\"");
+    CHECK(run("local p = doc:packets()[4] return p.proto .. ' ' .. tostring(p.ip_version) .. ' ' .. "
+              "tostring(p.src_port) .. ' ' .. p.payload_length") == "\"ARP nil nil 28\"");
+    // filter
+    CHECK(run("local l = doc:packets{ filter = 'tcp' } return #l .. ' ' .. l[1].number .. ' ' .. l[2].number") ==
+          "\"2 2 3\"");
+    CHECK(run("local l = doc:packets{ filter = 'tcp.flags.syn or vlan == 7' } return #l .. ' ' .. l[1].number .. ' ' "
+              ".. l[2].number") == "\"2 1 2\"");
+    CHECK(run("return #doc:packets{ filter = 'udp.dstport == 53 and frame.number > 20' }") == "4");
+    CHECK(run("return #doc:packets{ filter = '\"PSH\"' }") == "1");  // "text": Proto / Summary
+    CHECK(run("return #doc:packets{ filter = 'icmp' }") == "0");
+    // paging: first / max, the second result is where to continue
+    CHECK(run("local l, nx = doc:packets{ max = 5 } return #l .. ' ' .. l[5].number .. ' ' .. nx") == "\"5 5 6\"");
+    CHECK(run("local l, nx = doc:packets{ first = 6, max = 5 } return l[1].number .. ' ' .. nx") == "\"6 11\"");
+    CHECK(run("local l, nx = doc:packets{ first = 20 } return #l .. ' ' .. tostring(nx)") == "\"5 nil\"");
+    CHECK(run("local l, nx = doc:packets{ first = 24, max = 1 } return #l .. ' ' .. tostring(nx)") == "\"1 nil\"");
+    CHECK(run("return #doc:packets{ first = 1000 }") == "0");
+    CHECK(run("local l, nx = doc:packets{ filter = 'udp', max = 2 } return l[2].number .. ' ' .. nx") == "\"5 6\"");
+    CHECK(run("local l, nx = doc:packets{ filter = 'udp', first = 6, max = 100 } return #l .. ' ' .. tostring(nx)") ==
+          "\"19 nil\"");
+    // errors
+    fx.eng.exec("doc:packets{ filter = 'tcp.port ==' }");
+    CHECK(fx.console_has("doc:packets: filter: expected a value after '==' (column 12)", ConsoleLine::Error));
+    fx.eng.exec("doc:packets{ max = 0 }");
+    CHECK(fx.console_has("max must be 1..1000000", ConsoleLine::Error));
+    fx.eng.exec("doc:packets{ first = 0 }");
+    CHECK(fx.console_has("first must be >= 1", ConsoleLine::Error));
+    fx.eng.exec("doc:packets{ filter = 5 }");
+    CHECK(fx.console_has("option 'filter' must be a string", ConsoleLine::Error));
+    fx.eng.exec("doc:packets(3)");
+    CHECK(fx.console_has("table expected", ConsoleLine::Error));
+    // not a capture: nil + message
+    fx.host.add("just some bytes, not a capture");
+    CHECK(run("local l, e = doc:packets() return tostring(l) .. ' ' .. e") == "\"nil not a pcap / pcapng capture\"");
+}
+
+TEST_CASE("doc:packets: a capture bigger than one index chunk; a truncated last record") {
+    Fixture fx;
+    fx.load("");
+    std::vector<pcapfx::Bytes> f;
+    for (int i = 0; i < 70000; ++i)
+        f.push_back(i % 7 ? pcapfx::arp_frame() : pcapfx::udp_frame("10.0.0.1", 1, "10.0.0.2", 2, pcapfx::str("u")));
+    pcapfx::Bytes cap = pcapfx::pcap_file(f);
+    cap.resize(cap.size() - 10);  // the last record is cut short: the packets before it count
+    fx.host.open_bytes("big.pcap", cap.data(), cap.size());
+    fx.eng.exec("local l, nx = doc:packets{ filter = 'frame.number >= 69990', max = 1000000 } "
+                "return #l .. ' ' .. l[1].number .. ' ' .. tostring(nx)");
+    CHECK(fx.last_result() == "\"10 69990 nil\"");
+    fx.eng.exec("local l, nx = doc:packets{ filter = 'udp', max = 3, first = 65530 } return l[1].number .. ' ' .. "
+                "l[3].number .. ' ' .. nx");
+    CHECK(fx.last_result() == "\"65535 65549 65550\"");
+}
+
+TEST_CASE("examples: Capture commands (packets.lua)") {
+    Examples fx;
+    std::vector<pcapfx::Bytes> f;
+    f.push_back(pcapfx::udp_frame("10.0.0.5", 5353, "10.0.0.9", 53, pcapfx::str("ask")));
+    f.push_back(pcapfx::tcp_frame("10.0.0.1", 51000, "10.0.0.2", 80, 101, 1, pcapfx::PSH | pcapfx::ACK,
+                                  pcapfx::str("GET /")));
+    f.push_back(pcapfx::udp_frame("10.0.0.9", 53, "10.0.0.5", 5353, pcapfx::str("reply")));
+    const pcapfx::Bytes cap = pcapfx::pcap_file(f);
+    Document* d = fx.host.open_bytes("cap.pcap", cap.data(), cap.size());
+    const int errors = fx.errors();
+    fx.eng.run_command("Capture: Protocol Summary");
+    CHECK(fx.errors() == errors);
+    CHECK(fx.console_has("3 packets"));
+    CHECK(fx.console_has("UDP        2"));
+    fx.eng.run_command("Capture: Bookmark Matching Packets...");
+    REQUIRE(fx.eng.pending_prompt());
+    const std::string filter = "udp";
+    fx.eng.answer_prompt(&filter);
+    CHECK(fx.errors() == errors);
+    REQUIRE(d->view().bookmarks.size() == 2);
+    CHECK(d->view().bookmarks[0].name == "#1 UDP");
+    CHECK(d->view().bookmarks[1].length == 5);
+    CHECK(fx.console_has("2 bookmarks (2 packets matched)"));
+    CHECK(d->undo());  // one step
+    CHECK(d->view().bookmarks.empty());
+    // A bad filter is a warning, not an error.
+    fx.eng.run_command("Capture: Bookmark Matching Packets...");
+    const std::string bad = "udp.port ==";
+    fx.eng.answer_prompt(&bad);
+    CHECK(fx.errors() == errors);
+    CHECK(fx.console_has("doc:packets: filter: expected a value", ConsoleLine::Warn));
 }

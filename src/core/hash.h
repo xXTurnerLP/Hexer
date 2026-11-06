@@ -11,9 +11,13 @@
 //     of their width (CRC-32 of "123456789" -> CB F4 39 26), MD5/SHA as their byte string.
 //   * HashJob: several algorithms over a Snapshot range in one pass on a worker thread (4 MiB
 //     reads), with progress / cancel / generation like SearchJob. Never loads the whole range.
+//   * Custom algorithms (CustomHashAlgorithm; scripts: hx.hash_algorithm) come from outside core:
+//     a factory HashJob calls on its worker, whose Hasher may fail (Hasher::error, e.g. a script
+//     error): that value then has an error instead of a digest.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,6 +35,17 @@ public:
     virtual void init() = 0;                                  // back to the empty-input state
     virtual void update(const uint8_t* data, size_t len) = 0;
     virtual std::vector<uint8_t> finish() = 0;                // digest; call init() before reusing
+    // Non-empty once the hasher failed (custom algorithms: a script error); finish() is then
+    // meaningless. Built-ins never fail.
+    virtual std::string error() const { return {}; }
+};
+
+// An algorithm defined outside core (scripts: hx.hash_algorithm). `create` is called on the
+// HashJob worker thread with the run's cancel flag (it may take a while, e.g. load a script) and
+// returns an initialised Hasher (never null; one that cannot work reports it through error()).
+struct CustomHashAlgorithm {
+    std::string name;          // display name; distinct from the built-ins (hash_name_key)
+    std::function<std::unique_ptr<Hasher>(const std::atomic<bool>* cancel)> create;
 };
 
 struct HashAlgorithm {
@@ -44,6 +59,8 @@ struct HashAlgorithm {
 // CRC-32C (Castagnoli), Adler-32, Fletcher-16, FNV-1a/32, FNV-1a/64, MD5, SHA-1, SHA-256, SHA-512.
 const std::vector<HashAlgorithm>& hash_algorithms();
 const HashAlgorithm* find_hash_algorithm(const std::string& name);  // nullptr if unknown
+// The lookup key of a name: lowercase letters and digits only ("CRC-32" -> "crc32").
+std::string hash_name_key(const std::string& name);
 std::unique_ptr<Hasher> make_hasher(const std::string& name);       // nullptr if unknown
 
 std::string to_hex(const std::vector<uint8_t>& bytes, bool uppercase = false);
@@ -79,18 +96,19 @@ class HashJob {
 public:
     ~HashJob();
 
-    // Hashes [offset, offset + length) (clamped to the snapshot) with every named algorithm in one
-    // pass. Unknown names are skipped.
+    // Hashes [offset, offset + length) (clamped to the snapshot) with every named algorithm, then
+    // every custom one, in one pass. Unknown names are skipped.
     void start(std::shared_ptr<const Snapshot> snap, uint64_t offset, uint64_t length,
-               std::vector<std::string> algos);
+               std::vector<std::string> algos, std::vector<CustomHashAlgorithm> custom = {});
     void cancel();                 // non-blocking request
     bool running() const;
     double progress() const;       // 0..1
     uint64_t generation() const;   // increments every time a run finishes (poll to detect completion)
 
     struct Value {
-        std::string algo;          // display name (HashAlgorithm::name)
-        std::string hex;           // lowercase digest
+        std::string algo;          // display name (HashAlgorithm::name / CustomHashAlgorithm::name)
+        std::string hex;           // lowercase digest ("" when error is set)
+        std::string error;         // a custom algorithm failed (Hasher::error)
     };
     struct Result {
         uint64_t offset = 0, length = 0;  // the range actually hashed (after clamping)

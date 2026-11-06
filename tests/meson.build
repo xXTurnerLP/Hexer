@@ -35,7 +35,7 @@ test_panels = executable('test_panels', 'test_panels.cpp', test_main,
 test('panels', test_panels, timeout : 300)
 
 # Feature suites (one exe each so features can be built/tested independently).
-foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail', 'history', 'xorscan', 'session', 'symbols']
+foreach t : ['nav', 'strings', 'hash', 'entropy', 'bitmap', 'diff', 'pcap', 'tail', 'history', 'xorscan', 'session', 'symbols', 'multisel']
   exe = executable('test_' + t, 'test_' + t + '.cpp', test_main,
     dependencies : [core_dep, doctest_dep], cpp_args : conf_args)
   test(t, exe, timeout : 300)
@@ -70,3 +70,11 @@ test('parsejob', test_parsejob, timeout : 300)
 test_disasm = executable('test_disasm', 'test_disasm.cpp', test_main,
   dependencies : [script_dep, ui_view_dep, doctest_dep], cpp_args : conf_args)
 test('disasm', test_disasm, timeout : 300)
+
+# Headless App (ui/app.cpp + panels.cpp, no window / GL; ui/app_internal.h app_startup / app_frame):
+# session round trips of tabs / split / tail / Parse at / Compare, History and XOR panel actions.
+test_app = executable('test_app', 'test_app.cpp', test_main,
+  link_with : ui_lib,
+  dependencies : [script_dep, ui_view_dep, imgui_dep, glfw_dep, nfd_dep, doctest_dep] + sys_deps,
+  cpp_args : conf_args)
+test('app', test_app, timeout : 300)

@@ -29,6 +29,9 @@
 //   * endianness: CStructOptions::big_endian, overridden per struct by an annotation comment
 //     `// @be` or `// @le` on the line(s) right before `struct` / `union` / `typedef`, or right
 //     after the struct's `{`. Nested unnamed structs inherit the enclosing struct's endianness.
+//     One member: an annotation comment on the member's own line before its type
+//     (`/* @be */ int16_t x;`, also enum members and bit fields: a unit takes its first
+//     member's) overrides the struct's for it; `__be32` / `__le16` ... types do the same.
 //   * comments, `#define NAME <constant expression>`; other preprocessor lines are ignored.
 #include <cstdint>
 #include <string>

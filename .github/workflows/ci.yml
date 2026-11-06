@@ -182,11 +182,20 @@ jobs:
           if-no-files-found: error
 
   # Linux packages, built on the oldest supported runner (glibc 2.35) so they run on older distros:
-  # an AppImage and a plain tar.gz. File dialogs use xdg-desktop-portal (D-Bus) instead of GTK, so
-  # no GTK gets bundled; libstdc++ / libgcc are linked statically.
+  # an AppImage and a plain tar.gz, for x86_64 and aarch64 (GitHub's arm64 runner). File dialogs
+  # use xdg-desktop-portal (D-Bus) instead of GTK, so no GTK gets bundled; libstdc++ / libgcc are
+  # linked statically. The aarch64 leg may fail without failing the workflow until it has passed
+  # on CI once (TODO.md).
   package-linux:
-    name: linux-package
-    runs-on: ubuntu-22.04
+    name: linux-package-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  os: ubuntu-22.04,     experimental: false }
+          - { arch: aarch64, os: ubuntu-22.04-arm, experimental: true }
     defaults:
       run:
         shell: bash
@@ -205,7 +214,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential g++-12 pkg-config \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
-            libgl-dev libdbus-1-dev xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl-mesa0
+            libgl-dev libdbus-1-dev xvfb xauth libgl1-mesa-dri libglx-mesa0 libegl-mesa0 appstream
 
       - name: Cache subproject downloads
         uses: actions/cache@v5
@@ -245,40 +254,51 @@ jobs:
           fi
           exit $rc
 
-      # tar.gz: hexer-linux-x86_64/{hexer, scripts/, README.md, hexer.desktop, hexer.png}.
-      # AppImage: the meson install tree (usr/bin/hexer + usr/bin/scripts, desktop file, icons).
-      # Both find their bundled scripts next to the binary (/proc/self/exe).
+      # tar.gz: hexer-linux-ARCH/{hexer, scripts/, README.md, hexer.desktop, hexer.png}.
+      # AppImage: the meson install tree (usr/bin/hexer + usr/bin/scripts, desktop file, icons,
+      # AppStream metainfo in usr/share/metainfo). Both find their bundled scripts next to the
+      # binary (/proc/self/exe). The metainfo check only warns (also without appstreamcli).
       - name: Package
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           meson install -C build --strip --destdir "$PWD/AppDir"
-          d=dist/hexer-linux-x86_64
+          for m in AppDir/usr/share/metainfo/*.metainfo.xml; do
+            if ! command -v appstreamcli > /dev/null; then
+              echo "::warning title=AppStream::appstreamcli not found, $m not validated"
+            elif ! appstreamcli validate --no-net "$m"; then
+              echo "::warning title=AppStream::appstreamcli validate reported problems in $m"
+            fi
+          done
+          d=dist/hexer-linux-$ARCH
           rm -rf dist && mkdir -p $d
           cp AppDir/usr/bin/hexer README.md assets/hexer.desktop $d/
           cp -r AppDir/usr/bin/scripts $d/
           cp assets/icon/hexer-256.png $d/hexer.png
-          tar -C dist -czf hexer-linux-x86_64.tar.gz hexer-linux-x86_64
-          tar -tzvf hexer-linux-x86_64.tar.gz
+          tar -C dist -czf hexer-linux-$ARCH.tar.gz hexer-linux-$ARCH
+          tar -tzvf hexer-linux-$ARCH.tar.gz
           echo "::notice title=hexer NEEDED::$(readelf -d $d/hexer | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
           curl -fsSL --retry 3 -o linuxdeploy \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-$ARCH.AppImage
           chmod +x linuxdeploy
-          APPIMAGE_EXTRACT_AND_RUN=1 LDAI_OUTPUT=hexer-x86_64.AppImage ./linuxdeploy --appdir AppDir \
+          APPIMAGE_EXTRACT_AND_RUN=1 LDAI_OUTPUT=hexer-$ARCH.AppImage ./linuxdeploy --appdir AppDir \
             --executable AppDir/usr/bin/hexer \
             --desktop-file AppDir/usr/share/applications/hexer.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/hexer.png \
             --output appimage
-          ls -l hexer-x86_64.AppImage hexer-linux-x86_64.tar.gz
+          ls -l hexer-$ARCH.AppImage hexer-linux-$ARCH.tar.gz
 
       - name: Smoke test packages (Xvfb + Mesa)
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
+          ARCH: ${{ matrix.arch }}
         run: |
           xvfb=(xvfb-run -a -s "-screen 0 1600x1000x24")
-          rm -rf pkgtest && mkdir pkgtest && tar -C pkgtest -xzf hexer-linux-x86_64.tar.gz
+          rm -rf pkgtest && mkdir pkgtest && tar -C pkgtest -xzf hexer-linux-$ARCH.tar.gz
           set +e
-          bash .github/ci/smoke-package.sh linux-tar "${xvfb[@]}" pkgtest/hexer-linux-x86_64/hexer
+          bash .github/ci/smoke-package.sh linux-tar "${xvfb[@]}" pkgtest/hexer-linux-$ARCH/hexer
           rc1=$?
-          bash .github/ci/smoke-package.sh appimage "${xvfb[@]}" ./hexer-x86_64.AppImage --appimage-extract-and-run
+          bash .github/ci/smoke-package.sh appimage "${xvfb[@]}" ./hexer-$ARCH.AppImage --appimage-extract-and-run
           rc2=$?
           [ $rc1 -eq 0 ] && [ $rc2 -eq 0 ]
 
@@ -286,7 +306,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: screenshot-linux-package
+          name: screenshot-linux-package-${{ matrix.arch }}
           path: smoke/
           retention-days: 7
           if-no-files-found: ignore
@@ -294,16 +314,16 @@ jobs:
       - name: Upload tar.gz
         uses: actions/upload-artifact@v6
         with:
-          name: hexer-linux-x86_64
-          path: hexer-linux-x86_64.tar.gz
+          name: hexer-linux-${{ matrix.arch }}
+          path: hexer-linux-${{ matrix.arch }}.tar.gz
           retention-days: 7
           if-no-files-found: error
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v6
         with:
-          name: hexer-linux-appimage
-          path: hexer-x86_64.AppImage
+          name: hexer-linux-appimage-${{ matrix.arch }}
+          path: hexer-${{ matrix.arch }}.AppImage
           retention-days: 7
           if-no-files-found: error
 

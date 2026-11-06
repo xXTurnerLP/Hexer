@@ -1,8 +1,8 @@
 #pragma once
 // "XOR Brute Force" panel: finds simply obfuscated copies of a known plaintext (XOR / ADD / ROL with
-// a 1-byte key, XOR with a 2..16 byte key; core/xorscan.h) in the whole file or the selection on a
-// worker thread, guesses XOR keys of zero-heavy (or space-heavy) data from the selection, and
-// decodes the selection with a chosen key as one undoable edit.
+// a 1-byte key, XOR / ADD with a 2..16 byte key; core/xorscan.h) in the whole file or the selection
+// on a worker thread, guesses XOR / ADD keys of zero-heavy (or space-heavy) data from the
+// selection, and decodes the selection with a chosen key as one undoable edit.
 //
 // Self-contained: knows nothing about App; the host passes the active document and callbacks.
 // Results are kept per document (Document::id()); call forget() when a document is closed.
@@ -11,8 +11,8 @@
 //     the current input); presets MZ, PE\0\0, http, This program, \x89PNG.
 //   * Results table Offset | Transform | Key | Decoded (the bytes at the hit decoded with its key).
 //     Click = jump (select the match) and choose its key; right-click: copy offset / key.
-//   * Guess tab: candidate keys of the selection (first 256 KiB) ranked by score, with a preview
-//     of its first 64 bytes decoded; click a candidate to choose it.
+//   * Guess tab: candidate XOR (or ADD) keys of the selection (first 256 KiB) ranked by score, with
+//     a preview of its first 64 bytes decoded; click a candidate to choose it.
 //   * "Decode selection" applies the chosen key to the selection (phase = key index of the
 //     selection start, keys use the absolute-offset convention of core/xorscan.h).
 #include <cstdint>
@@ -52,6 +52,7 @@ struct XorPanel {
     XorScanOptions options;                  // transforms to try (shared by all documents)
     bool selection_only = false;             // scan the selection instead of the whole file
     bool guess_spaces = false;               // key guess assumes ' ' (text) instead of 0x00
+    bool guess_add = false;                  // key guess for ADD keys instead of XOR keys
     ImFont* mono = nullptr;                  // offsets / keys / previews (nullptr = current font)
     float ui_scale = 1.0f;
 

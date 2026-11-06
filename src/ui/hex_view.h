@@ -122,7 +122,12 @@ struct HexViewEvents {
 // insert mode (in overwrite mode it only moves left), mouse click/drag selects (bytes a..b
 // inclusive; a click on the second hex digit puts the caret on the low nibble; a click below the
 // last row or past the last byte puts the caret at EOF), Shift+click extends from the selection's
-// fixed end, double-click selects the highlight (field) under the mouse, Ctrl+hover underlines the
+// fixed end, double-click selects the highlight (field) under the mouse, multi-selection
+// (core/multisel.h, ViewState::extra_sel; extra ranges drawn in a lighter selection tint): Alt+click
+// / Alt+drag selects a new range (byte a..b) and the previous selection joins the extra ranges,
+// Alt+click on a byte of an extra range removes that range (on the primary selection: collapses it
+// to the caret there), a plain click or Esc (claimed only while extras exist) clears the extras,
+// Delete / Backspace with extras delete every range (one undo step), Ctrl+hover underlines the
 // pointer (cfg.pointer_type()) starting at the hovered byte with a tooltip of its type and target
 // (pointer_link_text, e.g. "u16 LE -> 0x1234") and Ctrl+click
 // on a byte reports ev.follow_requested instead of moving the caret (nothing for a pointer that is

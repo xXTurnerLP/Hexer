@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "core/file_source.h"
+#include "core/multisel.h"
 #include "core/os_file.h"
 #include "core/piece_table.h"
 
@@ -99,6 +100,9 @@ struct ViewState {
     uint64_t parse_base = 0;
     uint64_t parse_length = UINT64_MAX;
     std::vector<Bookmark> bookmarks;
+    // Multi-selection (core/multisel.h): extra ranges besides the primary selection, a range set
+    // (sorted, merged). Transient: neither undo entries nor the session keep it.
+    std::vector<ByteRange> extra_sel;
 
     uint64_t sel_begin() const { return anchor < cursor ? anchor : cursor; }
     uint64_t sel_end() const { return anchor < cursor ? cursor : anchor; }
@@ -300,6 +304,12 @@ public:
     // Fill [offset, offset+len) with a repeating pattern without materialising len bytes in RAM
     // beyond one add-buffer chunk (pattern is written once per chunk and pieces reference it).
     bool fill(uint64_t offset, uint64_t len, const uint8_t* pattern, size_t pattern_len);
+    // Multi-selection edit as ONE undo step labelled `label`: every range of `ranges` (sorted,
+    // non-overlapping, non-empty, inside the document) is filled with the repeating pattern, each
+    // from the pattern's first byte, or deleted when pattern_len == 0. One pass over the piece list
+    // (O(pieces + ranges + pieces the fill adds)), however many ranges. The caret is not moved.
+    bool fill_ranges(const std::vector<ByteRange>& ranges, const uint8_t* pattern, size_t pattern_len,
+                     const std::string& label, std::string* err = nullptr);
     // Replaces the whole content with the bytes of the file at `path` (e.g. "Revert to Backup"
     // with backup_path_of(path())) as ONE undo step labelled `label`. O(pieces), nothing is copied:
     // the file becomes an extra read-only source the piece list references (kept open while the
@@ -344,7 +354,9 @@ public:
     // Changes them as ONE cheap undo step labelled `label` ("Read-only on", "Parser: PNG image",
     // "Parse at 0x100"): no piece list, caret or bookmarks are stored (UndoEntry::view_only);
     // undo()/redo() only restore the view options (also on a read-only document); dirty() and
-    // generation() do not change. Inside a group the group's step records them instead. Allowed
+    // generation() do not change. It keeps the redo stack's content steps (undo a few edits, pick
+    // a parser: Redo re-applies the edits and keeps the parser); only undone view steps are
+    // replaced by it. Inside a group the group's step records them instead. Allowed
     // on read-only documents (that is how one leaves read-only); false if busy or nothing changes.
     // Scrolling, caret moves and the other view state are deliberately not undo steps.
     bool set_view_options(const ViewOptions& o, const std::string& label);

@@ -9,7 +9,9 @@
 //     (u24, multi-value p:read) -> uint8_t name[N] with the type in a comment
 //   * enums (opts.enum) -> `enum name_e : uint16_t { ... };` (the {false, true} enum -> bool;
 //     constants the field's type cannot hold become comments)
-//   * opts.flags -> the integer type with the bit names in a comment
+//   * opts.flags -> the integer type with the bit names in a comment, plus a `#define
+//     MEMBER_FLAG 0x...` mask per bit before the struct (upper case, unique in the header)
+//   * 1-byte unsigned numbers with fmt = "char" -> char (wider ones keep their integer type)
 //   * arrays whose elements share one layout -> T name[N] (nested arrays -> T name[N][M]);
 //     other arrays, bytes, LEB128, p:field -> uint8_t name[N]; str -> char name[N]
 //   * opts.bitfield fields -> `uint32_t name : width;` (unnamed `: k` for skipped and trailing
@@ -19,7 +21,9 @@
 //   * `#pragma pack(push, 1)`, a static_assert(sizeof) per struct, offset comments relative to
 //     the struct start, big-endian fields marked BE; a struct whose integers are mostly
 //     big-endian gets the `// @be` annotation core/cstruct.h understands, so the header
-//     converts back into an equivalent parser (C struct -> parser).
+//     converts back into an equivalent parser (C struct -> parser). Mixed byte order: the
+//     struct gets `// @be` / `// @le` for its majority and each minority member (number or
+//     bit-field unit) a `/* @le */` / `/* @be */` before its type (cstruct reads both).
 #include <cstdint>
 #include <string>
 #include <vector>

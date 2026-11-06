@@ -41,14 +41,15 @@ struct ScriptEngine::Impl {
     // Registry refs into the current state.
     std::unordered_map<std::string, int> parser_refs;   // parser name -> spec table
     std::unordered_map<std::string, int> command_refs;  // command name -> run function
+    std::unordered_map<std::string, int> hash_refs;     // hash_name_key(name) -> hx.hash_algorithm spec
     int ref_pack = LUA_NOREF;      // original string.pack / unpack / packsize (immune to user patching)
     int ref_unpack = LUA_NOREF;
     int ref_packsize = LUA_NOREF;
 
     std::string loading_file;      // script currently executed by reload() (for ParserInfo::file)
     // What every script file / run_source chunk ran as at the last reload, keyed like
-    // ParserInfo::file (only those that registered a parser): a ParseJob rebuilds the parser
-    // from it in a Lua state of its own.
+    // ParserInfo::file (only those that registered a parser or a hash algorithm): a ParseJob
+    // rebuilds the parser from it in a Lua state of its own (a background hash: the algorithm).
     struct ScriptText {
         std::string chunk, text;  // chunk name ("@examples/png.lua", "=C struct") + source
     };
@@ -117,6 +118,7 @@ struct ScriptEngine::Impl {
     // Registration from hx.parser / hx.command (a later one with the same name replaces it in place).
     void register_parser(ParserInfo info, int ref);
     void register_command(ScriptCommand cmd, int ref);
+    void register_hash(ScriptHashInfo info, int ref);
     HighlightSet& script_hl(uint64_t doc_id);  // marks it dirty; finalized when the script returns
     void clear_script_hl(uint64_t doc_id);
     void flush_highlights();
@@ -132,6 +134,35 @@ std::string lua_inspect(lua_State* L, int idx, int max_depth = 6);
 // (fields with absolute offsets, highlights, error). Never throws/longjmps.
 void run_parse(ScriptEngine::Impl& im, Document& doc, int parser_ref, ParseResult& out, uint64_t base = 0,
                uint64_t length = UINT64_MAX);
+
+// ---- hx.hash_algorithm (script/lua_hash.cpp) ----
+int l_hash_algorithm(lua_State* L);
+// Registry ref of the Lua hash algorithm `name` (case and punctuation ignored), LUA_NOREF if none.
+int find_lua_hash(const ScriptEngine::Impl& im, const std::string& name);
+// One run of a Lua hash algorithm (spec = its hx.hash_algorithm table) on `L`'s stack: init()
+// leaves the spec and the state at the top (call it at a fixed stack level and keep both there),
+// update() / finish() call update / final. Two modes:
+//   * raising (im null): inside a lua_CFunction of the shared state (hx.hash, doc:hash); errors
+//     are Lua errors (C++ exceptions, so it may run under hash_range);
+//   * protected (im non-null, the job's own state on a worker): every call is an im->pcall under
+//     the script time limit (and its cancel flag); the first error sticks in error().
+class LuaHasher final : public Hasher {
+public:
+    LuaHasher(lua_State* L, ScriptEngine::Impl* im, int spec_ref) : L_(L), im_(im), spec_ref_(spec_ref) { init(); }
+    void init() override;
+    void update(const uint8_t* data, size_t len) override;
+    std::vector<uint8_t> finish() override;
+    std::string error() const override { return err_; }
+
+private:
+    bool step(int which, const uint8_t* data, size_t len);  // pushes the step's result on success
+
+    lua_State* L_;
+    ScriptEngine::Impl* im_;
+    int spec_ref_;
+    int base_ = 0;     // stack index of the spec (the state is at base_ + 1); 0 before init()
+    std::string err_;
+};
 
 // Single numeric string.pack option ("<I2", ">i3", "B", "<d", ...): size and kind. False for
 // anything else (multi-value, strings, padding-only formats).

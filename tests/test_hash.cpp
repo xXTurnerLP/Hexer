@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <memory>
@@ -347,4 +348,76 @@ TEST_CASE("hash: ranges with holes of process memory are refused, readable range
     CHECK_FALSE(r.hole);
     REQUIRE(r.values.size() == 1);
     CHECK(r.values[0].hex == hash_hex("crc32", hm.after_ptr(), pg));
+}
+
+namespace {
+
+// A custom algorithm for HashJob: counts bytes; "fail_at" > 0 fails once that many were fed,
+// "fail_final" fails in finish(). Records which thread created it.
+struct CountHasher : Hasher {
+    uint64_t n = 0, fail_at = 0;
+    bool fail_final = false;
+    std::string err;
+    void init() override {
+        n = 0;
+        err.clear();
+    }
+    void update(const uint8_t*, size_t len) override {
+        n += len;
+        if (fail_at && n >= fail_at && err.empty()) err = "boom at " + std::to_string(n);
+    }
+    std::vector<uint8_t> finish() override {
+        if (fail_final) err = "final failed";
+        return {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
+    }
+    std::string error() const override { return err; }
+};
+
+}  // namespace
+
+TEST_CASE("hash: HashJob runs custom algorithms on its worker after the built-ins") {
+    const Bytes data = random_bytes((size_t(9) << 20) + 5, 4);
+    auto snap = snap_of(data);
+    std::atomic<int> made{0};
+    std::thread::id maker;
+    const std::thread::id ui = std::this_thread::get_id();
+    auto counter = [&](uint64_t fail_at, bool fail_final) {
+        return CustomHashAlgorithm{"Count", [&made, &maker, fail_at, fail_final](const std::atomic<bool>* cancel) {
+                                       CHECK(cancel != nullptr);
+                                       maker = std::this_thread::get_id();
+                                       ++made;
+                                       auto h = std::make_unique<CountHasher>();
+                                       h->fail_at = fail_at;
+                                       h->fail_final = fail_final;
+                                       return std::unique_ptr<Hasher>(std::move(h));
+                                   }};
+    };
+    HashJob job;
+    uint64_t gen = job.generation();
+    job.start(snap, 1, UINT64_MAX, {"CRC-32"}, {counter(0, false), CustomHashAlgorithm{"No factory", {}}});
+    wait_for(job, gen);
+    HashJob::Result r = job.result();
+    REQUIRE(r.values.size() == 2);
+    CHECK(made == 1);
+    CHECK(maker != ui);
+    CHECK(r.values[0].algo == "CRC-32");
+    CHECK(r.values[0].hex == hash_hex("CRC-32", data.data() + 1, data.size() - 1));
+    CHECK(r.values[1].algo == "Count");
+    CHECK(r.values[1].error.empty());
+    char want[16];
+    std::snprintf(want, sizeof want, "%08x", unsigned(data.size() - 1));
+    CHECK(r.values[1].hex == want);
+
+    // A failing custom hasher gives its error instead of a value; the others are unaffected.
+    gen = job.generation();
+    job.start(snap, 0, UINT64_MAX, {"MD5"}, {counter(5u << 20, false), counter(0, true)});
+    wait_for(job, gen);
+    r = job.result();
+    REQUIRE(r.values.size() == 3);
+    CHECK(r.values[0].hex == hash_hex("MD5", data.data(), data.size()));
+    CHECK(r.values[1].hex.empty());
+    CHECK(r.values[1].error == "boom at " + std::to_string(8u << 20));  // fed in 4 MiB blocks
+    CHECK(r.values[2].hex.empty());
+    CHECK(r.values[2].error == "final failed");
+    CHECK(r.values[0].error.empty());
 }

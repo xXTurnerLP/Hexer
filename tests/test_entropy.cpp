@@ -871,3 +871,151 @@ TEST_CASE("entropy: a small dense region in zeros is a spot (peak / nonzero), al
         CHECK_FALSE(entropy_spot(b));
     }
 }
+
+// ---- refinement of all-zero sampled buckets, refresh ----------------------------------------------
+
+namespace {
+
+// Polls the job's latest result until `pred` holds (fails after 60 s).
+template <class Pred>
+std::shared_ptr<const EntropyResult> wait_result(const EntropyJob& job, Pred pred) {
+    auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        auto r = job.result();
+        if (r && pred(*r)) return r;
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// 4 MiB of zeros in 1 MiB buckets sampled 64 KiB each (16 chunks, stride 68 KiB = 17 slots of
+// 4 KiB per gap) with 8 non-zero bytes in bucket 2, in a slot between two of the scan's chunks.
+constexpr uint64_t kRefStride = ((1u << 20) - 4096) / 15;
+constexpr uint64_t kRefSpot = (2u << 20) + 5 * kRefStride + 11 * 4096 + 100;
+Bytes refine_data() {
+    Bytes d(size_t(4) << 20, 0);
+    for (size_t i = 0; i < 8; ++i) d[size_t(kRefSpot) + i] = uint8_t(0x5A + i);
+    return d;
+}
+EntropyOptions refine_opts(uint32_t passes) {
+    EntropyOptions o;
+    o.buckets = 4;
+    o.sample_per_bucket = 64 << 10;
+    o.refine_passes = passes;
+    o.refine_pause_ms = 0;
+    return o;
+}
+
+}  // namespace
+
+TEST_CASE("entropy: refinement finds a small region between the samples of an allocated zero area") {
+    REQUIRE(kRefStride == 17u * 4096u);
+    const auto snap = snap_of(refine_data());
+    EntropyJob job;
+    // Off (the default): the scan's samples miss the bytes, and nothing reads more.
+    auto r = run(job, snap, refine_opts(0));
+    REQUIRE(r->buckets.size() == 4);
+    CHECK(r->buckets[2].sampled);
+    CHECK_FALSE(r->buckets[2].nonzero);
+    CHECK_FALSE(entropy_spot(r->buckets[2]));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(job.result()->refine_pass == 0);
+    CHECK(job.result()->bytes_read == 4u * (64u << 10));
+
+    // On: the gaps are read slot by slot until the bytes show.
+    r = run(job, snap, refine_opts(1000));
+    if (r->refine_pass == 0) {  // (refinement may have published its first pass already)
+        CHECK_FALSE(r->buckets[2].nonzero);  // the scan itself is unchanged
+        CHECK(r->bytes_read == 4u * (64u << 10));
+    }
+    r = wait_result(job, [](const EntropyResult& x) { return x.buckets[2].nonzero; });
+    const EntropyBucket& b = r->buckets[2];
+    CHECK(entropy_spot(b));
+    CHECK(b.peak > 0.0f);
+    CHECK(b.entropy > 0.0f);
+    CHECK(frac(b, ByteClass::Zero) < 1.0f);
+    CHECK(frac(b, ByteClass::Zero) > 0.99f);
+    CHECK(b.refined > 0);
+    CHECK(b.refined < 32);
+    CHECK(b.bytes_read < b.length);
+    CHECK(r->refine_pass >= 1);
+    CHECK(entropy_spot(entropy_aggregate(*r, 0, 4u << 20)));  // a row of all buckets shows it
+    // The all-zero buckets go on until every slot is read; the found one stops.
+    r = wait_result(job, [](const EntropyResult& x) {
+        return x.buckets[0].refined == UINT32_MAX && x.buckets[1].refined == UINT32_MAX &&
+               x.buckets[3].refined == UINT32_MAX;
+    });
+    for (size_t i : {size_t(0), size_t(1), size_t(3)}) {
+        INFO(i);
+        const EntropyBucket& z = r->buckets[i];
+        CHECK_FALSE(z.nonzero);
+        CHECK(z.bytes_read <= z.length);
+        CHECK(z.bytes_read >= z.length - 15);  // all but the scan grid's rounding remainder
+        CHECK(z.entropy == 0.0f);
+        CHECK(frac(z, ByteClass::Zero) == 1.0f);
+    }
+    CHECK(r->buckets[2].refined == b.refined);
+    CHECK(r->bytes_read <= (4u << 20));
+}
+
+TEST_CASE("entropy: refinement pauses between passes and is cancelled by a new run / the destructor") {
+    const auto snap = snap_of(refine_data());
+    EntropyOptions o = refine_opts(1000);
+    o.refine_pause_ms = 60000;
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        EntropyJob job;
+        run(job, snap, o);
+        auto r = wait_result(job, [](const EntropyResult& x) { return x.refine_pass >= 1; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(job.result()->refine_pass == 1);  // pausing
+        CHECK_FALSE(job.running());
+        // A new run supersedes the paused one right away.
+        Bytes small(64 * 1024, 7);
+        r = run(job, snap_of(small), refine_opts(0));
+        CHECK(r->doc_size == small.size());
+        run(job, snap, o);
+        wait_result(job, [](const EntropyResult& x) { return x.refine_pass >= 1; });
+    }  // the destructor cancels the pause
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+}
+
+TEST_CASE("entropy: rescans keep refined buckets; refresh recomputes the given ranges, also of process memory") {
+    auto d = refine_data();
+    auto doc = Document::create_from_bytes("z", d.data(), d.size());
+    EntropyJob job;
+    run(job, doc->snapshot(), refine_opts(1000));
+    wait_result(job, [](const EntropyResult& x) { return x.buckets[2].nonzero; });
+    const uint8_t x = 0;
+    REQUIRE(doc->overwrite(10, &x, 1));  // bucket 0
+    auto r = rerun(job, doc->snapshot(), refine_opts(0));  // no refinement racing the checks
+    CHECK(r->reused == 3);
+    CHECK(r->buckets[2].nonzero);  // kept, not sampled again
+    CHECK(r->buckets[0].refined == 0);  // recomputed
+
+    // Refresh of bucket 2's range: recomputed (without refinement the samples miss the bytes again).
+    const uint64_t gen = job.generation();
+    job.refresh(doc->snapshot(), {{kRefSpot, kRefSpot + 1}}, refine_opts(0));
+    wait_for(job, gen);
+    r = job.result();
+    CHECK(r->reused == 3);
+    CHECK_FALSE(r->buckets[2].nonzero);
+    CHECK(r->buckets[2].refined == 0);
+
+    // Process memory: a rescan reads everything, a refresh only the ranges given.
+    hx_test::HoleyMem hm;
+    auto self = hx_test::open_self();
+    EntropyOptions o;
+    o.buckets = 16;
+    o.sample_per_bucket = 4096;
+    r = run(job, self->snapshot(), o);
+    REQUIRE(r->done == 16);
+    const uint64_t g2 = job.generation();
+    const EntropyBucket& b5 = r->buckets[5];
+    job.refresh(self->snapshot(), {{b5.offset + 7, b5.offset + 8}, {r->buckets[9].offset, r->buckets[11].offset}}, o);
+    wait_for(job, g2);
+    r = job.result();
+    CHECK(r->reused == 13);  // 5, 9, 10 recomputed
+    CHECK(r->done == 16);
+    CHECK(rerun(job, self->snapshot(), o)->reused == 0);
+}

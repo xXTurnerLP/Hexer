@@ -236,13 +236,20 @@ constexpr size_t kMaxDataRanges = 64;      // data ranges of a sparse file sampl
 
 std::atomic<void (*)(uint32_t)> g_bucket_hook{nullptr};
 
-// Computes one bucket. Returns false if cancelled before it was finished (bucket stays pending).
-bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions& opts,
-                    const std::atomic<bool>& cancel, std::vector<uint8_t>& buf, uint64_t& io_at) {
+// Reads bytes of one bucket into a histogram (+ the bucket's bytes_read / peak / nonzero /
+// unreadable and the first I/O error offset).
+struct BucketReader {
+    const Snapshot& snap;
+    EntropyBucket& b;
+    std::vector<uint8_t>& buf;
+    uint64_t& io_at;
     uint64_t counts[256] = {};
-    const uint64_t end = b.offset + b.length;
+
+    BucketReader(const Snapshot& s, EntropyBucket& bucket, std::vector<uint8_t>& buffer, uint64_t& io_error_at)
+        : snap(s), b(bucket), buf(buffer), io_at(io_error_at) {}
+
     // Counts the bytes, 4 KiB chunk by chunk (peak / nonzero).
-    auto count = [&](const uint8_t* p, size_t n) {
+    void count(const uint8_t* p, size_t n) {
         for (size_t q = 0; q < n; q += kSampleChunk) {
             const size_t m = std::min(kSampleChunk, n - q);
             uint64_t c[256] = {};
@@ -252,10 +259,10 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
             b.nonzero = true;
             b.peak = std::max(b.peak, shannon_entropy(c));
         }
-    };
+    }
     // Reads the readable bytes of [off, off + len), skipping holes of a sparse source (they mark
     // the bucket unreadable). False (and marks the bucket) at a genuine I/O error.
-    auto take = [&](uint64_t off, size_t len) {
+    bool take(uint64_t off, size_t len) {
         if (buf.size() < len) buf.resize(len);
         const uint64_t stop = off + len;
         while (off < stop) {
@@ -274,11 +281,11 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
             off = resume;
         }
         return true;
-    };
+    }
     // One chunk at `at` (at most up to `limit`, the next chunk's position, and `rend`, the end of
     // its data range). A chunk that starts in a hole of process memory moves to the next readable
     // byte unless that is past `limit`. False at an I/O error.
-    auto chunk_at = [&](uint64_t at, uint64_t limit, uint64_t rend, uint64_t len) {
+    bool chunk_at(uint64_t at, uint64_t limit, uint64_t rend, uint64_t len) {
         const uint64_t s = snap.next_readable(at);
         if (s >= limit) {
             b.unreadable = true;
@@ -286,7 +293,63 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
         }
         if (s > at) b.unreadable = true;
         return take(s, size_t(std::min(len, rend - s)));
-    };
+    }
+    // Entropy and class fractions from the counts. `scale`: the bytes read stand for all `dlen`
+    // data bytes (sampled); the holes add their zeros.
+    void finish(uint64_t dlen, bool scale) {
+        if (scale && b.hole_bytes && b.bytes_read) {
+            const double f = double(dlen) / double(b.bytes_read);
+            for (uint64_t& c : counts) c = uint64_t(std::llround(double(c) * f));
+        }
+        counts[0] += b.hole_bytes;
+        b.entropy = shannon_entropy(counts);
+        uint64_t cls[kByteClassCount] = {}, total = 0;
+        for (int v = 0; v < 256; ++v) {
+            cls[int(byte_class(uint8_t(v)))] += counts[v];
+            total += counts[v];
+        }
+        for (int c = 0; c < kByteClassCount; ++c)
+            b.class_frac[c] = total ? float(double(cls[c]) / double(total)) : 0.0f;
+    }
+};
+
+// The scan's evenly spaced chunks over a bucket's `dlen` data bytes: n chunks of `chunk` bytes,
+// `stride` apart; the first starts at the first data byte, the last ends at (about) the last one.
+struct SampleGrid {
+    uint64_t chunk = 0, n = 0, stride = 0;
+};
+SampleGrid sample_grid(uint64_t dlen, uint64_t sample) {
+    SampleGrid g;
+    g.chunk = std::min<uint64_t>(kSampleChunk, sample);
+    g.n = std::max<uint64_t>(1, sample / g.chunk);
+    g.stride = g.n > 1 ? (dlen - g.chunk) / (g.n - 1) : 0;
+    return g;
+}
+
+// Positions in a bucket's data (holes of a sparse file left out) -> offsets, for ascending positions.
+struct DataWalk {
+    const std::vector<std::pair<uint64_t, uint64_t>>& data;
+    size_t ri = 0;       // range of the last position
+    uint64_t rbase = 0;  // data position of data[ri].first
+
+    explicit DataWalk(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) : data(ranges) {}
+    // The offset of data position `dpos` (past the end: beyond the last range's end) and the end
+    // of the range it is in.
+    uint64_t at(uint64_t dpos, uint64_t& rend) {
+        while (ri + 1 < data.size() && dpos >= rbase + (data[ri].second - data[ri].first)) {
+            rbase += data[ri].second - data[ri].first;
+            ++ri;
+        }
+        rend = data[ri].second;
+        return data[ri].first + (dpos - rbase);
+    }
+};
+
+// Computes one bucket. Returns false if cancelled before it was finished (bucket stays pending).
+bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions& opts,
+                    const std::atomic<bool>& cancel, std::vector<uint8_t>& buf, uint64_t& io_at) {
+    const uint64_t end = b.offset + b.length;
+    BucketReader rd(snap, b, buf, io_at);
 
     // Fully inside a hole (unmapped process memory): unreadable, nothing to read.
     if (snap.next_readable(b.offset) >= end) {
@@ -303,39 +366,25 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
 
     const uint64_t sample = opts.sample_per_bucket;
     if (sample && dlen > sample) {
-        // Evenly spaced chunks over the data (holes left out); the first starts at the first data
-        // byte, the last ends at the last one. A data range no chunk landed in gets one chunk at
-        // its start, so a small region of a sparse file is never skipped.
+        // Evenly spaced chunks over the data (holes left out). A data range no chunk landed in
+        // gets one chunk at its start, so a small region of a sparse file is never skipped.
         b.sampled = true;
-        const uint64_t chunk = std::min<uint64_t>(kSampleChunk, sample);
-        const uint64_t n = std::max<uint64_t>(1, sample / chunk);
-        const uint64_t stride = n > 1 ? (dlen - chunk) / (n - 1) : 0;
+        const SampleGrid g = sample_grid(dlen, sample);
         std::vector<uint8_t> hit(data.size(), 0);
-        size_t ri = 0;
-        uint64_t rbase = 0;  // data position of data[ri].first
+        DataWalk walk(data);
         bool ok = true;
-        for (uint64_t k = 0; k < n && ok; ++k) {
+        for (uint64_t k = 0; k < g.n && ok; ++k) {
             if (cancel.load(std::memory_order_relaxed)) return false;
-            const uint64_t dpos = k * stride;
-            while (ri + 1 < data.size() && dpos >= rbase + (data[ri].second - data[ri].first)) {
-                rbase += data[ri].second - data[ri].first;
-                ++ri;
-            }
-            const uint64_t rend = data[ri].second;
-            uint64_t at = data[ri].first + (dpos - rbase);
-            if (rend - data[ri].first >= chunk) at = std::min(at, rend - chunk);  // a whole chunk
-            const uint64_t limit = k + 1 < n && stride ? std::min(rend, at + stride) : rend;
-            hit[ri] = 1;
-            ok = chunk_at(at, limit, rend, chunk);
+            uint64_t rend = 0;
+            uint64_t at = walk.at(k * g.stride, rend);
+            if (rend - data[walk.ri].first >= g.chunk) at = std::min(at, rend - g.chunk);  // a whole chunk
+            const uint64_t limit = k + 1 < g.n && g.stride ? std::min(rend, at + g.stride) : rend;
+            hit[walk.ri] = 1;
+            ok = rd.chunk_at(at, limit, rend, g.chunk);
         }
         for (size_t i = 0; i < data.size() && ok; ++i) {
             if (cancel.load(std::memory_order_relaxed)) return false;
-            if (!hit[i]) ok = chunk_at(data[i].first, data[i].second, data[i].second, chunk);
-        }
-        // The chunks stand for all `dlen` data bytes; the holes add their zeros.
-        if (b.hole_bytes && b.bytes_read) {
-            const double scale = double(dlen) / double(b.bytes_read);
-            for (uint64_t& c : counts) c = uint64_t(std::llround(double(c) * scale));
+            if (!hit[i]) ok = rd.chunk_at(data[i].first, data[i].second, data[i].second, g.chunk);
         }
     } else {
         for (const auto& r : data) {
@@ -349,22 +398,65 @@ bool compute_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions
                 }
                 if (s > pos) b.unreadable = true;
                 const size_t len = size_t(std::min<uint64_t>(kReadBlock, r.second - s));
-                ok = take(s, len);
+                ok = rd.take(s, len);
                 pos = s + len;
             }
             if (!ok) break;
         }
     }
-    counts[0] += b.hole_bytes;
-
-    b.entropy = shannon_entropy(counts);
-    uint64_t cls[kByteClassCount] = {}, total = 0;
-    for (int v = 0; v < 256; ++v) {
-        cls[int(byte_class(uint8_t(v)))] += counts[v];
-        total += counts[v];
-    }
-    for (int c = 0; c < kByteClassCount; ++c) b.class_frac[c] = total ? float(double(cls[c]) / double(total)) : 0.0f;
+    rd.finish(dlen, b.sampled);
     b.done = true;
+    return true;
+}
+
+// The low `bits` bits of `v` in reverse order.
+uint64_t bit_reverse(uint64_t v, int bits) {
+    uint64_t r = 0;
+    for (int i = 0; i < bits; ++i, v >>= 1) r = (r << 1) | (v & 1);
+    return r;
+}
+
+// One refinement step (EntropyOptions::refine_passes) of a sampled bucket whose bytes read are
+// all zero: each gap between two of the scan's chunks is split into chunk-sized slots (slot 0 is
+// the scan's chunk), and the step reads the next slot of the bit-reversed order (1/2, 1/4, 3/4,
+// 1/8, ...; slots past the gap's end are skipped) in every gap. b.refined = the position in that
+// order. False if the bucket has nothing (more) to refine.
+bool refine_bucket(const Snapshot& snap, EntropyBucket& b, const EntropyOptions& opts, const std::atomic<bool>& cancel,
+                   std::vector<uint8_t>& buf, uint64_t& io_at) {
+    if (!b.done || !b.sampled || b.nonzero || b.refined >= opts.refine_passes || !opts.sample_per_bucket) return false;
+    const uint64_t dlen = b.length - b.hole_bytes;
+    if (dlen <= opts.sample_per_bucket) return false;
+    const SampleGrid g = sample_grid(dlen, opts.sample_per_bucket);
+    const uint64_t slots = g.n > 1 ? (g.stride + g.chunk - 1) / g.chunk : 0;  // per gap
+    int bits = 0;
+    while ((uint64_t(1) << bits) < slots) ++bits;
+    uint32_t i = b.refined;
+    uint64_t slot = 0;
+    do {
+        if (slots < 2 || uint64_t(i) + 1 >= (uint64_t(1) << bits)) {
+            b.refined = UINT32_MAX;  // every slot has been read
+            return false;
+        }
+        slot = bit_reverse(++i, bits);
+    } while (slot >= slots);
+    b.refined = i;
+
+    const auto data = snapshot_data_ranges(snap, b.offset, b.offset + b.length, kMaxDataRanges);
+    if (data.empty()) return false;
+    BucketReader rd(snap, b, buf, io_at);
+    rd.counts[0] = b.bytes_read;  // all zero so far
+    DataWalk walk(data);
+    const uint64_t in_gap = slot * g.chunk;
+    const uint64_t len = std::min(g.chunk, g.stride - in_gap);
+    for (uint64_t k = 0; k + 1 < g.n; ++k) {
+        if (cancel.load(std::memory_order_relaxed)) return false;
+        uint64_t rend = 0;
+        const uint64_t at = walk.at(k * g.stride + in_gap, rend);
+        if (at >= rend) continue;
+        const uint64_t n = std::min(len, rend - at);
+        if (!rd.chunk_at(at, at + n, rend, n)) break;
+    }
+    if (b.nonzero) rd.finish(dlen, true);  // found something: its entropy / classes from all bytes read
     return true;
 }
 
@@ -410,14 +502,20 @@ std::shared_ptr<const EntropyResult> EntropyJob::result() const {
 }
 
 void EntropyJob::start(std::shared_ptr<const Snapshot> snap, EntropyOptions opts) {
-    launch(std::move(snap), opts, false);
+    launch(std::move(snap), opts, Mode::Full);
 }
 
 void EntropyJob::rescan(std::shared_ptr<const Snapshot> snap, EntropyOptions opts) {
-    launch(std::move(snap), opts, true);
+    launch(std::move(snap), opts, Mode::Rescan);
 }
 
-void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opts, bool incremental) {
+void EntropyJob::refresh(std::shared_ptr<const Snapshot> snap, std::vector<std::pair<uint64_t, uint64_t>> ranges,
+                         EntropyOptions opts) {
+    launch(std::move(snap), opts, Mode::Refresh, std::move(ranges));
+}
+
+void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opts, Mode mode,
+                        std::vector<std::pair<uint64_t, uint64_t>> dirty) {
     // Never block the UI thread on the previous run (it may sit in one slow read): cancel it, let it
     // finish in the background (it no longer publishes anything) and join it once it has exited.
     auto run = std::make_shared<Run>();
@@ -429,7 +527,7 @@ void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opt
         std::lock_guard<std::mutex> lock(mu_);
         if (run_) run_->cancel = true;
         run_ = run;
-        if (incremental && result_snap_ && result_opts_.sample_per_bucket == opts.sample_per_bucket) {
+        if (mode != Mode::Full && result_snap_ && result_opts_.sample_per_bucket == opts.sample_per_bucket) {
             base = result_;
             base_snap = result_snap_;
         }
@@ -444,7 +542,7 @@ void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opt
     }
     running_ = true;
     std::thread th([this, run, snap = std::move(snap), opts, r = std::move(layout), base = std::move(base),
-                    base_snap = std::move(base_snap)]() mutable {
+                    base_snap = std::move(base_snap), mode, dirty = std::move(dirty)]() mutable {
         using clock = std::chrono::steady_clock;
         uint64_t io_at = UINT64_MAX;
         std::vector<uint8_t> buf;
@@ -466,10 +564,22 @@ void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opt
             return true;
         };
         // Rescan: copy the computed buckets no changed range touches. Same layout only (then bucket
-        // i covers the same offsets in both; a shorter / longer last bucket is recomputed).
-        if (base && base_snap && snap && !has_process_source(*snap) && base->bucket_size == r.bucket_size &&
-            base->buckets.size() == r.buckets.size()) {
-            const auto changes = snapshot_changes(*base_snap, *snap);
+        // i covers the same offsets in both; a shorter / longer last bucket is recomputed). A
+        // refresh also recomputes the `dirty` ranges, and may reuse buckets of process memory.
+        if (base && base_snap && snap && (mode == Mode::Refresh || !has_process_source(*snap)) &&
+            base->bucket_size == r.bucket_size && base->buckets.size() == r.buckets.size()) {
+            auto changes = snapshot_changes(*base_snap, *snap);
+            if (!dirty.empty()) {
+                changes.insert(changes.end(), dirty.begin(), dirty.end());
+                std::sort(changes.begin(), changes.end());
+                size_t m = 0;  // merge overlapping / adjacent ranges (ascending, disjoint)
+                for (const auto& c : changes) {
+                    if (c.first >= c.second) continue;
+                    if (m && c.first <= changes[m - 1].second) changes[m - 1].second = std::max(changes[m - 1].second, c.second);
+                    else changes[m++] = c;
+                }
+                changes.resize(m);
+            }
             size_t ci = 0;  // first change that ends after the current bucket's start
             for (size_t i = 0; i < r.buckets.size(); ++i) {
                 EntropyBucket& b = r.buckets[i];
@@ -506,7 +616,31 @@ void EntropyJob::launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opt
         }
         r.cancelled = run->cancel.load();
         r.finished = true;
-        publish(true);
+        // Refinement while idle (EntropyOptions::refine_passes): one step per eligible bucket per
+        // pass, published after each pass, then a pause; until nothing is left or cancelled.
+        bool more = publish(true) && !r.cancelled && snap && opts.refine_passes;
+        while (more) {
+            const auto t0 = clock::now();
+            more = false;
+            for (EntropyBucket& b : r.buckets) {
+                if (run->cancel.load()) break;
+                const uint64_t before = b.bytes_read;
+                if (!refine_bucket(*snap, b, opts, run->cancel, buf, io_at)) continue;
+                more = true;
+                r.bytes_read += b.bytes_read - before;
+            }
+            if (run->cancel.load()) break;
+            if (!more) {  // the buckets refine_bucket marked as fully read
+                publish(false);
+                break;
+            }
+            ++r.refine_pass;
+            if (!publish(false)) break;
+            const auto pause = std::max<clock::duration>(std::chrono::milliseconds(std::max(0, opts.refine_pause_ms)),
+                                                         (clock::now() - t0) * 3);
+            for (const auto until = clock::now() + pause; !run->cancel.load() && clock::now() < until;)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
         run->finished = true;
     });
     threads_.emplace_back(std::move(th), std::move(run));

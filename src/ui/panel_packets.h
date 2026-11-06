@@ -4,16 +4,23 @@
 //
 //   * Indexing runs on a PcapIndexJob worker over a Snapshot (progress + Cancel). It starts by
 //     itself the first time a document detected as a capture is drawn; "Index" re-runs it.
-//   * Table # | Offset | Time | Len | Proto | Summary, virtualised with ImGuiListClipper; only the
-//     visible rows are dissected (small cache). Time is relative to the first packet, or the UTC
-//     time of day with "Absolute time" (the row tooltip has the date).
+//   * Table # | Offset | Time | Len | Proto | Stream | Summary, virtualised with ImGuiListClipper;
+//     only the visible rows are dissected (small cache). Time is relative to the first packet, or
+//     the UTC time of day with "Absolute time" (the row tooltip has the date). Stream = the TCP /
+//     UDP conversation number (core/pcap_stream.h Conversations), numbered on a ConversationJob
+//     worker after each index (blank until it is done).
+//   * Live tail: appended(doc, before, after) tells the panel the document only grew at its end;
+//     when nothing else changed since the last index, the next draw indexes just the new records
+//     (PcapIndexJob::start_append; a rewritten file falls back to a full index) and the filter /
+//     Stream numbers continue from where they were.
 //   * Filter: an expression (core/pcap_filter.h: ip.src == 10.0.0.1 and not tcp.port == 22, "text",
 //     ...), re-applied on every edit. An invalid one is marked in red at its error position and the
 //     previous filter stays. Up to filter_sync_max packets it runs on the UI thread under a
 //     per-frame time budget, above on a PacketFilterJob worker (millions never freeze the UI).
-//   * Follow TCP Stream (toolbar, row context menu, request_follow_stream): reassembles the selected
-//     packet's connection on a TcpStreamJob worker (core/pcap_stream.h) and hands the bytes (client
-//     -> server then server -> client, or interleaved) with one bookmark per segment to
+//   * Follow TCP / UDP Stream (toolbar "Follow Stream": by the packet's protocol, row context menu,
+//     request_follow_stream): reassembles the selected packet's connection (UDP: collects the
+//     conversation's datagrams) on a TcpStreamJob worker (core/pcap_stream.h) and hands the bytes
+//     (client -> server then server -> client, or interleaved) with one bookmark per segment to
 //     cb.open_tab; the capture's list is filtered to that conversation. Open Packet / Payload as Tab
 //     hands one packet's bytes over the same way. Actions without a selected row use the packet
 //     under the document's caret, and wait for the index if it is still running.
@@ -83,13 +90,20 @@ struct PacketsPanel {
     void draw(Document* doc, const std::vector<std::string>& parser_names, const PacketsPanelCallbacks& cb);
     // Drops the state (and cancels the index) of a closed document.
     void forget(uint64_t doc_id);
+    // Live tail: document `doc_id` grew at its end, its generation went from `gen_before` to
+    // `gen_after` (Document::refresh_appended). If the index was up to date before, the next draw
+    // indexes only the appended records.
+    void appended(uint64_t doc_id, uint64_t gen_before, uint64_t gen_after);
     // (Re-)index the active document on the next draw() (e.g. from a palette action).
     void request_index() { index_requested_ = true; }
     // Act on the selected packet (else the one under the caret) of the active document on the next
     // draw that has its index.
-    void request_follow_stream(bool interleaved) {
+    // `proto`: Tcp / Udp insist on that protocol (palette actions); Any follows what the packet is.
+    enum class FollowProto : uint8_t { Tcp, Udp, Any };
+    void request_follow_stream(bool interleaved, FollowProto proto = FollowProto::Tcp) {
         pending_ = Pending::Follow;
         follow_interleaved = interleaved;
+        follow_proto_ = proto;
     }
     void request_open_packet(bool payload) { pending_ = payload ? Pending::OpenPayload : Pending::OpenPacket; }
     void request_conversation_filter() { pending_ = Pending::Conversation; }
@@ -111,6 +125,11 @@ struct PacketsPanel {
     std::string filter_error(uint64_t doc_id, size_t* pos = nullptr) const;
     size_t shown_rows(uint64_t doc_id) const;
     bool stream_running() const { return stream_job_.running(); }
+    // Packets indexed for `doc_id` (0 = none yet); whether its last index was an incremental
+    // append; the Stream number shown for packet `idx` (kNoStream = none / not numbered yet).
+    size_t indexed_packets(uint64_t doc_id) const;
+    bool last_index_incremental(uint64_t doc_id) const;
+    uint32_t stream_of(uint64_t doc_id, size_t idx) const;
 
 private:
     struct DocState;
@@ -119,6 +138,7 @@ private:
     bool index_requested_ = false;
     enum class Pending : uint8_t { None, Follow, OpenPacket, OpenPayload, Conversation };
     Pending pending_ = Pending::None;
+    FollowProto follow_proto_ = FollowProto::Tcp;
     void run_pending(Pending what, DocState& st, Document& doc, size_t packet, const PacketsPanelCallbacks& cb);
     TcpStreamJob stream_job_;
     uint64_t stream_seen_gen_ = 0;

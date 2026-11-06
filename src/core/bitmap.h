@@ -77,4 +77,27 @@ uint64_t bitmap_max_col0(int width, uint64_t page_cols);
 // Largest integer zoom in [1, max_zoom] at which `width` pixels fit into `avail_px` (1 if none fits).
 int bitmap_fit_zoom(int width, float avail_px, int max_zoom = 16);
 
+// ---- zoom levels: 1/16 .. 1/2 (downscale) and 1 .. 16 (nearest upscale) ---------------------------
+// A level is an int: n >= 1 = n screen pixels per image pixel; -2, -4, -8, -16 = 1/2 .. 1/16 (one
+// screen pixel averages a 2x2 .. 16x16 block of image pixels). Other values are not levels.
+constexpr int kBitmapMinZoom = -16;
+bool bitmap_zoom_valid(int level, int max_zoom = 16);
+int bitmap_zoom_clamp(int level, int max_zoom = 16);   // nearest valid level (0 / -1 -> 1, -3 -> -2)
+int bitmap_zoom_px(int level);                          // screen pixels per cell (1 when downscaled)
+int bitmap_zoom_step(int level);                        // image pixels per cell side (1 when zoomed in)
+int bitmap_zoom_next(int level, int dir, int max_zoom = 16);  // one level in (+1) or out (-1), clamped
+const char* bitmap_zoom_label(int level);               // "4x", "1/4x" (static strings)
+// Fit to width with downscaling: the largest level whose row of `width` pixels fits `avail_px`
+// (down to 1/16; a row too wide even then gets 1/16).
+int bitmap_fit_level(int width, float avail_px, int max_zoom = 16);
+
+// Downscale (box filter): `px` holds h * sub decoded rows of w pixels (row-major, `valid` of them
+// decoded: the rest is a missing suffix, see decode_pixels); every cell of the ceil(w / step) x h
+// result averages the decoded pixels [x * step, x * step + step) of its `sub` rows (y * sub ..
+// y * sub + sub - 1; `sub` <= step sampled rows of the step x step block, so the work stays within
+// the caller's byte budget). A cell without a decoded pixel gets bitmap_missing_color(); those form
+// a suffix, and the return value is the number of the others.
+size_t bitmap_downscale(const std::vector<uint32_t>& px, size_t valid, int w, int h, int step, int sub,
+                        std::vector<uint32_t>& out);
+
 }  // namespace hx

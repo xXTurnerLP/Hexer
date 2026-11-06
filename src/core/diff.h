@@ -82,19 +82,30 @@ std::pair<size_t, size_t> ranges_in(const std::vector<DiffRange>& ranges, uint64
 // changed, not inserted), a distinctive block equal on both sides at the current shift within
 // probe_scan bytes reports Found with delta 0. Bounded work after the first difference: about
 // 2 * (2 * window + 4 * probe_scan) bytes read, whatever the file sizes.
+//
+// Next misalignment: the search starts at the first difference at or after A offset `from` (the
+// Compare view passes its A caret, so after one Find Shift the next one continues behind the match)
+// and passes over plain changes: a difference after which a distinctive block lines up again at the
+// current shift within `change_scan` bytes is counted in ShiftResult::changes and the search goes
+// on at the next difference (at most `max_changes` of them, cheap: about 2 * change_scan bytes
+// each). So a change followed by an insertion reports the insertion's shift in one search.
 struct ShiftOptions {
     uint64_t window = uint64_t(16) << 20;     // +-16 MiB around the aligned position
     uint32_t block = 64;                      // probe length (bytes)
     uint32_t min_distinct = 8;                // distinct byte values a probe needs
     uint64_t probe_scan = uint64_t(1) << 20;  // how far past the difference a probe may start
     uint32_t probes = 16;                     // probes per side
+    uint64_t from = 0;                        // A offset the search for a difference starts at
+    uint64_t change_scan = 4096;              // realigned within this many bytes: a change, go on
+    uint32_t max_changes = 4096;              // changes passed over before reporting delta 0
 };
 
 struct ShiftResult {
     enum Status : uint8_t {
         Found,         // shift / delta / match_* are set (delta 0: the bytes after the difference
-                       // already line up - a change, not an insertion)
-        NoDifference,  // the aligned overlap is identical: nothing to align
+                       // already line up - a change, not an insertion; with changes > 0 the
+                       // match is behind the last change passed over)
+        NoDifference,  // the aligned overlap is identical (from `from` on): nothing to align
         NoProbe,       // no distinctive block after the difference on either side
         NoMatch,       // no probe found within the window of the other side
         Cancelled,
@@ -106,6 +117,11 @@ struct ShiftResult {
                                 // in B), < 0 A has -delta extra bytes (deleted in B)
     uint64_t diff_a = 0, diff_b = 0;    // first difference under the input shift (A / B offset)
     uint64_t match_a = 0, match_b = 0;  // Found: A[match_a, +block) == B[match_b, +block)
+    // Plain changes passed over before diff_a (ShiftOptions::change_scan); delta 0 with changes > 0:
+    // diff_a is the first of them, match_* follow the last one. limit: max_changes was reached
+    // (searching again from match_a goes on).
+    uint32_t changes = 0;
+    bool limit = false;
     uint64_t run = 0;           // ShiftJob: id of the start() call (0 = blocking call)
 };
 

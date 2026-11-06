@@ -29,6 +29,7 @@
 #include "core/elevation.h"
 #include "core/highlight.h"
 #include "core/inspector.h"
+#include "core/multisel.h"
 #include "core/nav.h"
 #include "core/os_file.h"
 #include "core/procmem.h"
@@ -146,7 +147,10 @@ bool parse_args(int argc, char** argv, AppOptions& out, std::string* err) {
 // Small shared helpers (declared in app_internal.h)
 // =============================================================================================
 
-double now_s() { return glfwGetTime(); }
+// Seconds on a monotonic clock (no GLFW: also works headless, tests/test_app.cpp).
+double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 std::string fmt_offset(uint64_t v) { return "0x" + fmt_hex(v, 8); }
 
@@ -821,6 +825,18 @@ bool copy_selection(App& app, CopyFormat fmt) {
     Document* d = usable_doc(app);
     if (!d) return false;
     const ViewState& v = d->view();
+    if (has_extra_selections(v)) {  // multi-selection: every range as `fmt`, one per line
+        std::string text, err;
+        if (!copy_selections(*d, fmt, copy_limit(fmt), text, &err)) {
+            show_message(app, "Copy", err);
+            return false;
+        }
+        ImGui::SetClipboardText(text.c_str());
+        const std::vector<ByteRange> rs = selection_ranges(v, d->size());
+        set_status(app, "Copied " + std::to_string(rs.size()) + " ranges (" + fmt_size(range_total(rs)) + ") as " +
+                            copy_format_name(fmt) + ", one per line");
+        return true;
+    }
     uint64_t off = v.sel_begin(), len = v.sel_len();
     if (len == 0) {  // no selection: copy the byte under the caret
         if (v.cursor >= d->size()) {
@@ -856,6 +872,21 @@ void cut_selection(App& app) {
     Document* d = usable_doc(app);
     if (!d) return;
     ViewState& v = d->view();
+    if (has_extra_selections(v)) {  // multi-selection: copy every range, then delete them (one step)
+        if (d->read_only()) {
+            report_edit_failure(app, *d);
+            return;
+        }
+        const size_t n = selection_ranges(v, d->size()).size();
+        if (!copy_default(app)) return;  // never erase bytes that did not reach the clipboard
+        if (!erase_selections(*d)) {
+            report_edit_failure(app, *d);
+            return;
+        }
+        after_edit(*t);
+        set_status(app, "Cut " + std::to_string(n) + " ranges");
+        return;
+    }
     if (!v.has_selection()) {
         set_status(app, "Select bytes to cut");
         return;
@@ -895,6 +926,20 @@ void paste(App& app) {
     bool parsed_hex = !v.ascii_focus && parse_bytes(text, bytes);
     if (!parsed_hex) bytes.assign(text.begin(), text.end());
     if (bytes.empty()) return;
+    if (has_extra_selections(v)) {  // multi-selection: the same value into every range
+        const size_t n = selection_ranges(v, d->size()).size();
+        std::string err;
+        if (d->read_only() || d->busy()) {
+            report_edit_failure(app, *d);
+        } else if (!paste_selections(*d, bytes.data(), bytes.size(), &err)) {
+            show_message(app, "Paste", err);
+        } else {
+            after_edit(*t);
+            set_status(app, "Pasted " + std::to_string(bytes.size()) + " bytes" + (parsed_hex ? " (hex)" : " (text)") +
+                                " into " + std::to_string(n) + " ranges", 6.0);
+        }
+        return;
+    }
     bool ok;
     const uint64_t at = v.has_selection() ? v.sel_begin() : v.cursor;
     const uint64_t sel_len = v.sel_len();
@@ -925,6 +970,7 @@ void select_all(App& app) {
     if (!d) return;
     d->view().anchor = 0;
     d->view().cursor = d->size();
+    d->view().extra_sel.clear();  // everything is selected: no extra ranges
     d->view_generation++;
     t->view.request_scroll_to(d->size(), false);
 }
@@ -1086,8 +1132,12 @@ void tail_poll_once(App& app, Tab& t) {
     uint64_t added = 0;
     std::string err;
     t.tail.last_poll = now_s();
+    const uint64_t gen_before = d.generation();
     switch (d.refresh_appended(&added, &err)) {
-        case GrowResult::Grown: tail_grown(t, added, at_end); break;
+        case GrowResult::Grown:
+            tail_grown(t, added, at_end);
+            app.packets_panel.appended(d.id(), gen_before, d.generation());  // a growing capture: index the new records
+            break;
         case GrowResult::NotAppend: stop_tail_rewritten(app, t); break;
         case GrowResult::Error:  // keep tailing; retry on the next poll
             if (!err.empty()) set_status(app, t.label + ": live tail: " + err, 4.0);
@@ -1311,6 +1361,89 @@ void compare_align(App& a) {
     set_status(a, "Compare shift " + std::to_string(a.diff->shift) + " (B offset = A offset + shift)", 6.0);
 }
 
+// ---- multi-selection (core/multisel.h) -----------------------------------------------------
+
+}  // namespace
+
+// The tab's Find All hits become the multi-selection: the first is the primary selection (revealed,
+// one jump), the others the extra ranges. Find All stops at kMaxSelections hits.
+void select_hits(App& app, Tab& t) {
+    const SearchHits& h = t.hits;
+    Document& d = *t.doc;
+    if (h.offsets.empty() || d.busy()) {
+        set_status(app, "No matches to select");
+        return;
+    }
+    if (h.doc_gen != d.generation()) {  // edited since: the offsets may no longer hold the matches
+        set_status(app, "The document changed since the search: Find All again (Select All Matches, Alt+F3)", 6.0);
+        return;
+    }
+    const size_t n = std::min(h.offsets.size(), kMaxSelections);
+    std::vector<ByteRange> rs;
+    rs.reserve(n);
+    for (size_t i = 0; i < n; ++i) rs.push_back({h.offsets[i], h.offsets[i] + h.len});
+    set_selection_ranges(d.view(), rs, d.size());
+    reveal_range(app, t, rs[0].begin, h.len, true);
+    set_status(app, "Selected " + std::to_string(n) + " matches of '" + h.query + "'" +
+                        (h.truncated || n < h.offsets.size() ? " (the search stopped at " + std::to_string(n) + ")" : ""),
+               6.0);
+}
+
+namespace {
+
+void find_start(App& app, SearchJob::Mode mode);
+
+// Select All Matches (Alt+F3): the current Find All hits when they are still valid for the find
+// bar's pattern, else a new Find All that selects its hits when it is done.
+void select_all_matches(App& app) {
+    Tab* t = active_tab(app);
+    Document* d = usable_doc(app);
+    if (!d) return;
+    const SearchHits& h = t->hits;
+    if (!h.offsets.empty() && h.doc_gen == d->generation() && (app.find.input.empty() || h.query == app.find.input)) {
+        select_hits(app, *t);
+        return;
+    }
+    if (app.find.input.empty()) {
+        app.find.open = app.find.focus = true;
+        set_status(app, "Type what to find, then Select All Matches (Alt+F3)");
+        return;
+    }
+    find_start(app, SearchJob::Mode::All);
+    app.find.select_matches = app.find.error.empty();
+}
+
+void add_selection(App& app) {
+    Document* d = usable_doc(app);
+    if (!d) return;
+    if (!add_primary_to_extras(d->view())) {
+        set_status(app, "Select bytes first: Add Selection keeps them and lets you select more (or Alt+drag)");
+        return;
+    }
+    d->view_generation++;
+    const std::vector<ByteRange> rs = selection_ranges(d->view(), d->size());
+    set_status(app, std::to_string(rs.size()) + (rs.size() == 1 ? " range" : " ranges") +
+                        " selected; select the next one (Esc clears them)");
+}
+
+void clear_extra_selections(App& app) {
+    if (Document* d = usable_doc(app)) {
+        d->view().extra_sel.clear();
+        d->view_generation++;
+    }
+}
+
+void bookmark_selections_action(App& app) {
+    Document* d = usable_doc(app);
+    if (!d) return;
+    std::string err;
+    const size_t n = bookmark_selections(*d, &err);
+    if (n)
+        set_status(app, "Added " + std::to_string(n) + (n == 1 ? " bookmark" : " bookmarks"));
+    else
+        set_status(app, err, 6.0);
+}
+
 // ---- search --------------------------------------------------------------------------------
 
 void open_find_bar(App& app) {
@@ -1320,6 +1453,7 @@ void open_find_bar(App& app) {
 
 void find_start(App& app, SearchJob::Mode mode) {
     FindState& f = app.find;
+    f.select_matches = false;  // only Select All Matches asks for it (after this call)
     Document* d = usable_doc(app);
     if (!d) return;
     if (f.input.empty()) {
@@ -1381,6 +1515,10 @@ void poll_search(App& app) {
         app.show_results = true;
         app.focus_results = true;
         set_status(app, std::to_string(h.offsets.size()) + (h.truncated ? "+" : "") + " hits for '" + h.query + "'" + skip);
+        if (f.select_matches) {  // Select All Matches started this search
+            f.select_matches = false;
+            select_hits(app, *t);
+        }
         return;
     }
     if (r.hits.empty()) {
@@ -1415,6 +1553,15 @@ bool has_doc(App& a) { return usable_doc(a) != nullptr; }
 bool has_selection(App& a) {
     Document* d = usable_doc(a);
     return d && d->view().has_selection();
+}
+// The primary selection or extra ranges of a multi-selection (Cut, Fill, Bookmark Selections).
+bool has_any_selection(App& a) {
+    Document* d = usable_doc(a);
+    return d && (d->view().has_selection() || has_extra_selections(d->view()));
+}
+bool has_extras(App& a) {
+    Document* d = usable_doc(a);
+    return d && has_extra_selections(d->view());
 }
 bool can_undo(App& a) {
     Document* d = usable_doc(a);
@@ -1568,6 +1715,24 @@ void toggle_panel(bool& show, bool& focus) {
     focus = show;
 }
 
+// The show_* flags from settings.ini's panel_* (load_ui_settings), or the default layout's
+// (Reset Layout: Settings' defaults, so the on-demand panels close; store_ui_settings follows).
+void apply_panel_visibility(App& app, const Settings& s) {
+    app.show_inspector = s.panel_inspector;
+    app.show_structure = s.panel_structure;
+    app.show_console = s.panel_console;
+    app.show_results = s.panel_results;
+    app.show_bookmarks = s.panel_bookmarks;
+    app.show_strings = s.panel_strings;
+    app.show_hashes = s.panel_hashes;
+    app.show_bitmap = s.panel_bitmap;
+    app.show_packets = s.panel_packets;
+    app.show_history = s.panel_history;
+    app.show_xor = s.panel_xor;
+    app.show_disasm = s.panel_disasm;
+    app.show_regions = s.panel_regions;
+}
+
 // Bitmap panel at a fixed offset: the cursor / selection start.
 void bitmap_at_cursor(App& a) {
     Document* d = usable_doc(a);
@@ -1689,12 +1854,17 @@ const Action kActions[] = {
     // Edit
     {"Undo", {C(ImGuiKey_Z), 0}, [](App& a) { do_undo(a, false); }, can_undo, false, true},
     {"Redo", {C(ImGuiKey_Y), CS(ImGuiKey_Z)}, [](App& a) { do_undo(a, true); }, can_redo, false, true},
-    {"Cut", {C(ImGuiKey_X), 0}, [](App& a) { cut_selection(a); }, has_selection, false, false},
+    {"Cut", {C(ImGuiKey_X), 0}, [](App& a) { cut_selection(a); }, has_any_selection, false, false},
     {"Copy", {C(ImGuiKey_C), 0}, [](App& a) { copy_default(a); }, has_doc, false, false},
     {"Copy As...", {CS(ImGuiKey_C), 0}, [](App& a) { a.req_copy_as = true; }, has_doc, false, false},
     {"Paste", {C(ImGuiKey_V), 0}, [](App& a) { paste(a); }, has_doc, false, false},
     {"Select All", {C(ImGuiKey_A), 0}, [](App& a) { select_all(a); }, has_doc, false, false},
-    {"Fill Selection...", {0, 0}, [](App& a) { a.req_fill = true; }, has_selection, false, false},
+    {"Fill Selection...", {0, 0}, [](App& a) { a.req_fill = true; }, has_any_selection, false, false},
+    // Multi-selection (also Alt+click / Alt+drag in the hex view; Esc there clears the extra ranges)
+    {"Add Selection", {CS(ImGuiKey_A), 0}, add_selection, has_selection, false, false},
+    {"Select All Matches", {A(ImGuiKey_F3), 0}, select_all_matches, has_doc, true, false},
+    {"Clear Extra Selections", {0, 0}, clear_extra_selections, has_extras, false, false},
+    {"Bookmark Selections", {0, 0}, bookmark_selections_action, has_any_selection, false, false},
     {"Toggle Insert / Overwrite", {ImGuiKey_Insert, 0}, [](App& a) { toggle_insert_mode(a); }, has_tab, false, false},
     {"Toggle Read-only", {0, 0}, [](App& a) { toggle_read_only(a); }, has_doc, false, false},
     {"Settings...", {C(ImGuiKey_Comma), 0}, [](App& a) { a.show_settings = !a.show_settings; }, nullptr, true, false},
@@ -1756,8 +1926,7 @@ const Action kActions[] = {
     {"Split View: Switch Pane", {ImGuiKey_F6, 0}, switch_pane, has_split, false, false},
     {"Reset Layout", {0, 0}, [](App& a) {
          a.build_layout = true;
-         a.show_inspector = a.show_structure = a.show_console = a.show_results = a.show_bookmarks = true;
-         a.show_strings = a.show_hashes = true;
+         apply_panel_visibility(a, Settings{});  // the default panels; on-demand ones close
      }, nullptr, true, false},
     // Analysis panels
     {"Strings: Scan File", {0, 0}, [](App& a) { show_strings(a); a.strings_panel.request_scan(false); }, has_doc, true, false},
@@ -1796,6 +1965,14 @@ const Action kActions[] = {
     {"Packets: Follow TCP Stream (Interleaved)", {0, 0}, [](App& a) {
          a.show_packets = a.focus_packets = true;
          a.packets_panel.request_follow_stream(true);
+     }, has_capture, true, false},
+    {"Packets: Follow UDP Stream", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_follow_stream(false, PacketsPanel::FollowProto::Udp);
+     }, has_capture, true, false},
+    {"Packets: Follow UDP Stream (Interleaved)", {0, 0}, [](App& a) {
+         a.show_packets = a.focus_packets = true;
+         a.packets_panel.request_follow_stream(true, PacketsPanel::FollowProto::Udp);
      }, has_capture, true, false},
     {"Packets: Open Packet as Tab", {0, 0}, [](App& a) {
          a.show_packets = a.focus_packets = true;
@@ -1934,6 +2111,15 @@ void draw_edit_menu(App& app) {
     ImGui::Separator();
     menu_action(app, "Select All");
     menu_action(app, "Fill Selection...");
+    if (ImGui::BeginMenu("Multi-Selection", d != nullptr)) {
+        menu_action(app, "Add Selection");
+        menu_action(app, "Select All Matches");
+        menu_action(app, "Bookmark Selections");
+        menu_action(app, "Clear Extra Selections");
+        ImGui::Separator();
+        ImGui::TextDisabled("Alt+click / Alt+drag adds a range");
+        ImGui::EndMenu();
+    }
     ImGui::Separator();
     Tab* t = active_tab(app);
     menu_action(app, "Toggle Insert / Overwrite", "Insert Mode", t && t->insert_mode);
@@ -2435,6 +2621,10 @@ void draw_hex_context_menu(App& app) {
     ImGui::Separator();
     menu_action(app, "Select All");
     menu_action(app, "Fill Selection...");
+    if (has_extras(app)) {
+        menu_action(app, "Bookmark Selections");
+        menu_action(app, "Clear Extra Selections");
+    }
     ImGui::Separator();
     menu_action(app, "Toggle Bookmark");
     menu_action(app, "Go to Offset...");
@@ -2472,14 +2662,48 @@ void adopt_top_units(Tab& t, int bpr) {
     t.top_bpr = bpr;
 }
 
+// Minimap scan options for `d`. Buckets of at least 4 KiB (16..1024 of them): smaller samples
+// underestimate the entropy of random data (~7.9 instead of 8 bits/byte at 1 KiB), which would
+// show it orange. Sampled all-zero buckets are refined while idle (a small region between the
+// samples of a huge allocated zero area, e.g. a disk image, shows up after a while).
+EntropyOptions entropy_options(const Document& d) {
+    EntropyOptions o;
+    o.buckets = uint32_t(std::clamp<uint64_t>(d.size() / 4096, 16, o.buckets));
+    o.refine_passes = 64;
+    return o;
+}
+
+// Process memory changes underneath without edits: every 2 s (while the minimap is shown and no
+// scan runs) the buckets around the visible bytes [vb, ve) and a rotating 1/64 of the others are
+// read again (EntropyJob::refresh); the rest keep their last result.
+void refresh_process_entropy(Tab& t, uint64_t vb, uint64_t ve, double n) {
+    Document& d = *t.doc;
+    if (d.target() != SourceKind::Process || t.entropy.running() || n < t.entropy_next_refresh) return;
+    t.entropy_next_refresh = n + 2.0;
+    const auto r = t.entropy.result();
+    if (!r || !r->finished || r->buckets.empty() || r->doc_size != d.size()) return;
+    const uint64_t bs = r->bucket_size, size = d.size();
+    const uint64_t around = 2 * bs;
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.emplace_back(vb > around ? vb - around : 0, ve < size - std::min(size, around) ? ve + around : size);
+    const uint64_t nb = r->buckets.size(), slice = std::max<uint64_t>(1, nb / 64);
+    const uint64_t k = t.entropy_refresh_turn++ % ((nb + slice - 1) / slice);
+    ranges.emplace_back(k * slice * bs, std::min(size, (k + 1) * slice * bs));
+    t.entropy.refresh(d.snapshot(), std::move(ranges), entropy_options(d));
+}
+
 // Starts the minimap scan of the tab's document: right away the first time, else once the
 // generation has been stable for 1 s (at most 5 s after the first change, so a growing file
-// under live tail still gets rescanned). Never while saving.
-void update_entropy(App& app, Tab& t) {
+// under live tail still gets rescanned). Never while saving. [vb, ve) = the visible bytes.
+void update_entropy(App& app, Tab& t, uint64_t vb, uint64_t ve) {
     Document& d = *t.doc;
     const uint64_t g = d.generation();
-    if (g == t.entropy_gen || d.busy()) return;
+    if (d.busy()) return;
     const double n = now_s();
+    if (g == t.entropy_gen) {
+        refresh_process_entropy(t, vb, ve, n);
+        return;
+    }
     if (g != t.entropy_pending_gen) {
         if (t.entropy_pending_gen == t.entropy_gen) t.entropy_first_change = n;  // nothing was pending
         t.entropy_pending_gen = g;
@@ -2487,10 +2711,7 @@ void update_entropy(App& app, Tab& t) {
     }
     const bool first = t.entropy_gen == UINT64_MAX;
     if (first || n >= std::min(t.entropy_last_change + 1.0, t.entropy_first_change + 5.0)) {
-        // Buckets of at least 4 KiB (16..1024 of them): smaller samples underestimate the entropy
-        // of random data (~7.9 instead of 8 bits/byte at 1 KiB), which would show it orange.
-        EntropyOptions o;
-        o.buckets = uint32_t(std::clamp<uint64_t>(d.size() / 4096, 16, o.buckets));
+        const EntropyOptions o = entropy_options(d);
         // Edits rescan only the buckets they touched; a save may have patched the file in place
         // (bytes changed under unchanged pieces), so the first scan after one reads everything.
         const uint64_t saved = d.saved_state_id();
@@ -2498,6 +2719,7 @@ void update_entropy(App& app, Tab& t) {
         else t.entropy.rescan(d.snapshot(), o);
         t.entropy_saved = saved;
         t.entropy_gen = t.entropy_pending_gen = g;
+        t.entropy_next_refresh = n + 2.0;
     } else {
         app.wants_poll = true;  // wake up when the debounce expires
     }
@@ -2508,19 +2730,18 @@ void update_entropy(App& app, Tab& t) {
 // `ev` = the pane's events of this frame; doc.view().top_row is the pane's while it is drawn.
 void draw_minimap(App& app, Tab& t, Minimap& mm, HexView& view, const HexViewEvents& ev, float width) {
     Document& d = *t.doc;
-    update_entropy(app, t);
-    std::shared_ptr<const EntropyResult> r = t.entropy.result();
-    // While a rescan runs, keep the last complete map of the same size (no flicker after an edit).
-    const auto& old = t.entropy_shown;
-    const bool keep_old = old && old->finished && !old->cancelled && old->doc_size == d.size() && (!r || !r->finished);
-    if (!keep_old) t.entropy_shown = r;
-    if (t.entropy.running()) app.wants_poll = true;  // progressive map
-
     const uint64_t size = d.size();
     const uint64_t bpr = uint64_t(std::max(1, ev.bytes_per_row));
     const uint64_t top = d.view().top_row;
     const uint64_t vb = top > size / bpr ? size : top * bpr;
     const uint64_t ve = vb + std::min(size - vb, uint64_t(std::max(1, ev.visible_rows)) * bpr);
+    update_entropy(app, t, vb, ve);
+    std::shared_ptr<const EntropyResult> r = t.entropy.result();
+    // While a rescan runs, keep the last complete map of the same size (no flicker after an edit).
+    const auto& old = t.entropy_shown;
+    const bool keep_old = old && old->finished && !old->cancelled && old->doc_size == d.size() && (!r || !r->finished);
+    if (!keep_old) t.entropy_shown = r;
+    if (t.entropy.running()) app.wants_poll = true;  // progressive map (refinement: the idle frames)
     ImGui::SameLine(0.0f, 0.0f);
     MinimapEvents mev;
     mm.draw("##minimap", width, 0.0f, t.entropy_shown.get(), size, vb, ve,
@@ -3118,13 +3339,19 @@ void draw_fill(App& app) {
     if (!ImGui::BeginPopupModal(kPopFill, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
     Tab* t = active_tab(app);
     Document* d = usable_doc(app);
-    if (!d || !d->view().has_selection()) {
+    if (!d || !(d->view().has_selection() || has_extra_selections(d->view()))) {
         ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         return;
     }
     const ViewState& v = d->view();
-    ImGui::Text("Fill %s", fmt_range(v.sel_begin(), v.sel_len()).c_str());
+    const bool multi = has_extra_selections(v);
+    const std::vector<ByteRange> ranges = multi ? selection_ranges(v, d->size()) : std::vector<ByteRange>{};
+    if (multi)
+        ImGui::Text("Fill %zu ranges (%s), each from the pattern start", ranges.size(),
+                    fmt_size(range_total(ranges)).c_str());
+    else
+        ImGui::Text("Fill %s", fmt_range(v.sel_begin(), v.sel_len()).c_str());
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(360.0f * app.ui_scale);
     const bool enter = ImGui::InputTextWithHint("##pattern", "hex pattern, e.g. 00 or DE AD BE EF", &app.fill_input,
@@ -3142,7 +3369,10 @@ void draw_fill(App& app) {
     ImGui::SameLine();
     if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     if (go && ok) {
-        if (d->fill(v.sel_begin(), v.sel_len(), pat.data(), pat.size())) {
+        if (multi && fill_selections(*d, pat.data(), pat.size())) {
+            after_edit(*t);
+            set_status(app, "Filled " + fmt_size(range_total(ranges)) + " in " + std::to_string(ranges.size()) + " ranges");
+        } else if (!multi && d->fill(v.sel_begin(), v.sel_len(), pat.data(), pat.size())) {
             after_edit(*t);
             set_status(app, "Filled " + fmt_size(d->view().sel_len()));
         } else {
@@ -3447,7 +3677,7 @@ void open_pending_popup(App& app) {
         }
     } else if (app.req_fill) {
         app.req_fill = false;
-        if (has_selection(app)) ImGui::OpenPopup(kPopFill);
+        if (has_any_selection(app)) ImGui::OpenPopup(kPopFill);
     } else if (app.req_copy_as) {
         app.req_copy_as = false;
         if (has_doc(app)) ImGui::OpenPopup(kPopCopyAs);
@@ -3765,6 +3995,7 @@ void poll_io_errors(App& app) {
 }
 
 void bring_to_front(GLFWwindow* w) {
+    if (!w) return;  // headless
     if (glfwGetWindowAttrib(w, GLFW_ICONIFIED)) glfwRestoreWindow(w);
     glfwFocusWindow(w);
     // The OS may refuse to steal the focus (Windows foreground rules): flash the taskbar instead.
@@ -4036,7 +4267,7 @@ void update_title(App& app) {
     if (os_elevated()) title += " (Administrator)";
     if (title == app.window_title) return;
     app.window_title = title;
-    glfwSetWindowTitle(app.window, title.c_str());
+    if (app.window) glfwSetWindowTitle(app.window, title.c_str());
 }
 
 void build_default_layout(ImGuiID dock_id) {
@@ -4587,24 +4818,47 @@ void set_window_icon(GLFWwindow* w) {
 }  // namespace
 
 // =============================================================================================
+// Headless driver (app_internal.h; tests/test_app.cpp): the App without a window or GL
+// =============================================================================================
+
+void app_startup(App& app) {
+    apply_core_settings(app.settings);
+    startup(app);
+}
+void app_frame(App& app) { frame(app); }
+void app_shutdown(App& app) { shutdown(app); }
+bool app_save_session(App& app) { return save_session(app, true); }
+
+// An action of the table by name, else any palette entry by its label ("Parser: PNG image",
+// "Script: ...", "Compare with: <tab>"). --action and tests/test_app.cpp.
+bool run_named_action(App& app, const std::string& name, std::string* err) {
+    if (const Action* a = find_action(name.c_str())) {
+        if (!action_enabled(app, *a)) {
+            if (err) *err = "'" + name + "' is not available now";
+            return false;
+        }
+        a->run(app);
+        return true;
+    }
+    app.palette_bookmarks = app.palette_compare = false;
+    build_palette(app);
+    auto it = std::find_if(app.palette_all.begin(), app.palette_all.end(),
+                           [&](const PaletteItem& p) { return p.label == name; });
+    if (it == app.palette_all.end() || !it->enabled) {
+        if (err) *err = it == app.palette_all.end() ? "unknown action '" + name + "'" : "'" + name + "' is not available now";
+        return false;
+    }
+    run_palette_item(app, *it);
+    return true;
+}
+
+// =============================================================================================
 // UI state <-> settings.ini (see CLAUDE.md "Persistence")
 // =============================================================================================
 
 void load_ui_settings(App& app) {
     const Settings& s = app.settings;
-    app.show_inspector = s.panel_inspector;
-    app.show_structure = s.panel_structure;
-    app.show_console = s.panel_console;
-    app.show_results = s.panel_results;
-    app.show_bookmarks = s.panel_bookmarks;
-    app.show_strings = s.panel_strings;
-    app.show_hashes = s.panel_hashes;
-    app.show_bitmap = s.panel_bitmap;
-    app.show_packets = s.panel_packets;
-    app.show_history = s.panel_history;
-    app.show_xor = s.panel_xor;
-    app.show_disasm = s.panel_disasm;
-    app.show_regions = s.panel_regions;
+    apply_panel_visibility(app, s);
     app.find.kind = std::clamp(s.find_kind, 0, 2);
     app.find.icase = s.find_ignore_case;
     app.console_wrap = s.console_wrap;
@@ -4773,22 +5027,8 @@ int run_app(const AppOptions& opts) {
         if (!actions_done && frame_no >= 2 && app.layout_focus_step == 0) {
             actions_done = true;
             for (const std::string& name : opts.actions) {
-                const Action* a = find_action(name.c_str());
-                if (!a) {  // any other palette entry by its label, e.g. "Parser: PNG image", "Script: ..."
-                    app.palette_bookmarks = app.palette_compare = false;
-                    build_palette(app);
-                    auto it = std::find_if(app.palette_all.begin(), app.palette_all.end(),
-                                           [&](const PaletteItem& p) { return p.label == name; });
-                    if (it == app.palette_all.end())
-                        std::fprintf(stderr, "hexer: --action: unknown action '%s'\n", name.c_str());
-                    else if (!it->enabled)
-                        std::fprintf(stderr, "hexer: --action: '%s' is not available now\n", name.c_str());
-                    else
-                        run_palette_item(app, *it);
-                } else if (!action_enabled(app, *a))
-                    std::fprintf(stderr, "hexer: --action: '%s' is not available now\n", name.c_str());
-                else
-                    a->run(app);
+                std::string err;
+                if (!run_named_action(app, name, &err)) std::fprintf(stderr, "hexer: --action: %s\n", err.c_str());
             }
         }
         if (opts.frames > 0 && frame_no >= opts.frames) {

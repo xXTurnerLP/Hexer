@@ -40,7 +40,9 @@ const char* kFilterHelp =
     "Filter expression, e.g.  tcp.port == 80 and not ip.src == 10.0.0.0/8\n\n"
     "Fields: ip.src  ip.dst  ip.addr (IPv4 / IPv6, optional /prefix)\n"
     "        tcp.port  tcp.srcport  tcp.dstport  udp.port  udp.srcport  udp.dstport\n"
-    "        frame.len  eth.type  proto (== tcp | udp | icmp | icmpv6 | arp | ip | ipv6)\n"
+    "        tcp.seq  tcp.ack  tcp.flags (0x12, syn+ack)  tcp.flags.syn / .ack / .fin / .rst ...\n"
+    "        frame.len  frame.number  eth.type  vlan  ip.proto\n"
+    "        proto (== tcp | udp | icmp | icmpv6 | arp | ip | ipv6)\n"
     "Operators: == != < > <= >=   and or not (&& || !)   ( )\n"
     "A protocol alone (tcp, not arp) and \"text\" (Proto / Summary substring) work too.\n"
     "ip.addr / tcp.port / udp.port mean either end (!= : neither end).";
@@ -94,6 +96,26 @@ struct PacketsPanel::DocState {
     size_t selected = SIZE_MAX;                   // packet index
     size_t scroll_to = SIZE_MAX;                  // row to bring into view on this draw
     std::string parser;                           // "" = none (select only)
+    // Live tail: the document generation up to which only appends happened since the index run
+    // that started at pending_doc_gen (appended() extends it); appending = that run is an append.
+    uint64_t chain_gen = 0;
+    bool appending = false;
+    bool incremental = false;                     // the last index result continued the one before
+    ConversationJob conv_job;                     // Stream column
+    uint64_t conv_seen_gen = 0;
+    std::shared_ptr<const ConversationJobResult> conv;
+
+    // The index grew from `old_count` packets (live tail): filter only the new ones.
+    void extend_filter(size_t old_count, size_t sync_max) {
+        if (!filtered()) return;
+        if (filter_async && !filter_done) return reset_filter(sync_max);  // that run numbers the old index
+        const size_t from = filter_async ? old_count : tested;
+        filter_done = from >= packet_count();
+        if (!filter_async && packet_count() <= sync_max) return;  // the incremental UI-thread filter goes on
+        filter_async = true;
+        tested = from;
+        if (!filter_done) filter_job.start(res, filter, from, matches);
+    }
 
     void reset_filter(size_t sync_max) {
         tested = 0;
@@ -190,7 +212,30 @@ void PacketsPanel::forget(uint64_t doc_id) {
     auto it = docs_.find(doc_id);
     if (it == docs_.end()) return;
     it->second->job.cancel();
+    it->second->conv_job.cancel();
     docs_.erase(it);  // the job's destructor joins its worker (it stops at the next record)
+}
+
+void PacketsPanel::appended(uint64_t doc_id, uint64_t gen_before, uint64_t gen_after) {
+    auto it = docs_.find(doc_id);
+    if (it != docs_.end() && it->second->chain_gen == gen_before) it->second->chain_gen = gen_after;
+}
+
+size_t PacketsPanel::indexed_packets(uint64_t doc_id) const {
+    auto it = docs_.find(doc_id);
+    return it == docs_.end() ? 0 : it->second->packet_count();
+}
+
+bool PacketsPanel::last_index_incremental(uint64_t doc_id) const {
+    auto it = docs_.find(doc_id);
+    return it != docs_.end() && it->second->incremental;
+}
+
+uint32_t PacketsPanel::stream_of(uint64_t doc_id, size_t idx) const {
+    auto it = docs_.find(doc_id);
+    if (it == docs_.end() || !it->second->conv) return kNoStream;
+    const std::vector<uint32_t>& s = it->second->conv->conv.stream;
+    return idx < s.size() ? s[idx] : kNoStream;
 }
 
 namespace {
@@ -277,11 +322,18 @@ void PacketsPanel::run_pending(Pending what, DocState& st, Document& doc, size_t
         return true;
     };
     switch (what) {
-    case Pending::Follow:
-        if (!pi.tcp_header || pi.fragment) return note("Follow TCP Stream: packet " + num + " is not a TCP packet");
-        stream_job_.start(st.res, pk, follow_interleaved, stream_max);
+    case Pending::Follow: {
+        const bool tcp = pi.tcp_header && !pi.fragment, udp = pi.has_ports && pi.proto == "UDP" && !pi.fragment;
+        if (follow_proto_ == FollowProto::Tcp && !tcp)
+            return note("Follow TCP Stream: packet " + num + " is not a TCP packet");
+        if (follow_proto_ == FollowProto::Udp && !udp)
+            return note("Follow UDP Stream: packet " + num + " is not a UDP packet");
+        if (!tcp && !udp) return note("Follow Stream: packet " + num + " is not a TCP or UDP packet");
+        const bool use_udp = follow_proto_ == FollowProto::Udp || (follow_proto_ == FollowProto::Any && !tcp);
+        stream_job_.start(st.res, pk, follow_interleaved, stream_max, use_udp);
         filter_conversation();
-        return note("Following the TCP stream of packet " + num + "...");
+        return note(std::string("Following the ") + (use_udp ? "UDP" : "TCP") + " stream of packet " + num + "...");
+    }
     case Pending::Conversation:
         if (!filter_conversation()) note("Packet " + num + " has no IP addresses to filter on");
         return;
@@ -319,16 +371,17 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
         stream_seen_gen_ = stream_job_.generation();
         if (auto r = stream_job_.result()) {
             const std::string num = "#" + std::to_string(r->packet + 1);
+            const std::string proto = r->stream.udp ? "UDP" : "TCP";
             std::string msg;
             if (r->stream.cancelled) {
-                msg = "Follow TCP Stream cancelled";
+                msg = "Follow " + proto + " Stream cancelled";
             } else if (!r->stream.error.empty()) {
-                msg = "Follow TCP Stream: " + r->stream.error;
+                msg = "Follow " + proto + " Stream: " + r->stream.error;
             } else if (r->doc.bytes.empty()) {
-                msg = "The TCP stream of packet " + num + " has no payload (" + tcp_stream_summary(r->stream) + ")";
+                msg = "The " + proto + " stream of packet " + num + " has no payload (" + tcp_stream_summary(r->stream) + ")";
             } else {
                 if (cb.open_tab) cb.open_tab(r->doc.name, r->doc.bytes, r->doc.bookmarks);
-                msg = "TCP stream: " + tcp_stream_summary(r->stream);
+                msg = proto + " stream: " + tcp_stream_summary(r->stream);
                 if (r->doc.bookmarks_capped)
                     msg += "; bookmarks for the first " + fmt_count(r->doc.bookmarks.size()) + " segments only";
             }
@@ -350,18 +403,34 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
     // ---- pick up a finished index ----
     if (st.job.generation() != st.seen_gen) {
         st.seen_gen = st.job.generation();
+        std::shared_ptr<const PcapIndexJob::Result> prev = std::move(st.res);
         st.res = st.job.result();
         st.res_doc_gen = st.pending_doc_gen;
-        st.selected = SIZE_MAX;
-        st.cache.clear();
-        st.reset_filter(filter_sync_max);
-        st.first_ts = 0;
-        if (st.res) {
+        // A live-tail append that continued the index we show: keep the selection, the rows, the
+        // filter matches and the Stream numbers; only the new packets are looked at.
+        const bool grew = st.appending && st.res && prev && st.res->incremental &&
+                          st.res->prev_packets == prev->index.packets.size();
+        st.appending = false;
+        st.incremental = grew;
+        if (grew) {
+            st.extend_filter(prev->index.packets.size(), filter_sync_max);
+            st.conv_job.start(st.res, st.conv);
+        } else {
+            st.selected = SIZE_MAX;
+            st.cache.clear();
+            st.reset_filter(filter_sync_max);
+            st.first_ts = 0;
+            st.conv.reset();
+            if (st.res) st.conv_job.start(st.res);
+        }
+        if (st.res && (!grew || st.first_ts == 0)) {
             for (const Packet& p : st.res->index.packets)
                 if (p.ts_ns != kNoTimestamp) {
                     st.first_ts = p.ts_ns;
                     break;
                 }
+        }
+        if (st.res && !grew) {
             if (cb.notify) {
                 const auto& ix = st.res->index;
                 std::string msg = "Packets: " + fmt_count(ix.packets.size()) + (ix.truncated ? "+" : "") + " indexed";
@@ -376,7 +445,15 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
     bool start = index_requested_ && capture && !doc->busy();
     index_requested_ = false;
     if (!st.auto_started && capture && !doc->busy() && !st.res && !st.job.running()) start = true;
-    const bool running = st.job.running();
+    // Live tail: only appends happened since the index we show was started: index the new records.
+    if (!start && capture && !doc->busy() && st.res && !st.job.running() && st.res_doc_gen == st.pending_doc_gen &&
+        st.res_doc_gen != doc->generation() && st.chain_gen == doc->generation()) {
+        st.pending_doc_gen = doc->generation();
+        st.appending = true;
+        st.job.start_append(doc->snapshot(), st.res, max_packets);
+    }
+    const bool running = st.job.running() && !st.appending;  // a short append keeps the list usable
+    if (st.job.running() || st.conv_job.running()) wants_frames_ = true;
     ImGui::BeginDisabled(doc->busy() || !capture);
     if (ImGui::Button(running ? "Re-index###index" : "Index###index")) start = true;
     ImGui::EndDisabled();
@@ -384,8 +461,15 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
         ImGui::SetTooltip("Document is being saved...");
     if (start) {
         st.auto_started = true;
-        st.pending_doc_gen = doc->generation();
+        st.appending = false;
+        st.chain_gen = st.pending_doc_gen = doc->generation();
         st.job.start(doc->snapshot(), max_packets);
+    }
+    // ---- Stream numbers of the index we show ----
+    if (st.conv_job.generation() != st.conv_seen_gen) {
+        st.conv_seen_gen = st.conv_job.generation();
+        auto r = st.conv_job.result();
+        if (r && !r->cancelled && r->index == st.res) st.conv = std::move(r);
     }
     // ---- a requested action (palette / menus / buttons): needs the index ----
     if (pending_ != Pending::None) {
@@ -443,14 +527,15 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
     }
     const bool have_index = st.res && !running;
     ImGui::BeginDisabled(!have_index || stream_job_.running());
-    if (ImGui::Button("Follow TCP Stream")) ImGui::OpenPopup("##follow");
+    if (ImGui::Button("Follow Stream")) ImGui::OpenPopup("##follow");
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("Reassemble the selected packet's TCP connection into a new tab\n"
+        ImGui::SetTooltip("Reassemble the selected packet's TCP connection (or collect its UDP\n"
+                          "conversation's datagrams) into a new tab\n"
                           "(one bookmark per segment: packet number and direction)");
     if (ImGui::BeginPopup("##follow")) {
-        if (ImGui::MenuItem("Client -> server, then server -> client")) request_follow_stream(false);
-        if (ImGui::MenuItem("Interleaved (in arrival order)")) request_follow_stream(true);
+        if (ImGui::MenuItem("Client -> server, then server -> client")) request_follow_stream(false, FollowProto::Any);
+        if (ImGui::MenuItem("Interleaved (in arrival order)")) request_follow_stream(true, FollowProto::Any);
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -476,7 +561,7 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
     }
     if (stream_job_.running()) {
         char pct[48];
-        std::snprintf(pct, sizeof pct, "Following TCP stream %.0f%%", stream_job_.progress() * 100.0);
+        std::snprintf(pct, sizeof pct, "Following stream %.0f%%", stream_job_.progress() * 100.0);
         ImGui::ProgressBar(float(stream_job_.progress()), ImVec2(-80.0f * s, 0.0f), pct);
         ImGui::SameLine();
         if (ImGui::Button("Cancel##stream")) stream_job_.cancel();
@@ -603,14 +688,16 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
     // ---- table ----
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_Resizable;
-    if (!ImGui::BeginTable("##packets", 6, flags)) return;
+    if (!ImGui::BeginTable("##packets", 7, flags)) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
     ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 110.0f * s);
     ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 160.0f * s);
     ImGui::TableSetupColumn("Len", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
     ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
+    ImGui::TableSetupColumn("Stream", ImGuiTableColumnFlags_WidthFixed, 56.0f * s);
     ImGui::TableSetupColumn("Summary", ImGuiTableColumnFlags_WidthStretch);
+    const std::vector<uint32_t>* streams = st.conv ? &st.conv->conv.stream : nullptr;
     ImGui::TableHeadersRow();
     ImGuiListClipper clip;
     clip.Begin(int(std::min<size_t>(rows, size_t(INT_MAX))));
@@ -651,8 +738,15 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
             if (ImGui::BeginPopupContextItem("##row")) {
                 st.selected = i;  // the actions below run on the next draw (they may change the rows)
                 const bool tcp = pi.tcp_header && !pi.fragment;
-                if (ImGui::MenuItem("Follow TCP Stream", nullptr, false, tcp)) request_follow_stream(false);
-                if (ImGui::MenuItem("Follow TCP Stream (interleaved)", nullptr, false, tcp)) request_follow_stream(true);
+                const bool udp = pi.has_ports && pi.proto == "UDP" && !pi.fragment;
+                if (udp) {
+                    if (ImGui::MenuItem("Follow UDP Stream")) request_follow_stream(false, FollowProto::Udp);
+                    if (ImGui::MenuItem("Follow UDP Stream (interleaved)")) request_follow_stream(true, FollowProto::Udp);
+                } else {
+                    if (ImGui::MenuItem("Follow TCP Stream", nullptr, false, tcp)) request_follow_stream(false);
+                    if (ImGui::MenuItem("Follow TCP Stream (interleaved)", nullptr, false, tcp))
+                        request_follow_stream(true);
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Open Packet as Tab")) request_open_packet(false);
                 if (ImGui::MenuItem("Open Payload as Tab", nullptr, false, pi.length > 0)) request_open_packet(true);
@@ -676,6 +770,11 @@ void PacketsPanel::draw(Document* doc, const std::vector<std::string>& parser_na
             ImGui::TableSetColumnIndex(4);
             ImGui::TextColored(proto_color(pi.proto), "%s", pi.proto.c_str());
             ImGui::TableSetColumnIndex(5);
+            if (streams && i < streams->size() && (*streams)[i] != kNoStream) {
+                std::snprintf(buf, sizeof buf, "%u", unsigned((*streams)[i]));
+                ImGui::TextUnformatted(buf);
+            }
+            ImGui::TableSetColumnIndex(6);
             if (mono) ImGui::PushFont(mono, 0.0f);
             if (pi.malformed) ImGui::TextColored(kErrColor, "%s", pi.summary.c_str());
             else ImGui::TextUnformatted(pi.summary.c_str());

@@ -100,6 +100,7 @@ struct Ui {
         ImGuiIO& io = ImGui::GetIO();
         if (m & ImGuiMod_Shift) io.AddKeyEvent(ImGuiMod_Shift, down);
         if (m & ImGuiMod_Ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, down);
+        if (m & ImGuiMod_Alt) io.AddKeyEvent(ImGuiMod_Alt, down);
         if (m) frame();
     }
     void click(ImVec2 p, int m = 0, int b = 0) {
@@ -118,12 +119,14 @@ struct Ui {
         button(false);
         settle();
     }
-    void drag(ImVec2 a, ImVec2 b) {
+    void drag(ImVec2 a, ImVec2 b, int m = 0) {
+        mods(m, true);
         move(a);
         button(true);
         // a few intermediate positions, like a real drag
         for (int i = 1; i <= 4; ++i) move(ImVec2(a.x + (b.x - a.x) * float(i) / 4.0f, a.y + (b.y - a.y) * float(i) / 4.0f));
         button(false);
+        mods(m, false);
         settle();
     }
     void key(ImGuiKey k, int m = 0) {
@@ -742,6 +745,105 @@ TEST_CASE("ui: plain and shift clicks are unaffected by follow pointer") {
     ev = press_events(ui, ui.hex(12), ImGuiMod_Shift);
     CHECK(!ev.follow_requested);
     CHECK(ui.sel() == Range{8, 13});
+}
+
+// =============================================================================================
+// multi-selection (Alt+click / Alt+drag, Esc, Delete)
+// =============================================================================================
+
+TEST_CASE("ui: alt+drag adds a range, the previous selection joins the extra ranges") {
+    Ui ui(iota_bytes(100));
+    ui.drag(ui.hex(2), ui.hex(4));
+    CHECK(ui.sel() == Range{2, 5});
+    CHECK(ui.v().extra_sel.empty());
+    ui.drag(ui.hex(10), ui.hex(12), ImGuiMod_Alt);
+    CHECK(ui.sel() == Range{10, 13});
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}});
+    ui.drag(ui.txt(40), ui.txt(35), ImGuiMod_Alt);  // backward, in the text column
+    CHECK(ui.sel() == Range{35, 41});
+    CHECK(ui.v().ascii_focus);
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}, {10, 13}});
+    // Alt+click selects one byte as a new range; the ranges touching it merge.
+    ui.click(ui.hex(13), ImGuiMod_Alt);
+    CHECK(ui.sel() == Range{13, 14});
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}, {10, 13}, {35, 41}});
+    ui.click(ui.hex(20), ImGuiMod_Alt);
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}, {10, 14}, {35, 41}});
+    CHECK(selection_ranges(ui.v(), ui.doc->size()) ==
+          std::vector<ByteRange>{{2, 5}, {10, 14}, {20, 21}, {35, 41}});
+}
+
+TEST_CASE("ui: alt+click on a selected byte removes its range; a plain click and Esc clear the extras") {
+    Ui ui(iota_bytes(100));
+    ui.drag(ui.hex(2), ui.hex(4));
+    ui.drag(ui.hex(10), ui.hex(12), ImGuiMod_Alt);
+    ui.drag(ui.hex(20), ui.hex(22), ImGuiMod_Alt);
+    REQUIRE(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}, {10, 13}});
+    ui.click(ui.hex(11), ImGuiMod_Alt);  // inside an extra range: removed, the primary stays
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}});
+    CHECK(ui.sel() == Range{20, 23});
+    ui.click(ui.hex(21), ImGuiMod_Alt);  // inside the primary selection: collapsed to the caret
+    CHECK(!ui.v().has_selection());
+    CHECK(ui.v().cursor == 21);
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{2, 5}});
+
+    // Keyboard moves and Shift+click keep the extras; Esc clears them, and the selection stays.
+    ui.key(ImGuiKey_RightArrow);
+    ui.click(ui.hex(30), ImGuiMod_Shift);
+    CHECK(ui.v().extra_sel.size() == 1);
+    CHECK(ui.sel() == Range{22, 31});
+    ui.key(ImGuiKey_Escape);
+    CHECK(ui.v().extra_sel.empty());
+    CHECK(ui.sel() == Range{22, 31});
+
+    ui.drag(ui.hex(40), ui.hex(41), ImGuiMod_Alt);
+    REQUIRE(ui.v().extra_sel.size() == 1);
+    ui.click(ui.hex(50));  // plain click
+    CHECK(ui.v().extra_sel.empty());
+    CHECK(ui.v().cursor == 50);
+}
+
+TEST_CASE("ui: Delete and Backspace with extra ranges delete every range as one undo step") {
+    Ui ui(iota_bytes(32));
+    ui.drag(ui.hex(2), ui.hex(3));
+    ui.drag(ui.hex(10), ui.hex(11), ImGuiMod_Alt);
+    ui.click(ui.hex(20), ImGuiMod_Alt);
+    const size_t steps = ui.doc->undo_stack().size();
+    ui.key(ImGuiKey_Delete);
+    CHECK(ui.doc->size() == 27);
+    CHECK(ui.byte(2) == 4);
+    CHECK(ui.byte(8) == 12);
+    CHECK(ui.byte(16) == 21);
+    CHECK(ui.v().cursor == 2);
+    CHECK(ui.v().extra_sel.empty());
+    CHECK(ui.doc->undo_stack().size() == steps + 1);
+    REQUIRE(ui.doc->undo());
+    CHECK(ui.doc->size() == 32);
+
+    // Backspace (overwrite mode, empty primary selection): the extra ranges still go.
+    ui.click(ui.hex(5));
+    ui.click(ui.hex(7), ImGuiMod_Alt);
+    ui.click(ui.hex(9), ImGuiMod_Alt);
+    ui.click(ui.hex(9), ImGuiMod_Alt);  // toggles the primary byte off again
+    REQUIRE(!ui.v().has_selection());
+    REQUIRE(ui.v().extra_sel == std::vector<ByteRange>{{7, 8}});
+    ui.key(ImGuiKey_Backspace);
+    CHECK(ui.doc->size() == 31);
+    CHECK(ui.byte(7) == 8);
+}
+
+TEST_CASE("ui: extra ranges outside the view and past EOF draw without trouble") {
+    Ui ui(iota_bytes(64 * 1024));
+    ui.v().extra_sel = {{3, 9}, {100, 4000}, {60000, 70000}};  // the last one reaches past EOF
+    ui.frame();
+    ui.v().top_row = 2000;
+    ui.frame();
+    ui.v().top_row = 3990;
+    ui.frame();
+    CHECK(ui.view.geometry().valid);
+    REQUIRE(ui.view.geometry().top_row * 16 > 60000);
+    ui.click(ui.hex(ui.view.geometry().top_row * 16 + 3), ImGuiMod_Alt);  // inside the last range
+    CHECK(ui.v().extra_sel == std::vector<ByteRange>{{3, 9}, {100, 4000}});
 }
 
 TEST_CASE("ui: mouse X1/X2 report back/forward while hovered") {

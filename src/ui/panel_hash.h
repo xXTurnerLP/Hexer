@@ -11,6 +11,9 @@
 //   * "Expected" input: a row whose value matches (hex, optional 0x, any case, spaces/colons
 //     ignored) is highlighted green.
 //   * Values computed for an older document state / another range are marked stale.
+//   * Script algorithms (hx.hash_algorithm, set_custom) are listed below the built-ins in the
+//     Algorithms popup and run on the same worker (each in a Lua state of its own); a failing one
+//     shows its error in the Value column and once through HashPanelCallbacks::error.
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -29,6 +32,9 @@ struct HashPanelCallbacks {
     std::function<void(const std::string& text)> copy;
     // Short user-facing notice, e.g. for the status bar ("Copied SHA-256"). Optional.
     std::function<void(const std::string& message)> status;
+    // A script algorithm failed ("Hash 'name': file:line: ..."); reported once per message until
+    // the next set_custom(). Optional (e.g. the console).
+    std::function<void(const std::string& message)> error;
 };
 
 class HashPanel {
@@ -49,9 +55,16 @@ public:
     // frames (instead of waiting for input) so the debounce fires and progress shows.
     bool wants_frames() const { return job_.running() || pending_since_ >= 0.0; }
 
-    // Selected algorithms by display name (for persisting in settings). Unknown names are ignored.
+    // Selected algorithms by display name (for persisting in settings): built-ins, then script
+    // ones. Names that are not built-ins are kept as script algorithms even before the scripts
+    // that define them are loaded (they apply once set_custom lists them).
     std::vector<std::string> selected() const;
     void set_selected(const std::vector<std::string>& names);
+
+    // The script algorithms (ScriptEngine::custom_hashes) as of `generation` (ScriptEngine::
+    // hash_algorithms_generation); the host calls it when the generation changed.
+    void set_custom(std::vector<CustomHashAlgorithm> list, uint64_t generation);
+    uint64_t custom_generation() const { return custom_gen_; }
 
     bool whole_file = false;   // hash the whole file even when there is a selection
     std::string expected;      // the "Expected" input
@@ -60,13 +73,22 @@ private:
     struct Key {               // what a result was computed for
         uint64_t doc_id = 0, gen = 0, offset = 0, length = 0;
         uint32_t algos = 0;    // bit i = hash_algorithms()[i]
+        std::vector<std::string> custom;  // selected script algorithms (custom_ order)
+        uint64_t custom_gen = 0;          // custom_gen_ when `custom` is non-empty, else 0
         bool operator==(const Key&) const = default;
+        bool any() const { return algos || !custom.empty(); }
     };
+    bool custom_on(const std::string& name) const;
+    void set_custom_on(const std::string& name, bool on);
     void start(const Document& doc, const Key& k);
     void draw_algorithm_popup();
     void draw_results(ImFont* mono, float ui_scale, const HashPanelCallbacks& cb);
 
     uint32_t algos_ = 0;
+    std::vector<CustomHashAlgorithm> custom_;  // script algorithms (set_custom)
+    uint64_t custom_gen_ = 0;
+    std::vector<std::string> custom_sel_;      // selected script algorithm names (maybe not loaded yet)
+    std::vector<std::string> reported_;        // errors passed to HashPanelCallbacks::error
     HashJob job_;
     uint64_t seen_gen_ = 0;    // last job generation consumed
     Key job_key_;              // key of the most recently started run

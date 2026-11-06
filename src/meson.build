@@ -28,6 +28,7 @@ core_lib = static_library('hexer_core',
   'core/xorscan.cpp',        # XOR / ADD / ROL brute force
   'core/exe_map.cpp',        # PE / ELF file offset <-> virtual address
   'core/symbols.cpp',        # PE exports / imports, ELF symtab / PLT names
+  'core/multisel.cpp',       # multi-selection: range sets + operations on every range
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [threads_dep],
@@ -50,6 +51,7 @@ script_lib = static_library('hexer_script',
   'script/lua_api.cpp',
   'script/cexport.cpp',      # parse tree -> C header, opts.flags names
   'script/parse_job.cpp',    # ParseJob: a parse on a worker thread, in a Lua state of its own
+  'script/lua_hash.cpp',     # hx.hash_algorithm: Lua hashes (shared state + HashJob workers)
   include_directories : inc,
   cpp_args : conf_args,
   dependencies : [core_dep, disasm_dep, lua_dep],
@@ -122,6 +124,8 @@ install_subdir(meson.project_source_root() / 'scripts', install_dir : get_option
 # Linux desktop integration: launcher entry + hicolor theme icons.
 if host_machine.system() == 'linux'
   install_data('../assets/hexer.desktop', install_dir : get_option('datadir') / 'applications')
+  # AppStream metadata (software centers; the AppImage carries it too, see .github/workflows/ci.yml).
+  install_data('../assets/linux/io.github.xXTurnerLP.Hexer.metainfo.xml', install_dir : get_option('datadir') / 'metainfo')
   foreach s : [16, 24, 32, 48, 64, 128, 256]
     install_data('../assets/icon/hexer-@0@.png'.format(s), rename : 'hexer.png',
       install_dir : get_option('datadir') / 'icons' / 'hicolor' / '@0@x@0@'.format(s) / 'apps')

@@ -1,12 +1,13 @@
 #pragma once
-// XOR / ADD / ROL brute force: find simply obfuscated copies of a known plaintext, guess XOR keys,
-// decode bytes for previews or (through Document, undoable) in place.
+// XOR / ADD / ROL brute force: find simply obfuscated copies of a known plaintext, guess XOR / ADD
+// keys, decode bytes for previews or (through Document, undoable) in place.
 //
 // Transforms (the "encoding" that turned plaintext p into the data d):
 //   Xor     d = p ^ k                  1-byte key, k = 1..255
 //   Add     d = p + k  (mod 256)       1-byte key, k = 1..255 (SUB k is ADD 256-k)
 //   Rol     d = rotl(p, k)             k = 1..7 bits (ROR k is ROL 8-k)
 //   XorKey  d[x] = p[x] ^ key[x % L]   multi-byte key, L = 2..16
+//   AddKey  d[x] = p[x] + key[x % L]   multi-byte key, L = 2..16 (mod 256; SUB key = its negation)
 //
 // Key convention (one for scan hits, key_guess and the apply helpers): the key byte that applies to
 // the byte at ABSOLUTE offset x is key[x % L]. A file XORed with "SECRET" from offset 0 reports the
@@ -15,7 +16,7 @@
 //
 // Scan (scan_xor / XorScanJob): every offset o where data[o, o+n) == encode(plaintext, key) for
 // some key, all keys at once. The first byte determines the candidate key (k = d[o] ^ p[0],
-// d[o] - p[0], ...), the rest verifies it - key-independent, O(1) per offset on average. Streaming
+// d[o] - p[0], ...; the first L bytes for an L-byte key), the rest verifies it - key-independent, O(1) per offset on average. Streaming
 // in 4 MiB blocks with an n-1 byte overlap, so a match across a block edge is reported once.
 // Holes of a sparse source (unmapped process memory) are skipped cheaply via
 // Snapshot::next_readable (no match spans one; XorScanResult::skipped counts them); a genuine I/O
@@ -40,8 +41,8 @@
 
 namespace hx {
 
-enum class XorTransform : uint8_t { Xor, Add, Rol, XorKey };
-const char* transform_name(XorTransform t);  // "XOR", "ADD", "ROL", "XOR key"
+enum class XorTransform : uint8_t { Xor, Add, Rol, XorKey, AddKey };
+const char* transform_name(XorTransform t);  // "XOR", "ADD", "ROL", "XOR key", "ADD key"
 
 constexpr uint32_t kXorMaxKeyLen = 16;
 constexpr size_t kXorBlock = size_t(4) << 20;  // bytes per read
@@ -51,14 +52,15 @@ struct XorScanOptions {
     bool add8 = true;            // ADD / SUB with a 1-byte key
     bool rol = true;             // ROL / ROR 1..7 bits
     bool xor_multi = false;      // XOR with a 2..max_key_len byte key
-    uint32_t max_key_len = kXorMaxKeyLen;  // clamped to 2..kXorMaxKeyLen
+    bool add_multi = false;      // ADD with a 2..max_key_len byte key
+    uint32_t max_key_len = kXorMaxKeyLen;  // clamped to 2..kXorMaxKeyLen (both multi-byte kinds)
     size_t max_results = 100000;
 };
 
 struct XorHit {
     uint64_t offset = 0;
     XorTransform transform = XorTransform::Xor;
-    std::vector<uint8_t> key;    // 1 byte for Xor / Add / Rol (Rol: the bit count), L for XorKey
+    std::vector<uint8_t> key;    // 1 byte for Xor / Add / Rol (Rol: the bit count), L for XorKey / AddKey
     uint32_t phase = 0;          // key index of `offset` (= offset % L); 0 for 1-byte transforms
 };
 
@@ -73,22 +75,26 @@ struct XorScanResult {
     uint64_t skipped = 0;        // bytes in holes of a sparse source passed over (not errors)
 };
 
-// "XOR 0x5A", "ADD 0x03 (SUB 0xFD)", "ROL 3 (ROR 5)", "XOR key 53 45 43 52 45 54 \"SECRET\"".
+// "XOR 0x5A", "ADD 0x03 (SUB 0xFD)", "ROL 3 (ROR 5)", "XOR key 53 45 43 52 45 54 \"SECRET\"",
+// "ADD key 01 02 03".
 std::string describe_key(XorTransform t, const std::vector<uint8_t>& key);
 
 // Encodes (decode=false: p -> d) or decodes (decode=true: d -> p) `n` bytes in place. Byte i uses
-// key[(phase + i) % key.size()] (XorKey; the other transforms use key[0]). An empty key is a no-op.
+// key[(phase + i) % key.size()] (XorKey / AddKey; the other transforms use key[0]). An empty key is a
+// no-op. Decoding ADD subtracts, decoding ROL rotates right.
 void apply_transform(uint8_t* data, size_t n, XorTransform t, const std::vector<uint8_t>& key,
                      uint64_t phase, bool decode);
 std::vector<uint8_t> apply_transform(std::vector<uint8_t> data, XorTransform t,
                                      const std::vector<uint8_t>& key, uint64_t phase, bool decode);
 
 // Decodes (or encodes) [begin, begin+len) of `doc` in place as ONE undo step labelled `label`
-// (default "<transform> selection"), in 1 MiB chunks; key index of `begin` = `phase`. Runs on the
+// (default "Decode <describe_key>" / "Encode ..."; inside an open group (a script command) an empty
+// label keeps the group's), in 1 MiB chunks; key index of `begin` = `phase`. Runs on the
 // caller's (UI) thread, so it refuses ranges above `max_len` (default 256 MiB, like the
 // "Selection: XOR with key" script command). False + *err when rejected (busy, read-only, empty
 // key, too large, an unreadable byte in the range); a failure partway leaves the document and its
-// history (undo AND redo stack) as they were (Document::abort_group).
+// history (undo AND redo stack) as they were (Document::abort_group; inside an open group that
+// rolls back the whole group).
 constexpr uint64_t kXorApplyMax = uint64_t(256) << 20;
 bool apply_transform(Document& doc, uint64_t begin, uint64_t len, XorTransform t,
                      const std::vector<uint8_t>& key, uint64_t phase, bool decode,
@@ -105,10 +111,11 @@ void scan_xor(const Snapshot& snap, uint64_t begin, uint64_t end, const std::vec
               std::atomic<uint64_t>* progress = nullptr);
 
 // ---- key guessing --------------------------------------------------------------------------------
-// For XOR-obfuscated data whose plaintext is dominated by one byte value (zeros in executables and
-// tables; pass ' ' for text): for every key length L = 1..max_len (with at least 2 bytes per
-// column), key[c] = the most common byte of column c (the bytes at i % L == c). score = fraction
-// of the bytes that decode to `plain_byte` with that key, minus 0.001 per key byte (ties go to the
+// For XOR- (or ADD-) obfuscated data whose plaintext is dominated by one byte value (zeros in
+// executables and tables; pass ' ' for text): for every key length L = 1..max_len (with at least 2
+// bytes per column), key[c] = the most common byte of column c (the bytes at i % L == c) XOR
+// `plain_byte` (op Add / AddKey: minus `plain_byte`; with plain_byte 0 both give the same key).
+// score = fraction of the bytes that decode to `plain_byte` with that key, minus 0.001 per key byte (ties go to the
 // shorter key). Keys that repeat a shorter key are dropped (that one is listed). Ranked best first.
 // `base_offset` = absolute offset of data[0]: keys follow the absolute convention above.
 struct KeyCandidate {
@@ -116,7 +123,10 @@ struct KeyCandidate {
     double score = 0;            // 0..1
 };
 std::vector<KeyCandidate> key_guess(const uint8_t* data, size_t n, uint64_t base_offset = 0,
-                                    uint8_t plain_byte = 0, uint32_t max_len = kXorMaxKeyLen);
+                                    uint8_t plain_byte = 0, uint32_t max_len = kXorMaxKeyLen,
+                                    XorTransform op = XorTransform::Xor);
+// The transform a key of `len` bytes is applied with: Xor / XorKey (add = false) or Add / AddKey.
+XorTransform keyed_transform(size_t len, bool add);
 
 // ---- background job --------------------------------------------------------------------------------
 // Same model as SearchJob / StringsJob: one run at a time; start() cancels a previous run without

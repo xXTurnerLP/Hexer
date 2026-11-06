@@ -38,6 +38,7 @@ struct Token {
     uint64_t num = 0;         // number value; pack value (0 = none)
     int line = 0;
     char annot = 0;           // 'b' / 'l': a `@be` / `@le` comment right before this token
+    bool annot_inline = false;  // ... and that comment ends on this token's line
     std::vector<Token> body;  // Define: replacement tokens (+ End)
 };
 
@@ -64,6 +65,7 @@ public:
         std::vector<Token> out;
         bool line_start = true;
         char pending = 0;
+        int pending_line = 0;
         while (i_ < s_.size()) {
             char c = s_[i_];
             if (c == '\n') {
@@ -84,7 +86,10 @@ public:
             if (c == '/' && at(1) == '/') {
                 size_t e = s_.find('\n', i_);
                 if (e == std::string::npos) e = s_.size();
-                if (char a = comment_annot(s_.substr(i_, e - i_))) pending = a;
+                if (char a = comment_annot(s_.substr(i_, e - i_))) {
+                    pending = a;
+                    pending_line = line_;
+                }
                 i_ = e;
                 continue;
             }
@@ -92,8 +97,11 @@ public:
                 size_t e = s_.find("*/", i_ + 2);
                 if (e == std::string::npos) fail(line_, "unterminated comment");
                 std::string body = s_.substr(i_, e - i_);
-                if (char a = comment_annot(body)) pending = a;
                 line_ += int(std::count(body.begin(), body.end(), '\n'));
+                if (char a = comment_annot(body)) {
+                    pending = a;
+                    pending_line = line_;
+                }
                 i_ = e + 2;
                 continue;
             }
@@ -105,6 +113,7 @@ public:
             Token t;
             t.line = line_;
             t.annot = pending;
+            t.annot_inline = pending && pending_line == line_;
             pending = 0;
             if (ident_start(c)) {
                 size_t b = i_;
@@ -980,6 +989,7 @@ private:
         if (!t.dims.empty()) return false;
         if (t.kind == TypeRef::Enum) {
             out = enums[size_t(t.idx)].prim;
+            if (t.prim.endian) out.endian = t.prim.endian;  // a member's own byte order
             return true;
         }
         if (t.kind != TypeRef::Prim || t.prim.kind == Prim::Float) return false;
@@ -1000,7 +1010,10 @@ private:
             }
             int line = peek().line;
             int defined = -1;
+            // `/* @be */ int16_t x;` (the comment on the member's line): this member's byte order.
+            const char member_endian = peek().annot_inline ? peek().annot : 0;
             TypeRef base = parse_type(si, 0, &defined);
+            if (member_endian && (base.kind == TypeRef::Prim || base.kind == TypeRef::Enum)) base.prim.endian = member_endian;
             bool packed = false;
             skip_attrs(packed);
             if (packed && defined >= 0) structs_[size_t(defined)]->pack = 1;
@@ -1330,6 +1343,7 @@ private:
         std::string local = (m && !m->lua_local.empty()) ? "local " + m->lua_local + " = " : "";
         if (t.kind == TypeRef::Prim || t.kind == TypeRef::Enum) {
             Prim pr = t.kind == TypeRef::Prim ? t.prim : enums_[size_t(t.idx)].prim;
+            if (t.kind == TypeRef::Enum && t.prim.endian) pr.endian = t.prim.endian;  // a member's own order
             std::string opts;
             if (t.kind == TypeRef::Enum) {
                 opts = ", { enum = " + enum_lua(t.idx) + " }";

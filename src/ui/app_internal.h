@@ -145,6 +145,10 @@ struct Tab {
     double entropy_first_change = 0.0, entropy_last_change = 0.0;
     uint64_t entropy_saved = 0;                 // saved_state_id() at the last scan (changed: full rescan)
     std::shared_ptr<const EntropyResult> entropy_shown;  // what the minimap draws (old map while rescanning)
+    // Process memory changes underneath without edits: the visible buckets (+ a rotating slice of
+    // the rest) are refreshed every couple of seconds (EntropyJob::refresh).
+    double entropy_next_refresh = 0.0;
+    uint32_t entropy_refresh_turn = 0;
 
     TailState tail;                   // View > Live Tail (session: doc extra tail.enabled)
 
@@ -189,6 +193,7 @@ struct FindState {
     uint64_t seen_gen = 0;            // job.generation() already handled
     size_t job_len = 0;
     std::string job_query;
+    bool select_matches = false;      // Select All Matches started the job: select its hits when done
 };
 
 enum class AfterSave { None, CloseTab, Quit };
@@ -410,5 +415,19 @@ void store_ui_settings(App& app);
 // Status text for an edit call that returned false.
 void report_edit_failure(App& app, const Document& doc);
 std::string fmt_offset(uint64_t v);  // "0x0000001F" (at least 8 hex digits)
+// The tab's Find All hits become the multi-selection (Search Results "Select All").
+void select_hits(App& app, Tab& t);
+
+// ---- headless driver (tests/test_app.cpp): the App without a window or GL context ----------
+// The caller owns the ImGui context (docking enabled, io.DisplaySize set by hand,
+// ImGuiBackendFlags_RendererHasTextures), sets app.opts / app.settings / app.fonts and wraps every
+// app_frame() in ImGui::NewFrame() / ImGui::Render(). app.window stays null (title, focus no-ops).
+void app_startup(App& app);       // core settings, Lua engine, panel settings, session restore, opts.files
+void app_frame(App& app);         // one frame: polls, menus, dockspace, editor, panels, popups, shortcuts
+void app_shutdown(App& app);      // hot-exit session + settings written, documents closed
+bool app_save_session(App& app);  // write the session now (false: failed)
+// Runs a menu / palette action by its name (--action): the action table first, then any palette
+// label ("Parser: PNG image", "Compare with: <tab>"). False (+ why) if unknown or not available.
+bool run_named_action(App& app, const std::string& name, std::string* err = nullptr);
 
 }  // namespace hx

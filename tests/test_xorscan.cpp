@@ -410,3 +410,74 @@ TEST_CASE("xorscan: apply failing partway leaves the document and its undo / red
     CHECK(doc->undo_stack().size() == 2);
     CHECK(doc->redo_stack().empty());
 }
+
+TEST_CASE("xorscan: multi-byte ADD keys: transform, scan, key guess, labels") {
+    // AddKey: byte i gets + key[(phase + i) % L]; decoding subtracts.
+    CHECK(apply_transform(Bytes{0, 0, 0, 0xFF}, XorTransform::AddKey, {1, 2, 3}, 2, false) == Bytes{3, 1, 2, 2});
+    CHECK(apply_transform(Bytes{3, 1, 2, 2}, XorTransform::AddKey, {1, 2, 3}, 2, true) == Bytes{0, 0, 0, 0xFF});
+    CHECK(describe_key(XorTransform::AddKey, bytes_of("KEY")) == "ADD key 4B 45 59 \"KEY\"");
+    CHECK(describe_key(XorTransform::AddKey, {0x01, 0xAB}) == "ADD key 01 AB");
+    CHECK(std::string(transform_name(XorTransform::AddKey)) == "ADD key");
+    CHECK(int(keyed_transform(1, true)) == int(XorTransform::Add));
+    CHECK(int(keyed_transform(3, true)) == int(XorTransform::AddKey));
+    CHECK(int(keyed_transform(1, false)) == int(XorTransform::Xor));
+    CHECK(int(keyed_transform(2, false)) == int(XorTransform::XorKey));
+
+    // Planted ADD-key copies (also across a block edge) are found with their absolute keys; with
+    // add_multi off they are not, and the XOR-key search does not report them either.
+    const std::string stub = "This program cannot be run in DOS mode.";
+    Bytes d = random_bytes(size_t(kBlk) + 4096, 33);
+    plant(d, 1234, bytes_of(stub), XorTransform::AddKey, bytes_of("K3Y!"));
+    plant(d, kBlk - 9, bytes_of(stub), XorTransform::AddKey, {0x10, 0xF0, 0x01});
+    XorScanOptions o;
+    o.xor8 = o.add8 = o.rol = false;
+    o.xor_multi = true;
+    CHECK(scan(d, bytes_of(stub), o).hits.empty());
+    o.add_multi = true;
+    auto r = scan(d, bytes_of(stub), o);
+    check_hits(r.hits, {hit(1234, XorTransform::AddKey, bytes_of("K3Y!"), uint32_t(1234 % 4)),
+                        hit(kBlk - 9, XorTransform::AddKey, {0x10, 0xF0, 0x01}, uint32_t((kBlk - 9) % 3))});
+    Bytes at(d.begin() + 1234, d.begin() + 1234 + ptrdiff_t(stub.size()));
+    CHECK(apply_transform(at, XorTransform::AddKey, r.hits[0].key, r.hits[0].phase, true) == bytes_of(stub));
+    // A constant ADD key is the 1-byte ADD hit, a repeated key the shorter one.
+    Bytes c = random_bytes(4096, 34);
+    plant(c, 100, bytes_of(stub), XorTransform::AddKey, {7, 7, 7});
+    plant(c, 1000, bytes_of(stub), XorTransform::AddKey, {1, 2, 1, 2});
+    o.add8 = true;
+    o.xor_multi = false;
+    check_hits(scan(c, bytes_of(stub), o).hits,
+               {hit(100, XorTransform::Add, {7}), hit(1000, XorTransform::AddKey, {1, 2}, uint32_t(1000 % 2))});
+    o.add_multi = false;
+    check_hits(scan(c, bytes_of(stub), o).hits, {hit(100, XorTransform::Add, {7})});
+    // No false positives on random data.
+    o.add_multi = true;
+    CHECK(scan(random_bytes(size_t(1) << 20, 35), bytes_of("This program"), o).hits.empty());
+
+    // Key guess for ADD-obfuscated text: XOR and ADD differ once the dominant byte is not 0.
+    Bytes text = bytes_of(std::string(300, ' ') + "a few words between many spaces" + std::string(200, ' '));
+    text = apply_transform(text, XorTransform::AddKey, {0x13, 0x37}, 0, false);
+    auto g = key_guess(text.data(), text.size(), 0, ' ', 16, XorTransform::AddKey);
+    REQUIRE_FALSE(g.empty());
+    CHECK(g[0].key == Bytes{0x13, 0x37});
+    g = key_guess(text.data() + 1, text.size() - 1, 1, ' ', 16, XorTransform::Add);  // absolute convention
+    REQUIRE_FALSE(g.empty());
+    CHECK(g[0].key == Bytes{0x13, 0x37});
+    g = key_guess(text.data(), text.size(), 0, ' ');  // as XOR: another key
+    REQUIRE_FALSE(g.empty());
+    CHECK(g[0].key != Bytes{0x13, 0x37});
+
+    // Undoable apply; inside an open group an unlabelled apply keeps the group's label.
+    const Bytes orig = bytes_of("0123456789");
+    auto doc = Document::create_from_bytes("t", orig.data(), orig.size());
+    std::string err;
+    REQUIRE(apply_transform(*doc, 1, 5, XorTransform::AddKey, {1, 2}, 1, false, &err));
+    CHECK(doc->undo_stack().back().label == "Encode ADD key 01 02");
+    Bytes got(orig.size());
+    doc->read(0, got.data(), got.size());
+    CHECK(got == bytes_of("0335576789"));
+    doc->begin_group("Script: mine");
+    REQUIRE(apply_transform(*doc, 0, 2, XorTransform::Xor, {1}, 0, true, &err));
+    doc->end_group();
+    CHECK(doc->undo_stack().size() == 2);
+    CHECK(doc->undo_stack().back().label == "Script: mine");
+}

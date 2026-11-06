@@ -185,3 +185,40 @@ hx.command {
         if doc then hx.clear_highlights(doc) end
     end,
 }
+
+-- Multi-selection: doc:select_ranges sets several selected ranges at once (the first one is the
+-- primary selection); Copy, Delete, Fill, Paste and Bookmark Selections then act on all of them.
+hx.command {
+    name = "Select: all NUL runs >= 16 bytes (multi-selection)",
+    description = "Select every run of 16+ zero bytes in the selection, or else in the 1 MiB at the cursor",
+    run = function(doc)
+        if not doc then return hx.warn("no document") end
+        local start, len = doc:selection()
+        if len == 0 then start, len = doc:cursor(), 1024 * 1024 end
+        len = math.min(len, 64 * 1024 * 1024, doc:size() - start)   -- bounded scan
+        local data = doc:read(start, len)
+        local ranges, pos = {}, 1
+        while #ranges < 100000 do                     -- doc:select_ranges takes at most 100,000
+            local a, b = data:find(string.rep("\0", 16) .. "\0*", pos)
+            if not a then break end
+            ranges[#ranges + 1] = { offset = start + a - 1, length = b - a + 1 }
+            pos = b + 1
+        end
+        if #ranges == 0 then return print("no NUL runs of 16+ bytes there") end
+        doc:select_ranges(ranges)
+        print(string.format("selected %d NUL run(s)", #ranges))
+    end,
+}
+
+hx.command {
+    name = "Selection: list selected ranges",
+    description = "Print every selected range (multi-selection: the primary one first)",
+    run = function(doc)
+        if not doc then return hx.warn("no document") end
+        local list = doc:selections()
+        for i, r in ipairs(list) do
+            print(string.format("%3d  0x%X  %d bytes", i, r.offset, r.length))
+        end
+        if #list == 0 then print("nothing selected") end
+    end,
+}

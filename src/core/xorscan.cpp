@@ -14,8 +14,14 @@ const char* transform_name(XorTransform t) {
     case XorTransform::Add: return "ADD";
     case XorTransform::Rol: return "ROL";
     case XorTransform::XorKey: return "XOR key";
+    case XorTransform::AddKey: return "ADD key";
     }
     return "?";
+}
+
+XorTransform keyed_transform(size_t len, bool add) {
+    if (add) return len > 1 ? XorTransform::AddKey : XorTransform::Add;
+    return len > 1 ? XorTransform::XorKey : XorTransform::Xor;
 }
 
 namespace {
@@ -65,7 +71,7 @@ struct Matcher {
                 rol_first[t[0]] = uint8_t(rol_first[t[0]] | (1u << r));
             }
         }
-        if (opt.xor_multi) {
+        if (opt.xor_multi || opt.add_multi) {
             const size_t max_len = std::clamp<size_t>(opt.max_key_len, 2, kXorMaxKeyLen);
             for (size_t L = 2; L <= max_len; ++L)
                 if (n >= 2 * L && n >= L + 4) lens.push_back(L);
@@ -109,19 +115,27 @@ struct Matcher {
                         return false;
                 }
             }
-            for (size_t L : lens) {
-                // Key-independent pre-check: the key byte at distance L repeats.
-                if (uint8_t(d[L] ^ p[L]) != uint8_t(d[0] ^ p[0])) continue;
-                uint8_t kr[kXorMaxKeyLen] = {};
-                for (size_t j = 0; j < L; ++j) kr[j] = uint8_t(d[j] ^ p[j]);
-                size_t j = L + 1;
-                while (j < n && uint8_t(d[j] ^ p[j]) == kr[j % L]) ++j;
-                if (j < n || has_shorter_period(kr, L)) continue;  // constant keys have period 1
-                std::vector<uint8_t> key(L);
-                const uint32_t phase = uint32_t(off % L);
-                for (size_t q = 0; q < L; ++q) key[(phase + q) % L] = kr[q];
-                if (!add(off, XorTransform::XorKey, std::move(key), phase)) return false;
-            }
+            if (opt.xor_multi && !keyed(d, off, false)) return false;
+            if (opt.add_multi && !keyed(d, off, true)) return false;
+        }
+        return true;
+    }
+
+    // Multi-byte keys at d (absolute offset `off`): XOR (k = d ^ p) or ADD (k = d - p).
+    bool keyed(const uint8_t* d, uint64_t off, bool sum) {
+        auto k_at = [&](size_t j) { return sum ? uint8_t(d[j] - p[j]) : uint8_t(d[j] ^ p[j]); };
+        for (size_t L : lens) {
+            // Key-independent pre-check: the key byte at distance L repeats.
+            if (k_at(L) != k_at(0)) continue;
+            uint8_t kr[kXorMaxKeyLen] = {};
+            for (size_t j = 0; j < L; ++j) kr[j] = k_at(j);
+            size_t j = L + 1;
+            while (j < n && k_at(j) == kr[j % L]) ++j;
+            if (j < n || has_shorter_period(kr, L)) continue;  // constant keys have period 1
+            std::vector<uint8_t> key(L);
+            const uint32_t phase = uint32_t(off % L);
+            for (size_t q = 0; q < L; ++q) key[(phase + q) % L] = kr[q];
+            if (!add(off, sum ? XorTransform::AddKey : XorTransform::XorKey, std::move(key), phase)) return false;
         }
         return true;
     }
@@ -147,9 +161,10 @@ std::string describe_key(XorTransform t, const std::vector<uint8_t>& key) {
         const unsigned r = k & 7u;
         return "ROL " + std::to_string(r) + " (ROR " + std::to_string((8 - r) & 7u) + ")";
     }
-    case XorTransform::XorKey: break;
+    case XorTransform::XorKey:
+    case XorTransform::AddKey: break;
     }
-    std::string s = "XOR key";
+    std::string s = transform_name(t);
     bool printable = true;
     for (uint8_t b : key) {
         s += " " + fmt_hex(b, 2);
@@ -184,6 +199,15 @@ void apply_transform(uint8_t* data, size_t n, XorTransform t, const std::vector<
         }
         break;
     }
+    case XorTransform::AddKey: {
+        const size_t L = key.size();
+        size_t ki = size_t(phase % L);
+        for (size_t i = 0; i < n; ++i) {
+            data[i] = uint8_t(decode ? data[i] - key[ki] : data[i] + key[ki]);
+            if (++ki == L) ki = 0;
+        }
+        break;
+    }
     }
 }
 
@@ -209,7 +233,9 @@ bool apply_transform(Document& doc, uint64_t begin, uint64_t len, XorTransform t
     constexpr size_t kChunk = size_t(1) << 20;
     std::vector<uint8_t> buf(size_t(std::min<uint64_t>(len, kChunk)));
     std::vector<uint8_t> bad(buf.size());
-    doc.begin_group(label.empty() ? std::string(decode ? "Decode " : "Encode ") + describe_key(t, key) : label);
+    // Inside a script command / transaction an unlabelled decode keeps that step's label.
+    doc.begin_group(label.empty() && !doc.in_group() ? std::string(decode ? "Decode " : "Encode ") + describe_key(t, key)
+                                                     : label);
     std::string why;
     uint64_t done = 0;
     while (done < len) {
@@ -322,7 +348,8 @@ void scan_xor(const Snapshot& snap, uint64_t begin, uint64_t end, const std::vec
 }
 
 std::vector<KeyCandidate> key_guess(const uint8_t* data, size_t n, uint64_t base_offset, uint8_t plain_byte,
-                                    uint32_t max_len) {
+                                    uint32_t max_len, XorTransform op) {
+    const bool sum = op == XorTransform::Add || op == XorTransform::AddKey;
     std::vector<KeyCandidate> out;
     if (!data) return out;
     std::vector<uint32_t> counts;
@@ -339,7 +366,7 @@ std::vector<KeyCandidate> key_guess(const uint8_t* data, size_t n, uint64_t base
             const uint32_t* row = &counts[col * 256];
             const size_t best = size_t(std::max_element(row, row + 256) - row);  // first max = lowest byte
             matched += row[best];
-            rel[col] = uint8_t(best ^ plain_byte);
+            rel[col] = sum ? uint8_t(best - plain_byte) : uint8_t(best ^ plain_byte);
         }
         if (has_shorter_period(rel.data(), L)) continue;
         KeyCandidate k;

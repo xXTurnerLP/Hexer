@@ -15,6 +15,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"  // ImGuiWindow::InnerRect (exact visible area of the child window)
 
+#include "core/multisel.h"
 #include "core/nav.h"
 #include "core/util.h"
 #include "ui/theme.h"
@@ -268,8 +269,10 @@ bool type_char(Document& doc, const HexViewConfig& cfg, uint8_t c) {
     return true;
 }
 
+// With extra ranges (multi-selection) every range goes, as one undo step.
 bool erase_selection(Document& doc) {
     ViewState& v = doc.view();
+    if (has_extra_selections(v)) return erase_selections(doc);
     uint64_t b = v.sel_begin();
     if (!doc.erase(b, v.sel_len())) return false;
     v.cursor = v.anchor = b;
@@ -279,7 +282,7 @@ bool erase_selection(Document& doc) {
 
 bool delete_forward(Document& doc) {
     ViewState& v = doc.view();
-    if (v.has_selection()) return erase_selection(doc);
+    if (v.has_selection() || has_extra_selections(v)) return erase_selection(doc);
     if (v.cursor >= doc.size() || !doc.erase(v.cursor, 1)) return false;
     v.anchor = v.cursor;
     v.low_nibble = false;
@@ -289,7 +292,7 @@ bool delete_forward(Document& doc) {
 // Returns true if bytes were removed (otherwise it may still have moved the caret).
 bool backspace(Document& doc, const HexViewConfig& cfg, bool editable) {
     ViewState& v = doc.view();
-    if (editable && v.has_selection()) return erase_selection(doc);
+    if (editable && (v.has_selection() || has_extra_selections(v))) return erase_selection(doc);
     if (!cfg.insert_mode) {  // overwrite mode: just move left
         if (v.low_nibble && !v.ascii_focus) v.low_nibble = false;
         else if (v.cursor > 0) --v.cursor;
@@ -652,6 +655,23 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                 ev.follow_target = t;
                 ev.follow_from = h.off;
             }
+        } else if (io.KeyAlt && !io.KeyCtrl && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // Multi-selection: Alt+click / Alt+drag selects a new range and the current selection
+            // joins the extra ranges; Alt+click on a selected byte removes the range holding it.
+            dragging_select_ = false;
+            const size_t i = range_find(v.extra_sel, h.off);
+            if (i < v.extra_sel.size()) {
+                v.extra_sel.erase(v.extra_sel.begin() + std::ptrdiff_t(i));
+            } else if (v.has_selection() && h.off >= v.sel_begin() && h.off < v.sel_end()) {
+                v.cursor = v.anchor = h.off;
+                v.low_nibble = false;
+            } else if (h.off < size) {
+                add_primary_to_extras(v);
+                drag_origin_ = h.off;
+                select_span(h.off, h.off);
+                v.ascii_focus = h.text;
+                dragging_select_ = true;
+            }
         } else if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             dragging_select_ = false;
             if (const Highlight* hl = highlight_at(layers, h.off)) {
@@ -670,6 +690,7 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
                 drag_origin_ = h.off;
                 v.cursor = v.anchor = h.off;
                 v.low_nibble = !h.text && h.low;
+                v.extra_sel.clear();  // a plain click ends a multi-selection
             }
             v.ascii_focus = h.text;
             dragging_select_ = true;
@@ -786,6 +807,9 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             if (!shift) v.anchor = v.cursor;
             keep_caret_visible = true;
         }
+        // Esc ends a multi-selection. Claimed only while there is one (a focused route beats the
+        // app's global Esc, e.g. the find bar's), so Esc keeps its other meanings otherwise.
+        if (!v.extra_sel.empty() && ImGui::Shortcut(ImGuiKey_Escape)) v.extra_sel.clear();
         if (L.ascii && !ctrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
             v.ascii_focus = !v.ascii_focus;
             v.low_nibble = false;
@@ -904,6 +928,14 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
             uint64_t e = h->length > size - std::min(h->offset, size) ? size : h->offset + h->length;
             fill_range(dl, L, top, draw_rows, h->offset, e, highlight_fill(h->color), rounding, true, true);
         }
+    }
+    // Multi-selection: the extra ranges in a lighter tint of the selection color (visible ones only).
+    if (!v.extra_sel.empty() && vis_end > vis_begin) {
+        const uint32_t extra = with_alpha(C.selection, 60);
+        auto it = std::upper_bound(v.extra_sel.begin(), v.extra_sel.end(), vis_begin,
+                                   [](uint64_t o, const ByteRange& r) { return o < r.end; });
+        for (; it != v.extra_sel.end() && it->begin < vis_end; ++it)
+            fill_range(dl, L, top, draw_rows, it->begin, std::min(it->end, size), extra, rounding, true, true);
     }
     if (v.has_selection())
         fill_range(dl, L, top, draw_rows, v.sel_begin(), v.sel_end(), C.selection, rounding, true, true);

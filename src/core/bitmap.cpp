@@ -170,4 +170,96 @@ int bitmap_fit_zoom(int width, float avail_px, int max_zoom) {
     return std::clamp(z, 1, std::max(max_zoom, 1));
 }
 
+bool bitmap_zoom_valid(int level, int max_zoom) {
+    if (level >= 1) return level <= std::max(max_zoom, 1);
+    return level == -2 || level == -4 || level == -8 || level == -16;
+}
+
+int bitmap_zoom_clamp(int level, int max_zoom) {
+    if (level >= 1) return std::min(level, std::max(max_zoom, 1));
+    if (level > -2) return 1;
+    int d = 2;
+    while (d < 16 && -level >= 2 * d) d *= 2;
+    return -d;
+}
+
+int bitmap_zoom_px(int level) { return level >= 1 ? level : 1; }
+
+int bitmap_zoom_step(int level) { return level >= 1 ? 1 : -bitmap_zoom_clamp(level); }
+
+int bitmap_zoom_next(int level, int dir, int max_zoom) {
+    level = bitmap_zoom_clamp(level, max_zoom);
+    if (dir > 0) {
+        if (level == -2) return 1;
+        return level < 0 ? level / 2 : std::min(level + 1, std::max(max_zoom, 1));
+    }
+    if (dir < 0) {
+        if (level == 1) return -2;
+        return level < 0 ? std::max(level * 2, kBitmapMinZoom) : level - 1;
+    }
+    return level;
+}
+
+const char* bitmap_zoom_label(int level) {
+    static const char* const kIn[] = {"1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x",
+                                      "9x", "10x", "11x", "12x", "13x", "14x", "15x", "16x"};
+    switch (bitmap_zoom_clamp(level)) {
+    case -2: return "1/2x";
+    case -4: return "1/4x";
+    case -8: return "1/8x";
+    case -16: return "1/16x";
+    default: break;
+    }
+    return kIn[std::clamp(level, 1, 16) - 1];
+}
+
+int bitmap_fit_level(int width, float avail_px, int max_zoom) {
+    if (width < 1 || !(avail_px >= 1.0f)) return 1;
+    if (float(width) <= avail_px) return bitmap_fit_zoom(width, avail_px, max_zoom);
+    for (int d = 2; d < 16; d *= 2)
+        if (float((width + d - 1) / d) <= avail_px) return -d;
+    return kBitmapMinZoom;
+}
+
+size_t bitmap_downscale(const std::vector<uint32_t>& px, size_t valid, int w, int h, int step, int sub,
+                        std::vector<uint32_t>& out) {
+    out.clear();
+    if (w < 1 || h < 1 || step < 1 || sub < 1) return 0;
+    const int cw = (w + step - 1) / step;
+    out.resize(size_t(cw) * size_t(h));
+    valid = std::min(valid, px.size());
+    size_t cells = 0;
+    std::vector<uint64_t> sum(size_t(cw) * 5);  // r, g, b, a, count per cell of one cell row
+    for (int y = 0; y < h; ++y) {
+        std::fill(sum.begin(), sum.end(), 0);
+        for (int s = 0; s < sub; ++s) {
+            const size_t row = (size_t(y) * size_t(sub) + size_t(s)) * size_t(w);
+            for (int x = 0; x < w; ++x) {
+                const size_t i = row + size_t(x);
+                if (i >= valid) break;
+                const uint32_t c = px[i];
+                uint64_t* a = &sum[size_t(x / step) * 5];
+                a[0] += c & 0xFF;
+                a[1] += (c >> 8) & 0xFF;
+                a[2] += (c >> 16) & 0xFF;
+                a[3] += c >> 24;
+                a[4] += 1;
+            }
+        }
+        for (int x = 0; x < cw; ++x) {
+            const uint64_t* a = &sum[size_t(x) * 5];
+            uint32_t& o = out[size_t(y) * size_t(cw) + size_t(x)];
+            if (!a[4]) {
+                o = bitmap_missing_color(x, y);
+                continue;
+            }
+            const uint64_t n = a[4], half = n / 2;
+            o = uint32_t((a[0] + half) / n) | (uint32_t((a[1] + half) / n) << 8) |
+                (uint32_t((a[2] + half) / n) << 16) | (uint32_t((a[3] + half) / n) << 24);
+            ++cells;
+        }
+    }
+    return cells;
+}
+
 }  // namespace hx

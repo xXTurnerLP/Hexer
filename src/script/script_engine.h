@@ -45,7 +45,23 @@
 //   hx.crc32(str, prev?) -> int       -- zlib/PNG/ZIP CRC-32; pass `prev` to continue over chunks
 //   hx.hash(algo, str) -> "cbf43926"   -- lowercase hex digest; algo: any of hx.hash_algorithms()
 //                                         (case and punctuation ignored: "sha256", "CRC-32C", "md5")
-//   hx.hash_algorithms() -> {"Sum-8", "XOR-8", "CRC-8", ..., "SHA-256", "SHA-512"}
+//   hx.hash_algorithms() -> {"Sum-8", "XOR-8", "CRC-8", ..., "SHA-256", "SHA-512", <Lua ones>}
+//   hx.hash_algorithm{ name=, init=function() -> state, update=function(state, bytes) -> state?,
+//       final=function(state) -> hex string }   -- a custom hash / checksum, usable everywhere a
+//       built-in is: hx.hash, doc:hash, hx.hash_algorithms() and the Hashes panel. init() returns
+//       the state for one run (any value: a table, an integer...); update(state, bytes) gets the
+//       data in order, in chunks of any size (up to 4 MiB), and returns the new state (nil keeps
+//       the old one: tables are updated in place); final(state) returns the digest as hex
+//       (case, spaces, ':' / '-' and a leading 0x ignored; e.g. string.format("%08x", h)).
+//       name: not a built-in's (after ignoring case and punctuation), no ','; a later
+//       registration with the same name replaces it. The Hashes panel runs it on a worker
+//       thread in a Lua state of its own that ran only its script file (as background parses
+//       do: no globals of other scripts, print output is dropped; algorithms defined in the
+//       console cannot run there), each update() under the script time limit; errors show in
+//       the panel and once in the console. Plain Lua handles roughly 10-50 MB/s.
+//         hx.hash_algorithm{ name = "Sum-16", init = function() return 0 end,
+//           update = function(s, b) for i = 1, #b do s = s + b:byte(i) end return s & 0xFFFF end,
+//           final = function(s) return string.format("%04x", s) end }
 //   hx.disasm(bytes, address?, mode?) -> list of instructions (x86-64, or mode 32 / "x86" for
 //       32-bit code; address = of the first byte, default 0; at most 10000 per call), each
 //       { address=, offset= (0-based in bytes), length=, text=, bytes=, valid=, target=?, flow=? }:
@@ -59,11 +75,13 @@
 //       { offset=, transform="xor"|"add"|"rol"|"xor_key", key= (raw key bytes; rol: one byte = the
 //       bit count), phase= (key index of `offset`), text= ("XOR 0x5A", "XOR key 53 45 ...") }.
 //       opts = { start=0, length= (to EOF), xor=true, add=true, rol=true, multi=false (2..16 byte
-//       XOR keys), max_key_len=16, max=10000 (hits) }. Blocking: at most 256 MiB per call (error
+//       XOR keys), add_multi=false (2..16 byte ADD keys: transform "add_key"), max_key_len=16,
+//       max=10000 (hits) }. Blocking: at most 256 MiB per call (error
 //       beyond; the XOR Search panel scans any size) and stopped at the script time limit.
 //   hx.xor_guess_key(doc, off, len, opts?) -> list of { key=, score= (0..1) }, best first: XOR key
 //       candidates for [off, off+len) assuming the plaintext is mostly `plain` bytes
-//       (opts = { plain=0 (a byte value or a 1-char string, e.g. " " for text), max_len=16 });
+//       (opts = { plain=0 (a byte value or a 1-char string, e.g. " " for text), max_len=16,
+//       op="xor" | "add" (ADD keys: column byte minus plain) });
 //       keys follow the absolute-offset convention of xor_scan. At most 16 MiB per call.
 //   string.pack / string.unpack       -- standard Lua; the recommended way to serialize
 //
@@ -75,6 +93,19 @@
 //       document ("KERNEL32.DLL", load address, image size, full path; Linux: file-backed mappings
 //       with an executable part, base = lowest mapping); {} for files / devices; nil, err when the
 //       process cannot be queried
+//   doc:packets(opts?) -> list, next | nil, "not a pcap / pcapng capture"   -- the packets of a
+//       capture (core/pcap.h index + dissector), in file order, each { number= (1-based), offset=
+//       (record / block start), data= (first captured byte), length= (captured), wire_length=,
+//       payload= (offset of the L7 payload), payload_length= (captured payload bytes), time= (s,
+//       float), time_ns= (both nil for SPB), interface= (0-based), linktype=, proto=, src=, dst=,
+//       info=, summary= (the Packets panel's columns), vlan=?, ip_version=?, ip_proto=?, src_port=?,
+//       dst_port=?, tcp_seq=?, tcp_ack=?, tcp_flags=?, fragment=?, malformed=? } (? = only when the
+//       layer was decoded). opts = { filter= (a Packets panel filter expression, core/pcap_filter.h;
+//       a bad one raises "doc:packets: filter: <msg> (column N)"), first=1 (packet number to start
+//       at), max=10000 (entries, 1..1000000) }. `next` = the number to pass as first for the next
+//       page, nil when the capture ended. Not the panel's index: each call indexes the document as
+//       it is now, synchronously, from the start up to where the page ends (in 64k-packet chunks),
+//       stopped at the script time limit (error); a record cut short at the end ends the list.
 //   doc:read(off, len) -> string         (clamped to EOF; at most 64 MiB per call)
 //   doc:u8(off) doc:i8(off) doc:u16le/u16be/i16le/i16be/u32le/u32be/i32le/i32be/
 //       u64le/u64be/i64le/i64be/f32le/f32be/f64le/f64be(off)  -> number (nil past EOF)
@@ -84,9 +115,32 @@
 //                                           command (already one step) a label renames that step
 //   doc:cursor() -> off     doc:selection() -> start, len     doc:select(off, len)     doc:jump(off) (alias doc["goto"])
 //       (`goto` is a Lua keyword: write doc:jump(off), the same function, or doc["goto"](doc, off))
+//       doc:select also drops the extra ranges of a multi-selection. Both (and doc:select_ranges)
+//       are Back / Forward jumps in the app: the position they leave goes into the tab's history.
+//   doc:selections() -> { {offset=, length=}, ... }   -- multi-selection (core/multisel.h): every
+//       selected range, the one holding the primary selection first, then the others in file
+//       order (overlapping ones merged); {} when nothing is selected
+//   doc:select_ranges{ {offset=, length=} | {off, len}, ... }   -- the first range becomes the
+//       primary selection (scrolled into view), the others the extra ranges (clamped to the
+//       document, merged when they touch); at most 100,000 ranges; {} leaves only the caret.
+//       View state, not an undo step (like doc:select)
 //   doc:find(needle, start?, {hex=bool, backward=bool}) -> off | nil   (hex=true: "DE ?? AD")
 //   doc:hash(algo, off?, len?) -> hex   (default: the whole doc; clamped to EOF; at most 256 MiB per
-//                                         call since it blocks - the Hashes panel does any size)
+//                                         call since it blocks - the Hashes panel does any size;
+//                                         a Lua algorithm runs here, under the script time limit)
+//   doc:apply_transform{ op=, key=, start=?, length=?, phase=?, decode=false, label=? }
+//       XOR / ADD / SUB / ROL / ROR bytes in place as ONE undo step (XOR Search's "Decode
+//       selection"; core/xorscan.h). op: "xor" | "add" | "sub" | "rol" | "ror" (also xor_scan's
+//       "xor_key" / "add_key"); key: a string of key bytes (any length up to 4096: repeated) or a
+//       byte value; rol / ror: key = the bit count 1..7 (a number, or xor_scan's 1-byte key
+//       string). decode=true applies the inverse (sub for
+//       add, ror for rol), so a hit h of hx.xor_scan decodes with { op = h.transform, key = h.key,
+//       start = h.offset, length = n, decode = true }. Range: start / length (length default: to
+//       EOF), neither given = the selection (error when nothing is selected); at most 256 MiB.
+//       phase = key index of `start` (default start % #key: xor_scan's absolute convention). A
+//       read-only document, an empty range or an unreadable byte raise; a failure partway changes
+//       nothing (inside a command / transaction it rolls back that whole step). label default
+//       "Encode <key>" / "Decode <key>" (inside a command or transaction: that step's label).
 //   doc:disasm(off, count?, mode?) -> list of instructions like hx.disasm (count default 16, at
 //       most 10000; stops at EOF). offset = file offset; address / target use the document's
 //       address map (PE / ELF headers: virtual addresses, process memory: = offset, else = offset);
@@ -183,6 +237,7 @@
 #include <vector>
 
 #include "core/document.h"
+#include "core/hash.h"
 #include "core/highlight.h"
 
 struct lua_State;
@@ -211,6 +266,7 @@ struct Field {
     int depth = 0;
     std::vector<int> children;
     std::string pack;      // string.pack format used to (re)encode; "" = not editable
+    const char* fmt = "";  // opts.fmt: "", "hex", "dec", "bin" or "char" (static strings)
     bool editable() const { return !pack.empty(); }
     // Enum names (sorted by value) when the field was read with opts.enum; null otherwise.
     // Shared by all fields that used the same enum table. Handy for a combo box in the UI.
@@ -256,6 +312,11 @@ struct ScriptCommand {
     std::string name;
     std::string description;
     std::string file;
+};
+
+struct ScriptHashInfo {             // hx.hash_algorithm
+    std::string name;
+    std::string file;                // script file path ("<console>" when defined there)
 };
 
 // Implemented by the application so scripts can reach documents and the UI.
@@ -323,6 +384,15 @@ public:
     // Runs the command on a coroutine; refused (console error) while a prompt is pending.
     void run_command(const std::string& name);
 
+    // ---- hash algorithms (hx.hash_algorithm) ------------------------------------------------
+    const std::vector<ScriptHashInfo>& hash_algorithms() const { return hashes_; }
+    // Bumps on every reload and every registration (the Hashes panel refreshes its list).
+    uint64_t hash_algorithms_generation() const { return hash_gen_; }
+    // The registered algorithms for HashJob (script/lua_hash.cpp): each create() builds a Lua
+    // state of its own on the worker that ran only the algorithm's script (as of the last reload /
+    // run_source); one that cannot be rebuilt that way reports it through Hasher::error().
+    std::vector<CustomHashAlgorithm> custom_hashes() const;
+
     // ---- hx.prompt ---------------------------------------------------------------------------
     // A command waiting in hx.prompt. The UI shows a modal (title, hint, a text field preset with
     // default_text) while pending_prompt() is non-null and calls answer_prompt() once: the text on
@@ -362,6 +432,12 @@ private:
     std::vector<std::string> dirs_;
     std::vector<ParserInfo> parsers_;
     std::vector<ScriptCommand> commands_;
+    std::vector<ScriptHashInfo> hashes_;
+    uint64_t hash_gen_ = 0;
+    // custom_hashes()' create(): the algorithm `name` from one script, in a fresh engine.
+    static std::unique_ptr<Hasher> make_job_hasher(const std::vector<std::string>& dirs, const std::string& file,
+                                                   const std::string& chunk, const std::string& text,
+                                                   const std::string& name, const std::atomic<bool>* cancel);
     std::deque<ConsoleLine> console_;   // capped at 5000 lines
     uint64_t console_gen_ = 0;
     uint64_t reload_count_ = 0;

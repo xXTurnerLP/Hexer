@@ -728,3 +728,65 @@ TEST_CASE("history: a view step whose bytes came from a dropped state is dropped
     CHECK_FALSE(r->read_only());
     CHECK(doc_bytes(*r) == doc_bytes(*d));
 }
+
+TEST_CASE("history: a view step keeps the undone content steps redoable") {
+    FakeClock clock;
+    TempDir t;
+    auto d = open_sample(t, "keep_redo.bin");
+    const uint8_t a = 'A', b = 'B', c = 'C';
+    REQUIRE(d->overwrite(0, &a, 1));
+    REQUIRE(d->overwrite(1, &b, 1));
+    REQUIRE(d->overwrite(2, &c, 1));
+    const Bytes all = doc_bytes(*d);
+    REQUIRE(d->undo());
+    REQUIRE(d->undo());
+    REQUIRE(d->redo_stack().size() == 2);
+    // Undo an earlier view step too: the new choice replaces it, the edits stay.
+    ViewOptions o = d->view_options();
+    o.parser = "ZIP archive";
+    REQUIRE(d->set_view_options(o, "Parser: ZIP archive"));
+    REQUIRE(d->undo());
+    CHECK(d->redo_stack().size() == 3);
+    o.parser = "PNG image";
+    REQUIRE(d->set_view_options(o, "Parser: PNG image"));
+    REQUIRE(d->redo_stack().size() == 2);
+    CHECK_FALSE(d->redo_stack().back().view_only);
+    CHECK(d->can_redo());
+    // History rows: 0 original, 1 A, 2 parser (current, the bytes of row 1), 3 B, 4 C (redo).
+    REQUIRE(history_count(*d) == 5);
+    CHECK(history_label(*d, 2) == "Parser: PNG image");
+    CHECK(history_pieces(*d, 2) == history_pieces(*d, 1));
+    CHECK(history_row_change(*d, 2).same);
+    CHECK_FALSE(history_row_change(*d, 3).same);
+    // Persisted and restored the same way (no format change: entries are whole states).
+    std::string err;
+    auto r = Document::restore(d->persist(), nullptr, &err);
+    REQUIRE(r);
+    for (Document* x : {d.get(), r.get()}) {
+        REQUIRE(x->redo());
+        REQUIRE(x->redo());
+        CHECK_FALSE(x->can_redo());
+        CHECK(doc_bytes(*x) == all);
+        CHECK(x->view().parser == "PNG image");  // the redo keeps the view choice
+        // Back down: the edits undo, then the parser step, with the bytes it was taken on.
+        REQUIRE(x->undo());
+        REQUIRE(x->undo());
+        CHECK(x->view().parser == "PNG image");
+        REQUIRE(x->undo());
+        CHECK(x->view().parser.empty());
+        Bytes first = str_bytes("0123456789abcdefghij");
+        first[0] = 'A';
+        CHECK(doc_bytes(*x) == first);
+        REQUIRE(x->undo());
+        CHECK(doc_bytes(*x) == str_bytes("0123456789abcdefghij"));
+        CHECK_FALSE(x->can_undo());
+        // ... and all the way up again.
+        while (x->can_redo()) REQUIRE(x->redo());
+        CHECK(doc_bytes(*x) == all);
+        CHECK(x->view().parser == "PNG image");
+    }
+    // A content edit still drops the redo states.
+    REQUIRE(d->undo());
+    REQUIRE(d->overwrite(5, &a, 1));
+    CHECK(d->redo_stack().empty());
+}

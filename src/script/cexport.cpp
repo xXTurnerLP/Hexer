@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
@@ -29,6 +30,11 @@ std::string trim(const std::string& s) {
     while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
     while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
     return s.substr(b, e - b);
+}
+
+std::string upper(std::string s) {
+    for (char& ch : s) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+    return s;
 }
 
 std::string hex(uint64_t v, int digits = 0) {
@@ -147,6 +153,9 @@ struct Decl {
     std::string note;               // comment after the offset ("BE", "flags: ...")
     uint64_t size = 0;
     int be = 0, le = 0;             // multi-byte integers by byte order (for the @be annotation)
+    char endian = 0;                // 'b' / 'l': a multi-byte number (element) in this byte order
+    const std::vector<Field::FlagItem>* flags = nullptr;  // opts.flags of the number (element)
+    uint64_t flag_size = 0;         // its size in bytes
     bool skip = false;              // 0 bytes: nothing to declare
 
     bool same_layout(const Decl& o) const {
@@ -161,6 +170,10 @@ struct Line {
     uint64_t rel = 0;               // offset in the struct
     std::string note;
     std::string raw;                // non-empty: a comment line, written as is
+    char endian = 0;                // 'b' / 'l': a multi-byte number / bit-field unit in this order
+    std::string member;             // the member's name (named members)
+    const std::vector<Field::FlagItem>* flags = nullptr;  // -> #define masks before the struct
+    uint64_t flag_size = 0;
 };
 
 struct TypeDef {
@@ -169,6 +182,7 @@ struct TypeDef {
     std::vector<Line> lines;
     uint64_t size = 0;
     bool be = false;
+    bool mixed = false;             // members of both byte orders: the minority is annotated
     std::vector<int> types, enums;  // dependencies
 };
 
@@ -310,12 +324,20 @@ private:
                 uses_bool_ = true;
             } else if (f.enums && !f.enums->empty()) {
                 d.type.enum_ref = enum_of(f, n.is_signed);
+            } else if (f.size == 1 && !n.is_signed && std::strcmp(f.fmt, "char") == 0) {
+                d.type.builtin = "char";  // fmt = "char" (C struct -> parser reads char so)
             } else {
                 d.type.builtin = int_type(f.size, n.is_signed);
+                if (f.size > 1 && std::strcmp(f.fmt, "char") == 0) d.note = "chars";
             }
-            if (f.size > 1) (n.be ? d.be : d.le) = 1;
-            if (n.be && f.size > 1) d.note = "BE";
+            if (f.size > 1) {
+                (n.be ? d.be : d.le) = 1;
+                d.endian = n.be ? 'b' : 'l';
+            }
+            if (n.be && f.size > 1) d.note = d.note.empty() ? "BE" : "BE, " + d.note;
             if (f.flags && !f.flags->empty()) {
+                d.flags = f.flags.get();
+                d.flag_size = f.size;
                 std::string fl;
                 for (const Field::FlagItem& it : *f.flags) {
                     if (it.bit < 0 || uint64_t(it.bit) >= f.size * 8) continue;
@@ -408,6 +430,7 @@ private:
                     continue;
                 }
                 pad_to(c.offset);
+                const size_t first_line = t.lines.size();  // this unit's lines get its byte order
                 // Every unit is declared full (see below), so the next one starts a new unit with
                 // MSVC as well as GCC / Clang without a `: 0` (which GCC aligns even under pack(1)).
                 const TypeName unit_t = builtin(int_type(c.size, false));
@@ -439,6 +462,7 @@ private:
                 // whose last bits stay undeclared would be shorter there than with MSVC.
                 const int rest = gbe ? cur : int(c.size * 8) - cur;
                 if (rest > 0) line(unit_t, " : " + std::to_string(rest) + ";", c.offset, "unused bits");
+                for (size_t k = first_line; k < t.lines.size(); ++k) t.lines[k].endian = gbe ? 'b' : 'l';
                 ++(gbe ? be : le);  // also 1-byte units: BE allocates from the top bit
                 pos = c.offset + c.size;
                 i = j - 1;
@@ -454,9 +478,14 @@ private:
                 continue;
             }
             pad_to(c.offset);
-            std::string rest = " " + member_name(c.name);
+            const std::string mname = member_name(c.name);
+            std::string rest = " " + mname;
             for (uint64_t n : d.dims) rest += "[" + std::to_string(n) + "]";
             line(d.type, rest + ";", c.offset, d.note);
+            t.lines.back().endian = d.endian;
+            t.lines.back().member = mname;
+            t.lines.back().flags = d.flags;
+            t.lines.back().flag_size = d.flag_size;
             be += d.be;
             le += d.le;
             if (d.type.type_ref >= 0) t.types.push_back(d.type.type_ref);
@@ -466,11 +495,12 @@ private:
         pad_to(start + size);
         t.size = pos - start;
         t.be = be > le;
+        t.mixed = be > 0 && le > 0;
         std::string sig = t.be ? "be\n" : "le\n";
         for (const Line& l : t.lines)
             sig += l.raw.empty() ? l.type.builtin + "#" + std::to_string(l.type.type_ref) + "#" +
                                        std::to_string(l.type.enum_ref) + l.rest + "@" + std::to_string(l.rel) + " " +
-                                       l.note + "\n"
+                                       std::string(1, l.endian ? l.endian : '-') + l.note + "\n"
                                  : l.raw + "\n";
         if (is_root) t.name = stem;
         else if (auto it = by_sig_.find(sig); it != by_sig_.end()) return it->second;
@@ -523,10 +553,20 @@ private:
             if (ti != top) types_[size_t(ti)].name = unique(types_[size_t(ti)].stem, "_t");
         for (int ei : enum_order) enums_[size_t(ei)].name = unique(enums_[size_t(ei)].stem, "_e");
 
+        bool any_mixed = false;
+        std::set<std::string> members;  // a #define must not rename any of them
+        for (int ti : order) {
+            any_mixed |= types_[size_t(ti)].mixed;
+            for (const Line& l : types_[size_t(ti)].lines)
+                if (!l.member.empty()) members.insert(l.member);
+        }
         std::string o;
         o += "// Generated by Hexer from the parse tree of \"" + title + "\" (Structure > Copy as C Header).\n";
         o += "// The layout of this parsed instance: variable-size parts have the sizes parsed here.\n";
         o += "// Offsets (+0x...) are relative to the struct start; BE = big-endian.\n";
+        if (any_mixed)
+            o += "// Mixed byte order: the annotation above a struct is its own; one before a member\n"
+                 "// marks that member as the other order (C struct -> parser reads both).\n";
         o += "#pragma once\n#include <assert.h>\n#include <stdint.h>\n";
         if (uses_bool_) o += "#include <stdbool.h>\n";
         o += "\n#pragma pack(push, 1)\n\n";
@@ -548,16 +588,34 @@ private:
             }
             o += "};\n\n";
         }
+        std::set<std::string> macros;
         for (int ti : order) {
             const TypeDef& t = types_[size_t(ti)];
-            if (t.be) o += "// @be\n";
+            // Bit masks of the flags members: MEMBER_FLAG (upper case, unique in the header).
+            for (const Line& l : t.lines) {
+                if (!l.flags) continue;
+                std::string defs;
+                for (const Field::FlagItem& it : *l.flags) {
+                    if (it.bit < 0 || uint64_t(it.bit) >= l.flag_size * 8) continue;
+                    const std::string base = upper(l.member) + "_" + upper(c_ident(it.name));
+                    std::string m = base;
+                    for (int k = 2; macros.count(m) || members.count(m) || used.count(m) || consts.count(m); ++k)
+                        m = base + "_" + std::to_string(k);
+                    macros.insert(m);
+                    defs += "#define " + m + " " + hex(uint64_t(1) << it.bit) + "\n";
+                }
+                if (!defs.empty()) o += "// " + t.name + "." + l.member + " flags\n" + defs + "\n";
+            }
+            if (t.be || t.mixed) o += t.be ? "// @be\n" : "// @le\n";
             o += "typedef struct " + t.name + " {\n";
             for (const Line& l : t.lines) {
                 if (!l.raw.empty()) {
                     o += l.raw + "\n";
                     continue;
                 }
-                std::string s = "    " + type_text(l.type) + l.rest;
+                const bool other = t.mixed && l.endian && (l.endian == 'b') != t.be;
+                std::string s = "    " + std::string(other ? (t.be ? "/* @le */ " : "/* @be */ ") : "") +
+                                type_text(l.type) + l.rest;
                 if (s.size() < 40) s.append(40 - s.size(), ' ');
                 else s += ' ';
                 o += s + "/* +" + hex(l.rel, 4) + (l.note.empty() ? "" : ", " + l.note) + " */\n";

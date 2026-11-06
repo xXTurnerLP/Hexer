@@ -8,6 +8,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/document.h"
@@ -942,6 +943,20 @@ TEST_CASE("settings: minimap, byte-class colors and bitmap panel fields round tr
         REQUIRE(e.load(f));
         CHECK(e.bitmap_width == 1);  // out-of-range numbers are clamped, like every int setting
         CHECK(e.bitmap_zoom == 16);
+        // Downscale levels (1/2x .. 1/16x) round trip; other values snap to the nearest level.
+        b.bitmap_zoom = -4;
+        REQUIRE(b.save(f));
+        Settings g;
+        REQUIRE(g.load(f));
+        CHECK(g.bitmap_zoom == -4);
+        const std::pair<const char*, int> snaps[] = {{"-3", -2}, {"0", 1}, {"-1", 1}, {"-99", -16}, {"x", 2}};
+        for (const auto& [text, want] : snaps) {
+            const std::string t3 = std::string("bitmap_zoom = ") + text + "\n";
+            REQUIRE(os_write_whole_atomic(f, t3.data(), t3.size()));
+            Settings h;
+            REQUIRE(h.load(f));
+            CHECK(h.bitmap_zoom == want);
+        }
     }
     for (const char* bad : {"2", "heat", ""}) {
         const std::string t2 = std::string("minimap = ") + bad + "\n";
@@ -1086,7 +1101,7 @@ struct UiFields {
     bool find_icase, console_wrap;
     bool s_ascii, s_le, s_be, s_nl;
     int s_min;
-    bool x_xor, x_add, x_rol, x_key;
+    bool x_xor, x_add, x_rol, x_key, x_add_key;
     int x_len;
     bool b_fit, b_alpha;
     int b_source;
@@ -1100,7 +1115,7 @@ UiFields ui_fields(const Settings& s) {
             s.panel_strings, s.panel_hashes, s.panel_bitmap, s.panel_packets, s.panel_history, s.panel_xor,
             s.panel_disasm, s.panel_regions, s.find_kind, s.find_ignore_case, s.console_wrap,
             s.strings_ascii, s.strings_utf16le, s.strings_utf16be, s.strings_newlines, s.strings_min_length,
-            s.xor_xor, s.xor_add, s.xor_rol, s.xor_key, s.xor_max_key_len, s.bitmap_fit, s.bitmap_alpha,
+            s.xor_xor, s.xor_add, s.xor_rol, s.xor_key, s.xor_add_key, s.xor_max_key_len, s.bitmap_fit, s.bitmap_alpha,
             s.bitmap_source, s.packets_absolute_time, s.packets_payload_only, s.packets_follow_interleaved,
             s.compare_sync_scroll, s.compare_sync_caret};
 }
@@ -1111,7 +1126,7 @@ const char* const kUiKeys[] = {
     "panel_strings", "panel_hashes", "panel_bitmap", "panel_packets", "panel_history", "panel_xor",
     "panel_disasm", "panel_regions", "find_kind", "find_ignore_case", "console_wrap",
     "strings_ascii", "strings_utf16le", "strings_utf16be", "strings_newlines", "strings_min_length",
-    "xor_xor", "xor_add", "xor_rol", "xor_key", "xor_max_key_len", "bitmap_fit", "bitmap_alpha",
+    "xor_xor", "xor_add", "xor_rol", "xor_key", "xor_add_key", "xor_max_key_len", "bitmap_fit", "bitmap_alpha",
     "bitmap_source", "packets_absolute_time", "packets_payload_only", "packets_follow_interleaved",
     "compare_sync_scroll", "compare_sync_caret"};
 
@@ -1165,7 +1180,7 @@ TEST_CASE("settings: window, panel visibility and panel option keys round trip")
         s.strings_utf16be = s.strings_newlines = true;
         s.strings_min_length = variant ? 4096 : 1;
         s.xor_xor = s.xor_add = s.xor_rol = false;
-        s.xor_key = true;
+        s.xor_key = s.xor_add_key = true;
         s.xor_max_key_len = variant ? 2 : 9;
         s.bitmap_fit = s.bitmap_alpha = true;
         s.bitmap_source = 1;

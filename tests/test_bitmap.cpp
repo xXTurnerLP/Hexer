@@ -252,6 +252,66 @@ TEST_CASE("bitmap: row count and fit zoom") {
     CHECK(bitmap_fit_zoom(16, 0.0f) == 1);
 }
 
+TEST_CASE("bitmap: zoom levels below 1x, fit with downscaling, box downscale") {
+    CHECK(bitmap_zoom_valid(1));
+    CHECK(bitmap_zoom_valid(16));
+    CHECK_FALSE(bitmap_zoom_valid(17));
+    CHECK(bitmap_zoom_valid(-2));
+    CHECK(bitmap_zoom_valid(-16));
+    CHECK_FALSE(bitmap_zoom_valid(-3));
+    CHECK_FALSE(bitmap_zoom_valid(0));
+    CHECK_FALSE(bitmap_zoom_valid(-1));
+    CHECK(bitmap_zoom_clamp(0) == 1);
+    CHECK(bitmap_zoom_clamp(-1) == 1);
+    CHECK(bitmap_zoom_clamp(-3) == -2);
+    CHECK(bitmap_zoom_clamp(-12) == -8);
+    CHECK(bitmap_zoom_clamp(-1000) == -16);
+    CHECK(bitmap_zoom_clamp(40) == 16);
+    CHECK(bitmap_zoom_clamp(9, 8) == 8);
+    CHECK(bitmap_zoom_px(4) == 4);
+    CHECK(bitmap_zoom_px(-4) == 1);
+    CHECK(bitmap_zoom_step(4) == 1);
+    CHECK(bitmap_zoom_step(-4) == 4);
+    CHECK(bitmap_zoom_next(2, -1) == 1);
+    CHECK(bitmap_zoom_next(1, -1) == -2);
+    CHECK(bitmap_zoom_next(-2, -1) == -4);
+    CHECK(bitmap_zoom_next(-16, -1) == -16);
+    CHECK(bitmap_zoom_next(-4, 1) == -2);
+    CHECK(bitmap_zoom_next(-2, 1) == 1);
+    CHECK(bitmap_zoom_next(16, 1) == 16);
+    CHECK(std::string(bitmap_zoom_label(-4)) == "1/4x");
+    CHECK(std::string(bitmap_zoom_label(3)) == "3x");
+    // Fit: zooms in while the row fits, else the smallest downscale that fits.
+    CHECK(bitmap_fit_level(256, 1024.0f) == 4);
+    CHECK(bitmap_fit_level(1024, 1024.0f) == 1);
+    CHECK(bitmap_fit_level(1025, 1024.0f) == -2);
+    CHECK(bitmap_fit_level(4096, 1024.0f) == -4);
+    CHECK(bitmap_fit_level(4097, 1024.0f) == -8);
+    CHECK(bitmap_fit_level(8192, 100.0f) == -16);  // too wide even at 1/16x
+    CHECK(bitmap_fit_level(0, 100.0f) == 1);
+
+    // Box filter: 5 x 2 pixels, step 2, both rows read -> 3 x 1 cells (the last one 1 pixel wide).
+    std::vector<uint32_t> px = {rgba(0, 0, 0),     rgba(100, 0, 0),  rgba(10, 20, 30), rgba(10, 20, 30), rgba(7, 7, 7),
+                                rgba(100, 100, 0), rgba(0, 100, 0), rgba(30, 40, 50), rgba(30, 40, 50), rgba(9, 9, 9)};
+    std::vector<uint32_t> out;
+    CHECK(bitmap_downscale(px, px.size(), 5, 1, 2, 2, out) == 3);
+    REQUIRE(out.size() == 3);
+    CHECK(out[0] == rgba(50, 50, 0));
+    CHECK(out[1] == rgba(20, 30, 40));
+    CHECK(out[2] == rgba(8, 8, 8));
+    // One sampled row per cell row (sub 1): only that row counts.
+    CHECK(bitmap_downscale(px, px.size(), 5, 2, 2, 1, out) == 6);
+    CHECK(out[0] == rgba(50, 0, 0));
+    CHECK(out[3] == rgba(50, 100, 0));
+    // Missing pixels: a partly decoded cell averages what it has, an empty one is the marker.
+    CHECK(bitmap_downscale(px, 3, 5, 2, 2, 1, out) == 2);
+    CHECK(out[1] == rgba(10, 20, 30));
+    CHECK(out[2] == bitmap_missing_color(2, 0));
+    CHECK(out[3] == bitmap_missing_color(0, 1));
+    CHECK(bitmap_downscale(px, px.size(), 0, 1, 2, 1, out) == 0);
+    CHECK(out.empty());
+}
+
 TEST_CASE("bitmap: horizontal scroll limit stays inside the row") {
     CHECK(bitmap_max_col0(256, 300) == 0);    // fits
     CHECK(bitmap_max_col0(256, 256) == 0);

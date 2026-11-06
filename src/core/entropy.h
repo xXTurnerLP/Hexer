@@ -50,6 +50,17 @@ struct EntropyOptions {
                                                // (snapshot_data_ranges), each range gets at least one,
                                                // and data that fits the budget is read in full
     int publish_ms = 30;                       // publish partial results at most this often (0 = per bucket)
+    // Refinement (0 = off): once the scan is done, every sampled bucket whose bytes read are all
+    // zero (a huge allocated zero area, e.g. a disk image, can hide a small region between two
+    // samples) gets up to this many more passes. A pass reads one more 4 KiB slot in each gap
+    // between two of the scan's chunks, in bit-reversed order (the gaps' midpoints first, then
+    // the quarter points, ...), so every slot is read once after stride / 4 KiB - 1 passes. One
+    // pass reads at most what the scan read; the worker then pauses for max(refine_pause_ms,
+    // 3x the pass's own time), so refining uses at most ~1/4 of the time. Cancelled like the
+    // scan (start / rescan / refresh / the destructor). A bucket that turns out non-zero gets its
+    // entropy / class_frac / peak from the bytes read and stops being refined.
+    uint32_t refine_passes = 0;
+    int refine_pause_ms = 500;
 };
 
 struct EntropyBucket {
@@ -63,7 +74,9 @@ struct EntropyBucket {
     float peak = 0.0f;                         // highest entropy of one 4 KiB chunk read (bits/byte):
                                                // a small dense region among zeros shows here
     bool nonzero = false;                      // some byte read is not 0x00
-    bool done = false;                         // computed (false = pending: draw neutral)
+    uint32_t refined = 0;                      // refinement passes over this bucket so far
+                                               // (EntropyOptions::refine_passes; kept by rescans)
+    bool done = false;                        // computed (false = pending: draw neutral)
     bool sampled = false;                      // only part of the bucket was read
     bool unreadable = false;                   // an I/O error stopped reading this bucket, or it
                                                // has holes (sparse source: unmapped process
@@ -82,7 +95,10 @@ struct EntropyResult {
     uint64_t io_error_offset = 0;              // with io_error: the first unreadable byte met
                                                // (holes of a sparse source are not I/O errors)
     uint64_t bytes_read = 0;                   // total bytes read so far by this run (bounded by
-                                               // sampling; reused buckets are not counted)
+                                               // sampling; reused buckets are not counted;
+                                               // refinement passes add theirs)
+    uint32_t refine_pass = 0;                  // refinement passes this run has completed (they
+                                               // run after `finished`; published after each one)
     uint32_t reused = 0;                       // buckets copied unchanged from the previous scan
                                                // (EntropyJob::rescan); they are done from the start
 
@@ -125,7 +141,8 @@ std::vector<std::pair<uint64_t, uint64_t>> snapshot_changes(const Snapshot& befo
 // Background entropy scan (SearchJob pattern). start() cancels any previous run without waiting for
 // it; that run finishes in the background and publishes nothing more. Results are published
 // progressively: result() returns the buckets computed so far, so a minimap can paint while the
-// scan runs. Bounded work: at most buckets * sample_per_bucket bytes are read.
+// scan runs. Bounded work: at most buckets * sample_per_bucket bytes are read (and as much again
+// per refinement pass, paced by EntropyOptions::refine_pause_ms).
 class EntropyJob {
 public:
     ~EntropyJob();
@@ -139,7 +156,13 @@ public:
     // underneath). The caller must use start() after an in-place save or a reload of the same
     // file version (its bytes changed under unchanged pieces). EntropyResult::reused counts them.
     void rescan(std::shared_ptr<const Snapshot> snap, EntropyOptions opts = {});
-    void cancel();                 // non-blocking request
+    // Like rescan(), but the buckets overlapping `ranges` (ascending or not) are recomputed even
+    // when their pieces did not change, and process memory is not rescanned in full: its bytes
+    // change underneath without edits, so a caller refreshes the part it shows (and a rotating
+    // slice of the rest) now and then while every other bucket keeps its last result.
+    void refresh(std::shared_ptr<const Snapshot> snap, std::vector<std::pair<uint64_t, uint64_t>> ranges,
+                 EntropyOptions opts = {});
+    void cancel();                // non-blocking request
     bool running() const;
     double progress() const;       // 0..1 (buckets done)
     uint64_t generation() const;   // increments every time a run finishes (poll to detect completion)
@@ -153,7 +176,9 @@ public:
 private:
     struct Run;
     std::shared_ptr<Run> current() const;
-    void launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opts, bool incremental);
+    enum class Mode { Full, Rescan, Refresh };
+    void launch(std::shared_ptr<const Snapshot> snap, EntropyOptions opts, Mode mode,
+                std::vector<std::pair<uint64_t, uint64_t>> dirty = {});
     std::shared_ptr<Run> run_;     // guarded by mu_
     std::vector<std::pair<std::thread, std::shared_ptr<Run>>> threads_;  // current + superseded runs
     std::atomic<bool> running_{false};

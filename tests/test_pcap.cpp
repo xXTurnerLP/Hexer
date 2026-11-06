@@ -1,7 +1,9 @@
 // Tests for core/pcap: detection, classic pcap + pcapng indexing (endians, resolutions, sections,
-// unknown blocks, truncation / corruption), the background job, the dissector and formatting.
+// unknown blocks, truncation / corruption), incremental appends (live tail), the background job, the
+// dissector and formatting.
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -478,6 +480,181 @@ TEST_CASE("PcapIndexJob indexes in the background and publishes a result") {
     CHECK(job.result()->index.truncated);
 }
 
+
+// ---- incremental index (live tail) ----
+
+namespace {
+
+void check_same(const PcapIndexResult& a, const PcapIndexResult& b) {
+    CHECK(a.format == b.format);
+    CHECK(a.error == b.error);
+    CHECK(a.error_msg == b.error_msg);
+    CHECK(a.error_offset == b.error_offset);
+    CHECK(a.truncated == b.truncated);
+    CHECK(a.scanned == b.scanned);
+    CHECK(a.time_decimals == b.time_decimals);
+    CHECK(a.interfaces.size() == b.interfaces.size());
+    REQUIRE(a.packets.size() == b.packets.size());
+    for (size_t i = 0; i < a.packets.size(); ++i) {
+        const Packet &p = a.packets[i], &q = b.packets[i];
+        INFO("packet " << i);
+        CHECK(p.record_off == q.record_off);
+        CHECK(p.data_off == q.data_off);
+        CHECK(p.cap_len == q.cap_len);
+        CHECK(p.orig_len == q.orig_len);
+        CHECK(p.ts_ns == q.ts_ns);
+        CHECK(p.linktype == q.linktype);
+        CHECK(p.iface == q.iface);
+    }
+}
+
+// Indexes the first `cut` bytes of `file`, then appends the rest; checks the result against a full
+// index of `file`. Returns what index_pcap_append returned.
+bool grow_and_compare(const Bytes& file, size_t cut) {
+    const Bytes head(file.begin(), file.begin() + std::ptrdiff_t(cut));
+    PcapIndexResult r;
+    index_pcap(*snap_of(head), r);
+    const bool inc = index_pcap_append(*snap_of(file), r);
+    check_same(r, index_of(file));
+    return inc;
+}
+
+}  // namespace
+
+TEST_CASE("index_pcap_append: classic pcap grown at every byte boundary equals a full index") {
+    for (bool be : {false, true})
+        for (bool ns : {false, true}) {
+            W w = pcap_header(be, ns, 1);
+            for (int i = 0; i < 12; ++i) pcap_rec(w, uint32_t(100 + i), uint32_t(i), pkt(size_t(20 + i), uint8_t(i)));
+            for (size_t cut = 0; cut <= w.b.size(); ++cut) {
+                INFO("be " << be << " ns " << ns << " cut " << cut);
+                const bool inc = grow_and_compare(w.b, cut);
+                CHECK(inc == (cut >= 24));  // a prefix shorter than the header is not a capture yet
+            }
+        }
+}
+
+TEST_CASE("index_pcap_append: pcapng with sections of both byte orders, grown at every byte") {
+    W a;
+    ng_shb(a);
+    ng_idb(a, 1, 0, 9);  // ns resolution: time_decimals 9 continues
+    ng_epb(a, 0, 1, pkt(4, 1));
+    ng_spb(a, 7, pkt(7, 5));
+    ng_block(a, 0x0BAD, pkt(8, 0));  // unknown block, skipped
+    W b;
+    b.be = true;
+    ng_shb(b);
+    ng_idb(b, 101, 0);
+    ng_epb(b, 0, 2, pkt(5, 2));
+    ng_idb(b, 228, 0);
+    ng_epb(b, 1, 3, pkt(6, 3));
+    ng_opb(b, 0, 4, pkt(9, 4));
+    const Bytes all = cat(a.b, b.b);
+    const PcapIndexResult full = index_of(all);
+    REQUIRE(full.packets.size() == 5);
+    REQUIRE_FALSE(full.error);
+    CHECK(full.time_decimals == 9);
+    size_t incremental = 0;
+    for (size_t cut = 0; cut <= all.size(); ++cut) {
+        INFO("cut " << cut);
+        if (grow_and_compare(all, cut)) ++incremental;
+    }
+    CHECK(incremental >= all.size() - 28);  // every cut after the first section header
+}
+
+TEST_CASE("index_pcap_append: a rewritten, shrunk or replaced capture falls back to a full index") {
+    W w = pcap_header(false, false);
+    for (int i = 0; i < 10; ++i) pcap_rec(w, uint32_t(i), 0, pkt(30, uint8_t(i)));
+    const Bytes v1 = w.b;
+    W w2 = w;
+    for (int i = 10; i < 15; ++i) pcap_rec(w2, uint32_t(i), 0, pkt(30, uint8_t(i)));
+    const Bytes v2 = w2.b;
+
+    PcapIndexResult r;
+    index_pcap(*snap_of(v1), r);
+    REQUIRE(r.packets.size() == 10);
+    CHECK(r.resume.tail_len == 16);
+    // Grown: only the new records are read.
+    PcapIndexResult g = r;
+    CHECK(index_pcap_append(*snap_of(v2), g));
+    CHECK(g.packets.size() == 15);
+    // Unchanged: nothing new.
+    PcapIndexResult same = r;
+    CHECK(index_pcap_append(*snap_of(v1), same));
+    check_same(same, r);
+    // Shrunk below what was indexed.
+    const Bytes shrunk(v1.begin(), v1.end() - 5);
+    PcapIndexResult s = r;
+    CHECK_FALSE(index_pcap_append(*snap_of(shrunk), s));
+    check_same(s, index_of(shrunk));
+    // Same length or longer, but the bytes before the old end changed (truncated and rewritten).
+    Bytes rewritten = v2;
+    rewritten[v1.size() - 3] ^= 0xFF;  // inside the last record indexed
+    PcapIndexResult rw = r;
+    CHECK_FALSE(index_pcap_append(*snap_of(rewritten), rw));
+    check_same(rw, index_of(rewritten));
+    // Now a pcapng file.
+    W ng;
+    ng_shb(ng);
+    ng_idb(ng, 1, 0);
+    ng_epb(ng, 0, 1, pkt(40, 1));
+    PcapIndexResult n = r;
+    CHECK_FALSE(index_pcap_append(*snap_of(ng.b), n));
+    check_same(n, index_of(ng.b));
+    // A cancelled index is redone from the start.
+    std::atomic<bool> cancel{true};
+    PcapIndexResult c;
+    index_pcap(*snap_of(v1), c, kPcapMaxPackets, &cancel);
+    CHECK(c.cancelled);
+    CHECK_FALSE(index_pcap_append(*snap_of(v2), c));
+    check_same(c, index_of(v2));
+    // A capped index continues up to the new cap.
+    PcapIndexResult capped;
+    index_pcap(*snap_of(v2), capped, 4);
+    CHECK(capped.truncated);
+    CHECK(index_pcap_append(*snap_of(v2), capped, 9));
+    CHECK(capped.packets.size() == 9);
+    CHECK(capped.truncated);
+    CHECK(index_pcap_append(*snap_of(v2), capped));
+    check_same(capped, index_of(v2));
+}
+
+TEST_CASE("PcapIndexJob::start_append continues a previous result") {
+    W w = pcap_header(false, false);
+    for (int i = 0; i < 100; ++i) pcap_rec(w, uint32_t(i), 0, pkt(32, uint8_t(i)));
+    const Bytes v1 = w.b;
+    for (int i = 100; i < 150; ++i) pcap_rec(w, uint32_t(i), 0, pkt(32, uint8_t(i)));
+    PcapIndexJob job;
+    job.start(snap_of(v1));
+    const auto t0 = std::chrono::steady_clock::now();
+    while (job.generation() == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto r1 = job.result();
+    REQUIRE(r1);
+    CHECK_FALSE(r1->incremental);
+    auto sn2 = snap_of(w.b);
+    job.start_append(sn2, r1);
+    while (job.generation() == 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto r2 = job.result();
+    REQUIRE(r2);
+    CHECK(r2->incremental);
+    CHECK(r2->prev_packets == 100);
+    CHECK(r2->snap == sn2);
+    CHECK(r2->index.packets.size() == 150);
+    CHECK(r1->index.packets.size() == 100);  // the previous result is untouched
+    // A rewritten file: a full index (not incremental).
+    Bytes other = w.b;
+    other.back() ^= 1;  // the last indexed bytes changed
+    job.start_append(snap_of(other), r2);
+    while (job.generation() == 2 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(job.result());
+    CHECK(job.generation() == 3);
+    CHECK_FALSE(job.result()->incremental);
+    CHECK(job.result()->prev_packets == 0);
+    CHECK(job.result()->index.packets.size() == 150);
+}
 // ---- dissector ----
 
 TEST_CASE("dissect: Ethernet / IPv4 / UDP with Ethernet padding") {

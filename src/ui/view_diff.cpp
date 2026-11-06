@@ -87,19 +87,29 @@ const char* kind_name(uint8_t kind) {
 std::string bytes_text(uint64_t n) { return fmt_count(n) + (n == 1 ? " byte" : " bytes"); }
 
 // What Find Shift found, for the toolbar note / status bar.
-std::string shift_message(const ShiftResult& r) {
+// `from`: the A offset the search started at (the A caret).
+std::string shift_message(const ShiftResult& r, uint64_t from) {
     const std::string at_a = "A 0x" + fmt_hex(r.diff_a);
+    const std::string passed =
+        r.changes == 0 ? std::string() : " (after " + fmt_count(r.changes) + (r.changes == 1 ? " change)" : " changes)");
     switch (r.status) {
     case ShiftResult::Found:
+        if (r.delta == 0 && r.changes > 1)
+            return "No shift needed: the " + fmt_count(r.changes) + " differences from " + at_a +
+                   " are changes, not insertions" +
+                   (r.limit ? "; Find Shift again goes on at A 0x" + fmt_hex(r.match_a) : std::string());
         if (r.delta == 0)
             return "No shift needed: the bytes after the difference at " + at_a +
                    " already line up (changed, not inserted)";
         if (r.delta > 0)
             return "Shift " + fmt_shift(r.shift) + ": B has " + bytes_text(uint64_t(r.delta)) + " more at B 0x" +
-                   fmt_hex(r.diff_b);
+                   fmt_hex(r.diff_b) + passed;
         return "Shift " + fmt_shift(r.shift) + ": A has " + bytes_text(uint64_t(0) - uint64_t(r.delta)) +
-               " more at " + at_a;
-    case ShiftResult::NoDifference: return "Nothing to align: no difference with the current shift";
+               " more at " + at_a + passed;
+    case ShiftResult::NoDifference:
+        if (from > 0)
+            return "Nothing to align: no difference after A 0x" + fmt_hex(from) + " with the current shift";
+        return "Nothing to align: no difference with the current shift";
     case ShiftResult::NoProbe:
         return "No distinctive bytes after the difference at " + at_a + " (only padding / repeats)";
     case ShiftResult::NoMatch:
@@ -181,7 +191,7 @@ void DiffView::poll_shift(Document& a, Document& b, const DiffViewCallbacks& cb)
         }
         cur_ = kNoDiff;
     }
-    note_ = shift_message(*r);
+    note_ = shift_message(*r, shift_from_);
     if (cb.notify) cb.notify(note_);
 }
 
@@ -329,8 +339,10 @@ void DiffView::draw_toolbar(Document& a, Document& b) {
     if (ImGui::Button("Find Shift")) find_shift_requested_ = true;
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("Find the shift that lines the documents up again after their first difference\n"
-                          "(an inserted or deleted header / block, searched within +-%s).",
+        ImGui::SetTooltip("Find the shift that lines the documents up again after the first misalignment\n"
+                          "at or after the A caret (an inserted or deleted header / block, searched\n"
+                          "within +-%s; plain changes are passed over). The caret then sits on the\n"
+                          "matching block, so Find Shift again finds the next misalignment.",
                           fmt_size(ShiftOptions{}.window).c_str());
     ImGui::SameLine();
     if (ImGui::Checkbox("Sync scroll", &sync_scroll) && sync_scroll) synced_once_ = false;
@@ -447,7 +459,9 @@ void DiffView::draw(const char* id, Document& a, Document& b, const DiffViewCall
     if (find_shift_requested_ && !a.busy() && !b.busy()) {
         find_shift_requested_ = false;
         note_.clear();
-        shift_run_ = shift_job_.start(a.snapshot(), b.snapshot(), shift);
+        ShiftOptions opt;
+        opt.from = shift_from_ = a.view().sel_begin();  // the next misalignment from the A caret on
+        shift_run_ = shift_job_.start(a.snapshot(), b.snapshot(), shift, opt);
     }
     poll_shift(a, b, cb);
 

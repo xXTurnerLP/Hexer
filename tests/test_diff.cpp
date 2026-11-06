@@ -595,6 +595,75 @@ TEST_CASE("find_shift: identical, appended tail, plain change, no match, window 
     CHECK(r.shift == 5000);
 }
 
+TEST_CASE("find_shift: a change followed by an insertion; the next misalignment from an offset") {
+    const Bytes x = random_bytes(10000, 81), y = random_bytes(50000, 82), z = random_bytes(30000, 83);
+    const Bytes w = random_bytes(20000, 84), ins = random_bytes(300, 85), ins2 = random_bytes(77, 86);
+    Bytes xc = x;  // two plain changes before the insertion
+    for (size_t i = 1000; i < 1016; ++i) xc[i] ^= 0xFF;
+    xc[5000] ^= 1;
+    const Bytes a = cat({&x, &y, &z, &w}), b = cat({&xc, &y, &ins, &z, &ins2, &w});
+    ShiftResult r = shift_of(a, b);
+    REQUIRE(r.status == ShiftResult::Found);
+    CHECK(r.changes == 2);
+    CHECK_FALSE(r.limit);
+    CHECK(r.diff_a == x.size() + y.size());
+    CHECK(r.delta == 300);
+    CHECK(r.shift == 300);
+    CHECK(r.match_a == x.size() + y.size());
+    CHECK(std::memcmp(a.data() + r.match_a, b.data() + r.match_b, 64) == 0);
+    // Without passing over changes the first one answers "no shift" (the old behaviour).
+    ShiftOptions plain;
+    plain.change_scan = 0;
+    ShiftResult p = shift_of(a, b, 0, plain);
+    REQUIRE(p.status == ShiftResult::Found);
+    CHECK(p.delta == 0);
+    CHECK(p.diff_a == 1000);
+    // The next misalignment: from the match on, under the new shift, the second insertion.
+    ShiftOptions next;
+    next.from = r.match_a;
+    ShiftResult r2 = shift_of(a, b, r.shift, next);
+    REQUIRE(r2.status == ShiftResult::Found);
+    CHECK(r2.changes == 0);
+    CHECK(r2.diff_a == x.size() + y.size() + z.size());
+    CHECK(r2.delta == 77);
+    CHECK(r2.shift == 377);
+    next.from = r2.match_a;
+    ShiftResult r3 = shift_of(a, b, r2.shift, next);
+    CHECK(r3.status == ShiftResult::NoDifference);
+    // max_changes: stop after each change; searching again from the match goes on.
+    ShiftOptions one;
+    one.max_changes = 1;
+    ShiftResult s = shift_of(a, b, 0, one);
+    REQUIRE(s.status == ShiftResult::Found);
+    CHECK(s.limit);
+    CHECK(s.changes == 1);
+    CHECK(s.delta == 0);
+    CHECK(s.diff_a == 1000);
+    CHECK(s.match_a == 1016);
+    one.from = s.match_a;
+    s = shift_of(a, b, 0, one);
+    CHECK(s.limit);
+    CHECK(s.diff_a == 5000);
+    one.from = s.match_a;
+    s = shift_of(a, b, 0, one);
+    CHECK_FALSE(s.limit);
+    CHECK(s.delta == 300);
+    // Only changes after `from`: no shift needed, the first change and the last match reported.
+    Bytes only = a;
+    only[20000] ^= 1;
+    only[40000] ^= 1;
+    only[70000] ^= 1;
+    s = shift_of(a, only);
+    REQUIRE(s.status == ShiftResult::Found);
+    CHECK(s.delta == 0);
+    CHECK(s.changes == 3);
+    CHECK(s.diff_a == 20000);
+    CHECK(s.match_a > 70000);
+    ShiftOptions late;
+    late.from = 70001;
+    CHECK(shift_of(a, only, 0, late).status == ShiftResult::NoDifference);
+}
+
 TEST_CASE("find_shift: no overlap under the current shift, huge shifts do not overflow") {
     const Bytes body = random_bytes(20000, 61), head = random_bytes(3000, 62);
     const Bytes b = cat({&head, &body});

@@ -55,7 +55,7 @@ struct Settings {
     // Bitmap panel: pixel format (its display name, e.g. "RGB 24-bit"; "" = Gray 8-bit), width, zoom.
     std::string bitmap_format;
     int bitmap_width = 256;
-    int bitmap_zoom = 2;
+    int bitmap_zoom = 2;              // a zoom level (core/bitmap.h): -2..-16 = 1/2x..1/16x
     // Disassembly panel: mode 0 = auto (the PE / ELF header's), 1 = 64-bit, 2 = 32-bit
     // (settings.ini: disasm_mode = auto | 64 | 32), AT&T syntax (disasm_syntax = intel | att),
     // uppercase, Follow cursor, bytes column. Per-tab map / base / pinned start: session extras.
@@ -103,9 +103,10 @@ struct Settings {
     // Strings: encodings, line breaks as string characters, minimum length (characters, 1..4096).
     bool strings_ascii = true, strings_utf16le = true, strings_utf16be = false, strings_newlines = false;
     int strings_min_length = 5;
-    // XOR Search: transforms to try (XOR / ADD-SUB / ROL-ROR 1-byte keys, multi-byte XOR key) and
-    // the longest multi-byte key (2..16).
+    // XOR Search: transforms to try (XOR / ADD-SUB / ROL-ROR 1-byte keys, multi-byte XOR / ADD
+    // keys) and the longest multi-byte key (2..16).
     bool xor_xor = true, xor_add = true, xor_rol = true, xor_key = false;
+    bool xor_add_key = false;  // multi-byte ADD keys
     int xor_max_key_len = 16;
     // Bitmap: Fit (largest zoom that fits), Alpha, where the image starts: 0 = the hex view's top
     // row, 1 = the cursor (bitmap_source = view | cursor; "Fixed offset" is session state).

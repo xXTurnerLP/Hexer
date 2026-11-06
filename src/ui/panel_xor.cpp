@@ -69,10 +69,6 @@ std::string escape_plaintext(const std::vector<uint8_t>& b) {
 
 std::string key_hex(const std::vector<uint8_t>& key) { return copy_as(key.data(), key.size(), CopyFormat::HexSpaced); }
 
-XorTransform guess_transform(const std::vector<uint8_t>& key) {
-    return key.size() > 1 ? XorTransform::XorKey : XorTransform::Xor;
-}
-
 }  // namespace
 
 struct XorPanel::DocState {
@@ -93,6 +89,7 @@ struct XorPanel::DocState {
     std::vector<KeyCandidate> guesses;
     std::vector<uint8_t> guess_head;  // first kGuessPreview bytes of the guessed range
     uint64_t guess_begin = 0, guess_len = 0, guess_doc_gen = 0;
+    bool guess_add = false;           // the candidates are ADD keys
     size_t guess_selected = SIZE_MAX;
 };
 
@@ -104,18 +101,20 @@ void XorPanel::load_settings(const Settings& s) {
     options.add8 = s.xor_add;
     options.rol = s.xor_rol;
     options.xor_multi = s.xor_key;
+    options.add_multi = s.xor_add_key;
     options.max_key_len = uint32_t(std::clamp(s.xor_max_key_len, 2, int(kXorMaxKeyLen)));
 }
 
 bool XorPanel::save_settings(Settings& s) const {
     const int len = int(std::clamp<uint32_t>(options.max_key_len, 2, kXorMaxKeyLen));
     if (s.xor_xor == options.xor8 && s.xor_add == options.add8 && s.xor_rol == options.rol &&
-        s.xor_key == options.xor_multi && s.xor_max_key_len == len)
+        s.xor_key == options.xor_multi && s.xor_add_key == options.add_multi && s.xor_max_key_len == len)
         return false;
     s.xor_xor = options.xor8;
     s.xor_add = options.add8;
     s.xor_rol = options.rol;
     s.xor_key = options.xor_multi;
+    s.xor_add_key = options.add_multi;
     s.xor_max_key_len = len;
     return true;
 }
@@ -172,7 +171,7 @@ void XorPanel::draw(Document* doc, const XorPanelCallbacks& cb) {
         ImGui::SameLine();
         ImGui::BeginDisabled(!sel_ok || doc->busy() || doc->read_only());
         if (ImGui::Button("Decode selection")) {
-            const uint64_t phase = st.key_t == XorTransform::XorKey ? v.sel_begin() % st.key.size() : 0;
+            const uint64_t phase = v.sel_begin() % st.key.size();  // 1-byte keys: always 0
             if (cb.apply) {
                 cb.apply(st.key_t, st.key, phase);
             } else {
@@ -264,13 +263,19 @@ void XorPanel::draw_scan_tab(Document& doc, DocState& st, const XorPanelCallback
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Multi-byte XOR keys of 2..%u bytes; a key of length L needs at least 2*L and L+4 plaintext bytes",
                           unsigned(options.max_key_len));
-    if (options.xor_multi) {
+    ImGui::SameLine();
+    ImGui::Checkbox("ADD key", &options.add_multi);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Multi-byte ADD keys of 2..%u bytes (byte + key byte, mod 256); a key of length L needs at "
+                          "least 2*L and L+4 plaintext bytes",
+                          unsigned(options.max_key_len));
+    if (options.xor_multi || options.add_multi) {
         ImGui::SameLine();
         int ml = int(options.max_key_len);
         ImGui::SetNextItemWidth(80.0f * s);
         if (ImGui::SliderInt("max len", &ml, 2, int(kXorMaxKeyLen))) options.max_key_len = uint32_t(std::clamp(ml, 2, int(kXorMaxKeyLen)));
     }
-    const bool any_t = options.xor8 || options.add8 || options.rol || options.xor_multi;
+    const bool any_t = options.xor8 || options.add8 || options.rol || options.xor_multi || options.add_multi;
 
     // ---- scan controls ----
     const bool running = st.job.running();
@@ -415,7 +420,9 @@ void XorPanel::draw_guess_tab(Document& doc, DocState& st, const XorPanelCallbac
         const uint64_t len = std::min<uint64_t>(v.sel_len(), kGuessMax);
         std::vector<uint8_t> data(static_cast<size_t>(len));
         data.resize(doc.read(v.sel_begin(), data.data(), data.size()));
-        st.guesses = key_guess(data.data(), data.size(), v.sel_begin(), guess_spaces ? uint8_t(' ') : uint8_t(0));
+        st.guess_add = guess_add;
+        st.guesses = key_guess(data.data(), data.size(), v.sel_begin(), guess_spaces ? uint8_t(' ') : uint8_t(0),
+                               kXorMaxKeyLen, guess_add ? XorTransform::Add : XorTransform::Xor);
         if (st.guesses.size() > kMaxGuesses) st.guesses.resize(kMaxGuesses);
         data.resize(std::min(data.size(), kGuessPreview));
         st.guess_head = std::move(data);
@@ -425,7 +432,8 @@ void XorPanel::draw_guess_tab(Document& doc, DocState& st, const XorPanelCallbac
         st.guess_selected = SIZE_MAX;
         st.guessed = true;
         if (cb.notify && !st.guesses.empty())
-            cb.notify("Best key guess: " + describe_key(guess_transform(st.guesses[0].key), st.guesses[0].key));
+            cb.notify("Best key guess: " + describe_key(keyed_transform(st.guesses[0].key.size(), guess_add),
+                                                         st.guesses[0].key));
     }
     ImGui::EndDisabled();
     if (guess_requested_ && !sel_ok && cb.notify) cb.notify("Guess key: select the obfuscated bytes first");
@@ -438,6 +446,13 @@ void XorPanel::draw_guess_tab(Document& doc, DocState& st, const XorPanelCallbac
     if (ImGui::RadioButton("0x00", !guess_spaces)) guess_spaces = false;
     ImGui::SameLine();
     if (ImGui::RadioButton("spaces", guess_spaces)) guess_spaces = true;
+    ImGui::SameLine();
+    ImGui::TextUnformatted("  Key");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("XOR", !guess_add)) guess_add = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("ADD", guess_add)) guess_add = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Data obfuscated by adding a key (decoded by subtracting it)");
 
     if (!st.guessed) {
         ImGui::TextDisabled("Select XOR-obfuscated data (e.g. a zero-padded table or a text block)");
@@ -466,7 +481,7 @@ void XorPanel::draw_guess_tab(Document& doc, DocState& st, const XorPanelCallbac
     ImGui::TableHeadersRow();
     for (size_t i = 0; i < st.guesses.size(); ++i) {
         const KeyCandidate& c = st.guesses[i];
-        const XorTransform t = guess_transform(c.key);
+        const XorTransform t = keyed_transform(c.key.size(), st.guess_add);
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::PushID(int(i));

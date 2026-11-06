@@ -77,6 +77,16 @@ struct PcapIndexResult {
     std::string error_msg;
     uint64_t error_offset = 0;
     uint64_t scanned = 0;                   // offset the index reached
+    // Where index_pcap_append continues: the reader state after the last complete record.
+    struct Resume {
+        bool be = false;                    // byte order (classic: of the file, pcapng: of the section)
+        bool ns = false;                    // classic: nanosecond timestamps
+        bool have_section = false;          // pcapng: a section header was read
+        uint32_t section_no = 0;
+        std::vector<uint32_t> ifaces;       // pcapng: local interface id -> index into interfaces
+        uint8_t tail[16] = {};              // the bytes right before `scanned` (rewrite check)
+        uint32_t tail_len = 0;
+    } resume;
 };
 
 constexpr size_t kPcapMaxPackets = 5000000;
@@ -86,9 +96,17 @@ constexpr uint32_t kPcapMaxRecord = 64u << 20;  // a record claiming more captur
 // Blocking primitive. `progress` (if non-null) gets the offset reached.
 void index_pcap(const Snapshot& snap, PcapIndexResult& out, size_t max_packets = kPcapMaxPackets,
                 const std::atomic<bool>* cancel = nullptr, std::atomic<uint64_t>* progress = nullptr);
+// Live tail: `out` is an index of an earlier version of the capture in `snap` that has since only
+// grown at its end. Reads only the records after out.scanned (a record that was cut short there
+// is read again in full) and appends them to out.packets; true. Falls back to a full index_pcap
+// (false) when that cannot be trusted: another format, a size below out.scanned, other bytes right
+// before out.scanned (rewritten / truncated and regrown), a cancelled or headerless index.
+bool index_pcap_append(const Snapshot& snap, PcapIndexResult& out, size_t max_packets = kPcapMaxPackets,
+                       const std::atomic<bool>* cancel = nullptr, std::atomic<uint64_t>* progress = nullptr);
 
 // Background index, same model as SearchJob / StringsJob: one run at a time; start() cancels a
 // previous run without waiting for it (it finishes in the background and publishes nothing).
+// start_append() runs index_pcap_append over a copy of `prev`'s index (live tail).
 class PcapIndexJob {
 public:
     PcapIndexJob() = default;
@@ -97,6 +115,9 @@ public:
     PcapIndexJob& operator=(const PcapIndexJob&) = delete;
 
     void start(std::shared_ptr<const Snapshot> snap, size_t max_packets = kPcapMaxPackets);
+    struct Result;
+    void start_append(std::shared_ptr<const Snapshot> snap, std::shared_ptr<const Result> prev,
+                      size_t max_packets = kPcapMaxPackets);
     void cancel();                 // non-blocking request
     bool running() const;
     double progress() const;       // 0..1
@@ -105,10 +126,14 @@ public:
     struct Result {
         PcapIndexResult index;
         std::shared_ptr<const Snapshot> snap;  // what was indexed (read packet bytes from it)
+        // start_append continued the previous index: its packets are the first `prev_packets` here.
+        bool incremental = false;
+        size_t prev_packets = 0;
     };
     std::shared_ptr<const Result> result() const;  // last finished run; null before the first
 
 private:
+    void launch(std::shared_ptr<const Snapshot> snap, std::shared_ptr<const Result> prev, size_t max_packets);
     struct Run;
     std::shared_ptr<Run> current() const;
     std::shared_ptr<Run> run_;

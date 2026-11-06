@@ -583,6 +583,8 @@ const HashAlgorithm* find_hash_algorithm(const std::string& name) {
     return nullptr;
 }
 
+std::string hash_name_key(const std::string& name) { return key_of(name); }
+
 std::unique_ptr<Hasher> make_hasher(const std::string& name) {
     const HashAlgorithm* a = find_hash_algorithm(name);
     return a ? a->create() : nullptr;
@@ -728,7 +730,7 @@ HashJob::Result HashJob::result() const {
 }
 
 void HashJob::start(std::shared_ptr<const Snapshot> snap, uint64_t offset, uint64_t length,
-                    std::vector<std::string> algos) {
+                    std::vector<std::string> algos, std::vector<CustomHashAlgorithm> custom) {
     const uint64_t size = snap ? snap->size() : 0;
     offset = std::min(offset, size);
     length = std::min(length, size - offset);
@@ -748,19 +750,28 @@ void HashJob::start(std::shared_ptr<const Snapshot> snap, uint64_t offset, uint6
         }
     }
     running_ = true;
-    std::thread th([this, run, snap = std::move(snap), offset, length, algos = std::move(algos)]() {
+    std::thread th([this, run, snap = std::move(snap), offset, length, algos = std::move(algos),
+                    custom = std::move(custom)]() {
         Result r;
         r.offset = offset;
         r.length = length;
-        std::vector<const HashAlgorithm*> infos;
+        std::vector<std::string> names;
         std::vector<std::unique_ptr<Hasher>> owned;
         std::vector<Hasher*> hs;
         for (const auto& name : algos) {
             if (const HashAlgorithm* a = find_hash_algorithm(name)) {
-                infos.push_back(a);
+                names.push_back(a->name);
                 owned.push_back(a->create());
                 hs.push_back(owned.back().get());
             }
+        }
+        for (const CustomHashAlgorithm& c : custom) {
+            if (!c.create || run->cancel) continue;
+            std::unique_ptr<Hasher> h = c.create(&run->cancel);
+            if (!h) continue;
+            names.push_back(c.name);
+            owned.push_back(std::move(h));
+            hs.push_back(owned.back().get());
         }
         uint64_t bad = UINT64_MAX;
         bool hole = false;
@@ -770,7 +781,17 @@ void HashJob::start(std::shared_ptr<const Snapshot> snap, uint64_t offset, uint6
         r.io_error_offset = r.io_error ? bad : 0;
         r.hole = r.io_error && hole;
         if (ok && !r.cancelled)
-            for (size_t i = 0; i < hs.size(); ++i) r.values.push_back({infos[i]->name, to_hex(hs[i]->finish())});
+            for (size_t i = 0; i < hs.size(); ++i) {
+                Value v{names[i], {}, hs[i]->error()};
+                if (v.error.empty()) {
+                    std::vector<uint8_t> digest = hs[i]->finish();
+                    v.error = hs[i]->error();  // a custom final() may fail too
+                    if (v.error.empty()) v.hex = to_hex(digest);
+                }
+                r.values.push_back(std::move(v));
+            }
+        hs.clear();
+        owned.clear();  // custom hashers (Lua states) are destroyed on this thread, before publishing
         {
             std::lock_guard<std::mutex> lock(mu_);
             if (run_ == run) {  // superseded runs publish nothing
