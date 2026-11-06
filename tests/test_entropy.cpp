@@ -941,6 +941,7 @@ TEST_CASE("entropy: refinement finds a small region between the samples of an al
     CHECK(b.bytes_read < b.length);
     CHECK(r->refine_pass >= 1);
     CHECK(entropy_spot(entropy_aggregate(*r, 0, 4u << 20)));  // a row of all buckets shows it
+    const uint32_t found_refined = b.refined;  // b points into r, which the next wait replaces
     // The all-zero buckets go on until every slot is read; the found one stops.
     r = wait_result(job, [](const EntropyResult& x) {
         return x.buckets[0].refined == UINT32_MAX && x.buckets[1].refined == UINT32_MAX &&
@@ -955,7 +956,7 @@ TEST_CASE("entropy: refinement finds a small region between the samples of an al
         CHECK(z.entropy == 0.0f);
         CHECK(frac(z, ByteClass::Zero) == 1.0f);
     }
-    CHECK(r->buckets[2].refined == b.refined);
+    CHECK(r->buckets[2].refined == found_refined);
     CHECK(r->bytes_read <= (4u << 20));
 }
 
