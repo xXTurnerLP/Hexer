@@ -318,7 +318,7 @@ and while a save is running.
 
 | Call | |
 |---|---|
-| `hx.version` | `"1.1.1"` (the running Hexer) |
+| `hx.version` | `"1.1.2"` (the running Hexer) |
 | `hx.parser{...}` `hx.command{...}` | registration (see above / below) |
 | `hx.run(name)` | runs a registered command exactly like the palette (one undo step on the active document); handy with `hexer --exec`. Called from inside a command, it runs the other command inline, as part of the caller's step |
 | `hx.prompt(title, default?, {hint=}?)` | asks the user for one line of text in a dialog; returns the text, or `nil` if cancelled. Commands only (see below) |

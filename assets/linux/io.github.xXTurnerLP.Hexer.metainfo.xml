@@ -30,6 +30,17 @@
   <url type="bugtracker">https://github.com/xXTurnerLP/Hexer/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.2" date="2026-11-10">
+      <description>
+        <ul>
+          <li>Give each bookmark its own color: preset colors or a custom one, shown live while you pick it</li>
+          <li>Edit a bookmark's offset, length and bytes in the Bookmarks panel</li>
+          <li>Ctrl+B on a selection that covers a bookmark and more bytes extends that bookmark</li>
+          <li>Fixed: Ctrl+B with the cursor at the end of the file stacked bookmarks on the last byte</li>
+          <li>Fixed: a hidden Disassembly panel left a stale blue highlight in the hex view</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.1" date="2026-11-10">
       <description>
         <ul>
