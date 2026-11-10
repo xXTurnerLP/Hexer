@@ -282,10 +282,12 @@ Alt+drag adds, Alt+click on a selected byte removes, a plain click / Esc clears 
 with a focused `ImGui::Shortcut` only while extras exist, so the app's global Esc keeps working).
 
 ## Releasing
-Versioning (from 1.0.0 on): every update bumps the **minor** version (1.0.0 -> 1.1.0 -> 1.2.0). An
-update that breaks backwards compatibility with any of the systems (sessions / hot exit that no
-longer restore, settings.ini or layout keys, the Lua API and its scripts, the command line,
-`process://` / disk URLs, package layout) bumps the **major** version instead (1.4.0 -> 2.0.0).
+Versioning: the major version stays **1** (always 1.x.y). Every update bumps the **patch** version
+(1.1.0 -> 1.1.1 -> 1.1.2). An update that breaks backwards compatibility with any of the systems
+(sessions / hot exit that no longer restore, settings.ini or layout keys, the Lua API and its
+scripts, the command line, `process://` / disk URLs, package layout) bumps the **minor** version
+instead and resets the patch (1.1.4 -> 1.2.0). (1.1.0 came from an older rule that bumped minor
+on every update; it stays, the next compatible release is 1.1.1.)
 Bump `version` in meson.build (HEXER_VERSION / `hx.version` / the About box come from it; keep the
 fallback in lua_api.cpp, the script_engine.h comment and docs/scripting.md in step), add a
 `<release>` entry to assets/linux/*.metainfo.xml (newest first), commit, wait for a green CI on
