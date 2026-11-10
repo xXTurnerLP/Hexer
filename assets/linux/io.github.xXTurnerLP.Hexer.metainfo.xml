@@ -30,6 +30,14 @@
   <url type="bugtracker">https://github.com/xXTurnerLP/Hexer/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.1" date="2026-11-10">
+      <description>
+        <ul>
+          <li>Select part of the console output, a message or an error text with the mouse and copy it with Ctrl+C</li>
+          <li>Fixed: the Open dialog failed when the last opened item was a disk</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-11-06"/>
     <release version="1.0.0" date="2026-11-06"/>
   </releases>
