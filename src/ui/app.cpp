@@ -485,9 +485,25 @@ std::string native_path(std::string p) {
     return p;
 }
 
+// The directory of `path` if it is an existing folder, else "". Disks ("\\.\PhysicalDrive1"),
+// processes and files in deleted folders have none: the Windows dialog fails on such a default
+// path ("Failed to create ShellItem for setting the default path").
+std::string existing_dir_of(const std::string& path) {
+    auto sep = [](char c) { return c == '\\' || c == '/'; };
+    if (path.size() >= 4 && sep(path[0]) && sep(path[1]) && path[2] == '.' && sep(path[3]))
+        return {};  // a disk / volume: its dirname "\\." is no folder
+    std::string dir = path_dirname(path);
+    if (dir.empty()) return {};
+    FileStat st = os_stat(dir);
+    return st.exists && st.is_dir && !st.is_device ? native_path(dir) : std::string();
+}
+
 std::string dialog_dir(App& app) {
-    if (Tab* t = active_tab(app); t && !t->path.empty()) return native_path(path_dirname(t->path));
-    if (!app.settings.recent_files.empty()) return native_path(path_dirname(app.settings.recent_files.front()));
+    if (Tab* t = active_tab(app); t) {
+        if (std::string d = existing_dir_of(t->path); !d.empty()) return d;
+    }
+    for (const std::string& r : app.settings.recent_files)
+        if (std::string d = existing_dir_of(r); !d.empty()) return d;
     return {};
 }
 
