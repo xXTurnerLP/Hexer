@@ -298,6 +298,26 @@ fallback in lua_api.cpp, the script_engine.h comment and docs/scripting.md in st
 `<release>` entry to assets/linux/*.metainfo.xml (newest first), commit, wait for a green CI on
 main, then push a `vX.Y.Z` tag: the `release` job publishes the packages as a GitHub Release.
 
+**"Ready for a push" = do the whole release, without asking again:** pick the next version by the
+rule above (patch, or minor if anything breaks compatibility), bump + metainfo entry + commit, push
+main, wait for its CI to be green (fix and repeat if not), push the `vX.Y.Z` tag, then create the
+release yourself with the notes:
+`gh release create vX.Y.Z --verify-tag --title "Hexer vX.Y.Z" --notes-file <scratch>/notes.md`.
+The tag's `release` job sees the existing release and only attaches the packages (it falls back
+to `--generate-notes` only when no release exists); watch it and check the assets are there.
+Release notes (also the metainfo `<release>` description, shortened): written for users, from
+`git log <previous tag>..HEAD`, simple and clear. One line per change saying what the user gets
+or what was wrong, grouped under `## New`, `## Improved`, `## Fixed` (omit empty groups), plus
+`## Breaking changes` first when the minor version was bumped (what breaks and what to do). No
+commit hashes, internal names (classes, files, functions) or test / refactor / docs-only commits.
+Example:
+```
+## New
+- Select part of the console output (or a message / error text) with the mouse and copy it with Ctrl+C.
+## Fixed
+- Ctrl+O failed with "Failed to create ShellItem" when the last opened item was a disk.
+```
+
 ## Conventions
 - namespace `hx`; 4-space indent; `snake_case` functions/vars, `PascalCase` types, `trailing_` members.
 - Colors are packed `0xAABBGGRR` (IM_COL32 layout) — use `hx::rgba(r,g,b,a)`.
