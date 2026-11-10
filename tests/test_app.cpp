@@ -372,6 +372,7 @@ TEST_CASE("app: bookmark colors: the color menu, the bookmark under the caret, o
         pick_min = ImGui::GetItemRectMin();
         pick_max = ImGui::GetItemRectMax();
         ImGui::End();
+        bookmark_color_preview_tick(*h.app);  // as app_frame() does once per frame
         ImGui::Render();
     };
     // A click on the first preset swatch sets red: one undo step.
@@ -404,6 +405,8 @@ TEST_CASE("app: bookmark colors: the color menu, the bookmark under the caret, o
     const uint32_t live_b = d.view().bookmarks[0].color;
     CHECK(live_b != live_a);
     CHECK(d.undo_stack().size() == steps + 1);
+    for (int k = 0; k < 5; ++k) menu_frame(sv_b, true);  // the mouse rests mid-drag: the preview stays
+    CHECK(d.view().bookmarks[0].color == live_b);
     menu_frame(sv_b, false);
     CHECK(d.view().bookmarks[0].color == live_b);
     CHECK(d.undo_stack().size() == steps + 2);

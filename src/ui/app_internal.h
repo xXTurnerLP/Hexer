@@ -225,7 +225,7 @@ struct BookmarkColorPreview {
     size_t index = 0;
     uint32_t original = 0;  // the color the undo step starts from
     uint32_t shown = 0;     // the preview color written into the view
-    int frame = 0;          // ImGui frame the picker last changed it (ended when the picker is gone)
+    int frame = 0;          // ImGui frame the picker was last drawn (ended when the picker is gone)
     bool active = false;
 };
 

@@ -1716,6 +1716,9 @@ bool bookmark_color_menu(App& app, Document& d, size_t index) {
                                          "blue", "purple", "pink",   "gray",  "white"};
     static float custom[3] = {1.0f, 0.0f, 0.0f};  // the picker's value while this popup is open
     if (index >= d.view().bookmarks.size()) return false;
+    BookmarkColorPreview& p = app.bm_preview;
+    if (p.active && p.doc == d.id() && p.index == index)
+        p.frame = ImGui::GetFrameCount();  // still open (the mouse may rest mid-drag): keep the preview
     const uint32_t cur = d.view().bookmarks[index].color;
     const uint32_t shown = cur ? cur : hex_colors().bookmark;
     if (ImGui::IsWindowAppearing()) {
