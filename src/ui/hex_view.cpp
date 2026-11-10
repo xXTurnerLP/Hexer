@@ -352,10 +352,26 @@ constexpr uint32_t kMarkColor = IM_COL32(0xff, 0xc4, 0x5c, 0xff);  // cfg.mark_*
 
 uint32_t with_alpha(uint32_t c, uint32_t a) { return (c & 0x00FFFFFFu) | (a << 24); }
 
-// Highlight colors arrive opaque; the view tints them. Explicitly translucent colors are kept.
-uint32_t highlight_fill(uint32_t c) {
-    uint32_t a = c >> 24;
-    return with_alpha(c, a == 255 ? 72u : a);
+// Highlight colors arrive opaque; the view tints them so the byte text stays readable. Explicitly
+// translucent colors are kept. Soft (parser fields): the color at low alpha. Vivid (bookmarks): hue
+// and saturation kept, HSL lightness scaled down - a translucent tint over the dark background washes
+// them out (yellow turns olive, red maroon). Selected highlights are drawn stronger / lighter.
+uint32_t highlight_fill(uint32_t c, bool vivid, bool selected) {
+    if ((c >> 24) != 255) return c;
+    if (!vivid) return with_alpha(c, selected ? 150u : 72u);
+    const float boost = selected ? 0.1f : 0.0f;
+    float ch[3] = {float(c & 0xFF) / 255.0f, float((c >> 8) & 0xFF) / 255.0f, float((c >> 16) & 0xFF) / 255.0f};
+    const float mx = std::max({ch[0], ch[1], ch[2]}), mn = std::min({ch[0], ch[1], ch[2]});
+    const float l = 0.5f * (mx + mn);
+    const float nl = 0.28f + 0.15f * l + boost;              // new lightness: ~0.37 for the presets
+    const float span = 1.0f - std::fabs(2.0f * l - 1.0f);    // chroma per saturation, old / new
+    const float k = span > 1e-4f ? (1.0f - std::fabs(2.0f * nl - 1.0f)) / span : 0.0f;
+    uint32_t out = 0;
+    for (int i = 0; i < 3; ++i) {
+        const float v = std::clamp(nl + (ch[i] - l) * k, 0.0f, 1.0f);
+        out |= uint32_t(v * 255.0f + 0.5f) << (8 * i);
+    }
+    return out | (200u << 24);
 }
 
 // Fills [begin, end) in the visible rows (hex and/or text column), one rounded rect per row piece.
@@ -920,19 +936,19 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     if (L.ascii) dl->AddLine(ImVec2(L.sep2_x, L.rows_y), ImVec2(L.sep2_x, L.inner_max.y), C.separator);
 
     // Highlight layers (later layers on top), then the selection.
-    std::vector<ByteRange> sel_hl;  // visible highlights inside the selection, with their colors:
-    std::vector<uint32_t> sel_hl_color;
+    std::vector<ByteRange> sel_hl;  // visible highlights inside the selection, with their fills:
+    std::vector<uint32_t> sel_hl_fill;
     for (const HighlightSet* layer : layers) {
         if (!layer || layer->empty() || vis_end <= vis_begin) continue;
         hl_tmp_.clear();
         layer->query(vis_begin, vis_end, hl_tmp_);
         for (const Highlight* h : hl_tmp_) {
             uint64_t e = h->length > size - std::min(h->offset, size) ? size : h->offset + h->length;
-            fill_range(dl, L, top, draw_rows, h->offset, e, highlight_fill(h->color), rounding, true, true);
+            fill_range(dl, L, top, draw_rows, h->offset, e, highlight_fill(h->color, layer->vivid, false), rounding, true, true);
             const uint64_t a = std::max(h->offset, v.sel_begin()), b = std::min(e, v.sel_end());
             if (a < b) {
                 sel_hl.push_back({a, b});
-                sel_hl_color.push_back(h->color);
+                sel_hl_fill.push_back(highlight_fill(h->color, layer->vivid, true));
             }
         }
     }
@@ -946,13 +962,11 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     }
     if (v.has_selection()) {
         // The selection color would mix with a highlight's (a yellow bookmark turning green): selected
-        // highlighted bytes show their own color, stronger, and the selection is outlined around them.
+        // highlighted bytes show their own color, lighter, and the selection is outlined around them.
         // The selection fill covers the rest.
-        for (size_t k = 0; k < sel_hl.size(); ++k) {
-            const uint32_t a = sel_hl_color[k] >> 24;
-            fill_range(dl, L, top, draw_rows, sel_hl[k].begin, sel_hl[k].end,
-                       with_alpha(sel_hl_color[k], std::max(a == 255 ? 150u : a, 150u)), rounding, true, true);
-        }
+        for (size_t k = 0; k < sel_hl.size(); ++k)
+            fill_range(dl, L, top, draw_rows, sel_hl[k].begin, sel_hl[k].end, sel_hl_fill[k],
+                       rounding, true, true);
         std::vector<ByteRange> covered = sel_hl;
         std::sort(covered.begin(), covered.end(), [](const ByteRange& x, const ByteRange& y) { return x.begin < y.begin; });
         uint64_t at = v.sel_begin();

@@ -2629,6 +2629,7 @@ void update_bookmark_layer(Tab& t) {
     if (sig == t.bookmark_sig) return;
     t.bookmark_sig = sig;
     t.bookmark_layer.clear();
+    t.bookmark_layer.vivid = true;
     for (const Bookmark& b : bms)
         t.bookmark_layer.add({b.offset, b.length, b.color ? b.color : hex_colors().bookmark, b.name, -1});
     t.bookmark_layer.finalize();

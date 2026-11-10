@@ -32,6 +32,9 @@ struct Highlight {
 class HighlightSet {
 public:
     std::vector<Highlight> items;   // after finalize(): sorted by offset (ties: larger first)
+    // Drawn in the colors themselves (bookmarks: few, deliberate marks) instead of the soft tint
+    // that suits layers covering whole files (parser fields). Not touched by clear().
+    bool vivid = false;
 
     void clear();
     void add(Highlight h);          // zero-length entries ignored
