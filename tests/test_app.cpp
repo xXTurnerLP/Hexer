@@ -400,3 +400,98 @@ TEST_CASE("app: bookmark colors: the color menu, the bookmark under the caret, o
     REQUIRE(d.redo());
     CHECK(d.view().bookmarks[0].color == red);
 }
+
+TEST_CASE("app: Toggle Bookmark grows the one bookmark a selection overlaps; never shrinks one") {
+    TempDir dir;
+    const std::string f = dir.file("tb.bin", Bytes(256, 0));
+    HeadlessApp h(path_join(dir.path, "config"), {f}, true);
+    Document& d = *h.tab(0).doc;
+    auto select = [&](uint64_t a, uint64_t e) {
+        d.view().anchor = a;
+        d.view().cursor = e;
+    };
+    REQUIRE(d.add_bookmark({0x10, 4, "a", 0, ""}));
+    const size_t steps = d.undo_stack().size();
+    select(0x08, 0x20);  // covers it and more
+    h.action("Toggle Bookmark");
+    REQUIRE(d.view().bookmarks.size() == 1);
+    CHECK(d.view().bookmarks[0].offset == 0x08);
+    CHECK(d.view().bookmarks[0].length == 0x18);
+    CHECK(d.view().bookmarks[0].name == "a");
+    CHECK(d.undo_stack().size() == steps + 1);
+    select(0x18, 0x30);  // overlaps its end: grows to the union
+    h.action("Toggle Bookmark");
+    REQUIRE(d.view().bookmarks.size() == 1);
+    CHECK(d.view().bookmarks[0].offset == 0x08);
+    CHECK(d.view().bookmarks[0].length == 0x28);
+    select(0x10, 0x14);  // inside it (not at its start): a new bookmark
+    h.action("Toggle Bookmark");
+    REQUIRE(d.view().bookmarks.size() == 2);
+    CHECK(d.view().bookmarks[1].offset == 0x10);
+    select(0x00, 0x40);  // two bookmarks: a new one, nothing grows
+    h.action("Toggle Bookmark");
+    REQUIRE(d.view().bookmarks.size() == 3);
+    CHECK(d.view().bookmarks[0].length == 0x28);
+    select(0x08, 0x30);  // exactly the first one: removed
+    h.action("Toggle Bookmark");
+    CHECK(d.view().bookmarks.size() == 2);
+    REQUIRE(d.undo());
+    REQUIRE(d.undo());
+    REQUIRE(d.undo());
+    REQUIRE(d.undo());
+    REQUIRE(d.view().bookmarks.size() == 1);
+    CHECK(d.view().bookmarks[0].offset == 0x08);
+    CHECK(d.view().bookmarks[0].length == 0x18);
+}
+
+TEST_CASE("app: the Bookmarks panel edits offset, length and bytes in place") {
+    TempDir dir;
+    const std::string f = dir.file("be.bin", pattern(256, 5));
+    HeadlessApp h(path_join(dir.path, "config"), {f}, true);
+    Document& d = *h.tab(0).doc;
+    REQUIRE(d.add_bookmark({0x10, 4, "a", 0, ""}));
+    h.action("Show All Bookmarks");
+    h.frames(3);
+    // Row of the InlineEdit: bookmark index * 5 + field (0 name, 1 note, 2 offset, 3 length, 4 bytes).
+    auto edit = [&](int field, const std::string& text) {
+        h.app->bm_edit.begin(field, d.id(), text);
+        h.frames(3);
+        REQUIRE(h.app->bm_edit.active(field, d.id()));
+        h.key(ImGuiKey_Enter);
+        h.frames(2);
+    };
+    edit(2, "0x20");
+    CHECK(d.view().bookmarks[0].offset == 0x20);
+    CHECK(d.view().bookmarks[0].length == 4);
+    CHECK_FALSE(h.app->bm_edit.active(2, d.id()));
+    edit(2, "+0x8");  // relative to the bookmark's offset
+    CHECK(d.view().bookmarks[0].offset == 0x28);
+    edit(3, "16");  // decimal by default
+    CHECK(d.view().bookmarks[0].length == 16);
+    edit(3, "0x400");  // past the end: refused, the editor stays open
+    CHECK(d.view().bookmarks[0].length == 16);
+    CHECK(h.app->bm_edit.active(3, d.id()));
+    CHECK_FALSE(h.app->bm_edit.error.empty());
+    h.app->bm_edit.end();
+    h.frames(2);  // the field goes away (an active InputText keeps its own text)
+    edit(3, "4");
+    CHECK(d.view().bookmarks[0].length == 4);
+
+    const Bytes before = [&] { Bytes b(4); d.read(0x28, b.data(), 4); return b; }();
+    edit(4, "AA BB");  // wrong count: refused
+    CHECK(h.app->bm_edit.active(4, d.id()));
+    h.app->bm_edit.end();
+    h.frames(2);
+    Bytes now(4);
+    REQUIRE(d.read(0x28, now.data(), 4) == 4);
+    CHECK(now == before);
+    const size_t steps = d.undo_stack().size();
+    edit(4, "AA BB CC DD");
+    REQUIRE(d.read(0x28, now.data(), 4) == 4);
+    CHECK(now == Bytes{0xAA, 0xBB, 0xCC, 0xDD});
+    CHECK(d.undo_stack().size() == steps + 1);
+    CHECK(d.undo_stack().back().label == "Edit bookmark bytes");
+    REQUIRE(d.undo());
+    REQUIRE(d.read(0x28, now.data(), 4) == 4);
+    CHECK(now == before);
+}

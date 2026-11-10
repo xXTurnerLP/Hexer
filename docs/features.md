@@ -200,7 +200,10 @@ Lua API see [scripting.md](scripting.md).
 - **Bookmarks** with a name and a note, kept in the session and undoable. `Ctrl+B` toggles one on
   the selection or caret, `F2` / `Shift+F2` jump, `Ctrl+Shift+B` fuzzy-finds a bookmark in any open
   file. The Bookmarks panel (bottom dock) lists name, note, offset, length and the first bytes,
-  for this file or **all open files**; double-click a name or note to edit it. Each bookmark has its
+  for this file or **all open files**; double-click any cell to edit it: name, note, offset and
+  length (Go to expressions such as `+0x10` or `end-4`), or the bytes themselves (up to 4 KiB, same
+  length; one undo step). With a selection over one bookmark plus bytes outside it, `Ctrl+B` grows
+  that bookmark to cover both (it never shrinks one). Each bookmark has its
   own **color**: click its swatch in the panel (or *Color* in its right-click menu, or *Bookmark
   Color* in the hex view's right-click menu on a bookmarked byte) for a preset, the default or any
   custom color (undoable). The Bookmarks menu
@@ -304,7 +307,7 @@ in `<config>/layout.ini` (View > Reset Layout rebuilds it).
 | `Ctrl+F` | Find bar (`Enter` next, `Shift+Enter` previous, `Esc` closes) |
 | `F3` / `Shift+F3` | Find next / previous |
 | `Ctrl+G` | Go to offset (`Shift+Enter` selects from the cursor) |
-| `Ctrl+B` | Toggle bookmark (on the selection, else the caret byte) |
+| `Ctrl+B` | Toggle bookmark (on the selection, else the caret byte); grows the one bookmark a selection partly covers |
 | `F2` / `Shift+F2` | Next / previous bookmark |
 | `Ctrl+Shift+B` | Jump to a bookmark in any open file (fuzzy search) |
 | `Ctrl+click` / `Ctrl+Enter` | Follow the pointer under the mouse / at the cursor (`Ctrl+hover` previews the target) |

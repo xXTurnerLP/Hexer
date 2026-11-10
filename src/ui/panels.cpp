@@ -1394,58 +1394,160 @@ namespace {
 // One change requested while drawing the table, applied after it (the lists must not change
 // while they are being iterated).
 struct BookmarkChange {
-    enum Kind { None, Name, Note, Color, Remove } kind = None;
+    enum Kind { None, Name, Note, Color, Range, Bytes, Remove } kind = None;
     uint64_t doc = 0;
     size_t index = 0;
-    std::string text;
-    uint32_t color = 0;  // Color: the new color (0 = default)
+    std::string text;                 // Name / Note
+    uint32_t color = 0;               // Color: the new color (0 = default)
+    uint64_t offset = 0, length = 0;  // Range
+    std::vector<uint8_t> bytes;       // Bytes: written over the bookmark's bytes
 };
 
-// Right-click menu of a bookmark row's Name / Note cell (the same edits as double-clicks).
+// The editable cells of a bookmark row (InlineEdit row = bookmark index * kBmFieldCount + field).
+enum BmField { kBmName, kBmNote, kBmOffset, kBmLength, kBmBytes, kBmFieldCount };
+constexpr uint64_t kBmEditMaxBytes = 4096;  // longer bookmarks' bytes are edited in the hex view
+
+int bm_row(size_t i, int field) { return int(i) * kBmFieldCount + field; }
+
+std::string bookmark_field_text(const Document& d, const Bookmark& b, int field) {
+    switch (field) {
+    case kBmName: return b.name;
+    case kBmNote: return b.note;
+    case kBmOffset: return fmt_offset(b.offset);
+    case kBmLength: return std::to_string(b.length);
+    default: {
+        std::vector<uint8_t> buf(size_t(std::min(b.length, kBmEditMaxBytes)));
+        return hex_preview(buf.data(), d.read(b.offset, buf.data(), buf.size()));
+    }
+    }
+}
+
+void begin_bookmark_edit(App& app, const Document& d, const Bookmark& b, size_t i, int field) {
+    if (field == kBmBytes && b.length > kBmEditMaxBytes) {
+        set_status(app, "Bookmark too long to edit its bytes here (" + std::to_string(kBmEditMaxBytes) +
+                            " bytes at most): select it and edit them in the hex view");
+        return;
+    }
+    app.bm_edit.begin(bm_row(i, field), d.id(), bookmark_field_text(d, b, field));
+}
+
+// The change an edited cell asks for, or false with `err` (the editor stays open).
+// Offset and Length take Go to expressions ("+0x10", "end-4"); the bytes must keep the length.
+bool bookmark_edit_change(const Document& d, const Bookmark& b, size_t i, int field, const std::string& text,
+                          BookmarkChange& out, std::string& err) {
+    out = {};
+    out.doc = d.id();
+    out.index = i;
+    const uint64_t size = d.size();
+    switch (field) {
+    case kBmName:
+    case kBmNote:
+        out.kind = field == kBmName ? BookmarkChange::Name : BookmarkChange::Note;
+        out.text = text;
+        return true;
+    case kBmOffset: {
+        uint64_t off = 0;
+        if (!parse_offset(text, b.offset, size, true, off, &err)) return false;
+        if (off >= size) {
+            err = "past the end of the file";
+            return false;
+        }
+        out.kind = BookmarkChange::Range;
+        out.offset = off;
+        out.length = std::min(std::max<uint64_t>(b.length, 1), size - off);  // clamped to the end
+        return true;
+    }
+    case kBmLength: {
+        if (b.offset >= size) {
+            err = "the bookmark starts past the end of the file";
+            return false;
+        }
+        uint64_t len = 0;
+        if (!parse_offset(text, b.length, size - b.offset, false, len, &err)) return false;
+        if (len == 0) {
+            err = "at least 1 byte";
+            return false;
+        }
+        out.kind = BookmarkChange::Range;
+        out.offset = b.offset;
+        out.length = len;
+        return true;
+    }
+    default:
+        if (!parse_bytes(text, out.bytes, &err)) return false;
+        if (out.bytes.size() != b.length) {
+            err = "enter " + std::to_string(b.length) + " bytes (" + std::to_string(out.bytes.size()) +
+                  " given); change Length to resize the bookmark";
+            return false;
+        }
+        out.kind = BookmarkChange::Bytes;
+        return true;
+    }
+}
+
+// Right-click menu of a bookmark row's cells (the same edits as double-clicks).
 void bookmark_context_menu(App& app, Tab& t, const Bookmark& b, size_t i, BookmarkChange& change) {
     if (!ImGui::BeginPopupContextItem("##bmctx")) return;
     Document& d = *t.doc;
     if (ImGui::MenuItem("Select bytes")) reveal_range(app, t, b.offset, b.length, true);
-    if (ImGui::MenuItem("Edit name")) app.bm_edit.begin(int(i) * 2, d.id(), b.name);
-    if (ImGui::MenuItem("Edit note")) app.bm_edit.begin(int(i) * 2 + 1, d.id(), b.note);
+    if (ImGui::MenuItem("Edit name")) begin_bookmark_edit(app, d, b, i, kBmName);
+    if (ImGui::MenuItem("Edit note")) begin_bookmark_edit(app, d, b, i, kBmNote);
+    if (ImGui::MenuItem("Edit offset")) begin_bookmark_edit(app, d, b, i, kBmOffset);
+    if (ImGui::MenuItem("Edit length")) begin_bookmark_edit(app, d, b, i, kBmLength);
+    if (ImGui::MenuItem("Edit bytes", nullptr, false, b.length <= kBmEditMaxBytes))
+        begin_bookmark_edit(app, d, b, i, kBmBytes);
     if (ImGui::BeginMenu("Color")) {
         uint32_t c = 0;
-        if (bookmark_color_menu(b.color, &c)) change = {BookmarkChange::Color, d.id(), i, {}, c};
+        if (bookmark_color_menu(b.color, &c)) {
+            change = {BookmarkChange::Color, d.id(), i};
+            change.color = c;
+        }
         ImGui::EndMenu();
     }
     if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(b.offset).c_str());
     ImGui::Separator();
-    if (ImGui::MenuItem("Delete")) change = {BookmarkChange::Remove, d.id(), i, {}};
+    if (ImGui::MenuItem("Delete")) change = {BookmarkChange::Remove, d.id(), i};
     close_popup_on_escape();
     ImGui::EndPopup();
 }
 
-// The Name / Note cell: text (double-click edits) or the in-place editor. `field` 0 = name, 1 = note.
-void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, bool selected,
-                        BookmarkChange& change) {
+// One cell of a bookmark row: its value (click selects the bookmark, double-click edits) or the
+// in-place editor. Name / Note commit when the editor loses focus; Offset / Length / Bytes cancel.
+void bookmark_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, bool selected,
+                   BookmarkChange& change) {
     Document& d = *t.doc;
-    const int row = int(i) * 2 + field;
-    if (app.bm_edit.active(row, d.id())) {
-        const int res = inline_edit_input(app.bm_edit, true);
-        if (res > 0) change = {field == 0 ? BookmarkChange::Name : BookmarkChange::Note, d.id(), i, app.bm_edit.buf};
-        if (res != 0) app.bm_edit.end();
+    ImGui::PushID(field);
+    if (app.bm_edit.active(bm_row(i, field), d.id())) {
+        const int res = inline_edit_input(app.bm_edit, field <= kBmNote);
+        if (res > 0) {
+            std::string err;
+            BookmarkChange c;
+            if (bookmark_edit_change(d, b, i, field, app.bm_edit.buf, c, err)) {
+                change = std::move(c);
+                app.bm_edit.end();
+            } else {
+                app.bm_edit.retry(err);
+            }
+        } else if (res < 0) {
+            app.bm_edit.end();
+        }
+        ImGui::PopID();
         return;
     }
-    const std::string& text = field == 0 ? b.name : b.note;
-    if (field == 0) {
+    if (field == kBmName) {
         const ImVec2 swatch = ImGui::GetCursorScreenPos();
         draw_swatch(b.color ? b.color : hex_colors().bookmark);
         ImGuiSelectableFlags fl = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap |
                                   ImGuiSelectableFlags_AllowDoubleClick;
-        if (ImGui::Selectable(text.empty() ? "(unnamed)" : text.c_str(), selected, fl)) {
+        if (ImGui::Selectable(b.name.empty() ? "(unnamed)" : b.name.c_str(), selected, fl)) {
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                app.bm_edit.begin(row, d.id(), b.name);
+                begin_bookmark_edit(app, d, b, i, kBmName);
             else
                 reveal_range(app, t, b.offset, b.length, false);
         }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s\n%s", fmt_range(b.offset, b.length).c_str(),
-                              "Click: select it  \xC2\xB7  double-click the name or note to edit");
+                              "Click: select it  \xC2\xB7  double-click a cell to edit it");
         bookmark_context_menu(app, t, b, i, change);
         // The swatch picks the color: a button on top of the row's Selectable (which allows overlap).
         ImGui::SetCursorScreenPos(swatch);
@@ -1454,27 +1556,45 @@ void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field
         ImGui::SetItemTooltip("Bookmark color");
         if (ImGui::BeginPopup("##bmcolor")) {
             uint32_t c = 0;
-            if (bookmark_color_menu(b.color, &c)) change = {BookmarkChange::Color, d.id(), i, {}, c};
+            if (bookmark_color_menu(b.color, &c)) {
+                change = {BookmarkChange::Color, d.id(), i};
+                change.color = c;
+            }
             close_popup_on_escape();
             ImGui::EndPopup();
         }
+        ImGui::PopID();
         return;
     }
-    // Note: plain text; a double-click anywhere in the cell edits it.
-    ImGui::PushID("note");
+    // The other cells: plain text; a double-click anywhere in the cell edits it.
     const float w = std::max(1.0f, ImGui::GetContentRegionAvail().x);
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##hit", ImVec2(w, ImGui::GetTextLineHeight()), ImGuiButtonFlags_AllowOverlap);
     const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (ImGui::IsItemClicked() && !dbl) reveal_range(app, t, b.offset, b.length, false);
+    if (field == kBmBytes && b.length > kBmEditMaxBytes)
+        ImGui::SetItemTooltip("Too long to edit here: select it and edit the bytes in the hex view");
     bookmark_context_menu(app, t, b, i, change);
     ImGui::SetCursorScreenPos(p);
-    if (text.empty())
-        ImGui::TextDisabled("%s", dbl ? "" : "-");
-    else
-        ImGui::TextUnformatted(text.c_str());
+    switch (field) {
+    case kBmNote:
+        if (b.note.empty())
+            ImGui::TextDisabled("%s", dbl ? "" : "-");
+        else
+            ImGui::TextUnformatted(b.note.c_str());
+        break;
+    case kBmOffset: ImGui::TextUnformatted(fmt_offset(b.offset).c_str()); break;
+    case kBmLength: ImGui::Text("%llu", ull(b.length)); break;
+    default: {
+        uint8_t buf[8];
+        const size_t n = d.read(b.offset, buf, size_t(std::min<uint64_t>(b.length, sizeof buf)));
+        std::string pv = hex_preview(buf, n);
+        if (b.length > sizeof buf) pv += " \xE2\x80\xA6";
+        ImGui::TextDisabled("%s", pv.c_str());
+    }
+    }
     ImGui::PopID();
-    if (dbl) app.bm_edit.begin(row, d.id(), b.note);
+    if (dbl) begin_bookmark_edit(app, d, b, i, field);
 }
 
 void draw_bookmark_rows(App& app, Tab& t, BookmarkChange& change) {
@@ -1483,7 +1603,6 @@ void draw_bookmark_rows(App& app, Tab& t, BookmarkChange& change) {
     const uint64_t at = focus_offset(d.view());
     ImGuiListClipper clip;
     clip.Begin(int(bms.size()));
-    uint8_t buf[8];
     while (clip.Step()) {
         for (int k = clip.DisplayStart; k < clip.DisplayEnd; ++k) {
             const size_t i = size_t(k);
@@ -1492,22 +1611,17 @@ void draw_bookmark_rows(App& app, Tab& t, BookmarkChange& change) {
             ImGui::PushID(k);
             const bool selected = &t == active_tab(app) && at >= b.offset && at - b.offset < std::max<uint64_t>(b.length, 1);
             ImGui::TableSetColumnIndex(0);
-            bookmark_text_cell(app, t, b, i, 0, selected, change);
+            bookmark_cell(app, t, b, i, kBmName, selected, change);
             ImGui::TableSetColumnIndex(1);
-            bookmark_text_cell(app, t, b, i, 1, selected, change);
+            bookmark_cell(app, t, b, i, kBmNote, selected, change);
             ImGui::PushFont(app.fonts.mono, 0.0f);
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(fmt_offset(b.offset).c_str());
-            ImGui::TableSetColumnIndex(3);
-            ImGui::Text("%llu", ull(b.length));
-            ImGui::TableSetColumnIndex(4);
-            const size_t n = d.read(b.offset, buf, size_t(std::min<uint64_t>(b.length, sizeof buf)));
-            std::string pv = hex_preview(buf, n);
-            if (b.length > sizeof buf) pv += " \xE2\x80\xA6";
-            ImGui::TextDisabled("%s", pv.c_str());
+            for (int f = kBmOffset; f <= kBmBytes; ++f) {
+                ImGui::TableSetColumnIndex(f);
+                bookmark_cell(app, t, b, i, f, selected, change);
+            }
             ImGui::PopFont();
             ImGui::TableSetColumnIndex(5);
-            if (ImGui::SmallButton("x")) change = {BookmarkChange::Remove, d.id(), i, {}};
+            if (ImGui::SmallButton("x")) change = {BookmarkChange::Remove, d.id(), i};
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete bookmark (undoable)");
             ImGui::PopID();
         }
@@ -1521,18 +1635,31 @@ void apply_bookmark_change(App& app, const BookmarkChange& c) {
     Document& d = *t->doc;
     const auto& bms = d.view().bookmarks;
     if (c.index >= bms.size()) return;
+    Bookmark b = bms[c.index];
     bool ok = true;
-    if (c.kind == BookmarkChange::Remove) {
-        ok = d.remove_bookmark(c.index);
-    } else if (c.kind == BookmarkChange::Color) {
-        set_bookmark_color(app, d, c.index, c.color);
-        return;
-    } else {
-        Bookmark b = bms[c.index];
+    switch (c.kind) {
+    case BookmarkChange::Remove: ok = d.remove_bookmark(c.index); break;
+    case BookmarkChange::Color: set_bookmark_color(app, d, c.index, c.color); return;
+    case BookmarkChange::Range:
+        if (b.offset == c.offset && b.length == c.length) return;
+        b.offset = c.offset;
+        b.length = c.length;
+        ok = d.update_bookmark(c.index, b);
+        break;
+    case BookmarkChange::Bytes: {
+        std::vector<uint8_t> cur(c.bytes.size());
+        if (d.read(b.offset, cur.data(), cur.size()) == cur.size() && cur == c.bytes) return;
+        d.begin_group("Edit bookmark bytes");
+        ok = d.overwrite(b.offset, c.bytes.data(), c.bytes.size());
+        d.end_group();
+        break;
+    }
+    default: {
         std::string& field = c.kind == BookmarkChange::Name ? b.name : b.note;
         if (field == c.text) return;
         field = c.text;
         ok = d.update_bookmark(c.index, b);
+    }
     }
     if (!ok) report_edit_failure(app, d);
 }
@@ -1634,7 +1761,7 @@ void draw_bookmarks_panel(App& app) {
     if (ImGui::Checkbox("All open files", &app.settings.bookmarks_all_files)) mark_settings_dirty(app);
     ImGui::SameLine();
     ImGui::TextDisabled("Ctrl+B toggle  \xC2\xB7  F2 / Shift+F2 next / previous  \xC2\xB7  Ctrl+Shift+B find  \xC2\xB7  "
-                        "double-click name or note to edit");
+                        "double-click a cell to edit");
 
     // The tabs to list: the active one, or every open (not saving) one.
     std::vector<Tab*> tabs;

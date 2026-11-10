@@ -920,6 +920,8 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
     if (L.ascii) dl->AddLine(ImVec2(L.sep2_x, L.rows_y), ImVec2(L.sep2_x, L.inner_max.y), C.separator);
 
     // Highlight layers (later layers on top), then the selection.
+    std::vector<ByteRange> sel_hl;  // visible highlights inside the selection, with their colors:
+    std::vector<uint32_t> sel_hl_color;
     for (const HighlightSet* layer : layers) {
         if (!layer || layer->empty() || vis_end <= vis_begin) continue;
         hl_tmp_.clear();
@@ -927,6 +929,11 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         for (const Highlight* h : hl_tmp_) {
             uint64_t e = h->length > size - std::min(h->offset, size) ? size : h->offset + h->length;
             fill_range(dl, L, top, draw_rows, h->offset, e, highlight_fill(h->color), rounding, true, true);
+            const uint64_t a = std::max(h->offset, v.sel_begin()), b = std::min(e, v.sel_end());
+            if (a < b) {
+                sel_hl.push_back({a, b});
+                sel_hl_color.push_back(h->color);
+            }
         }
     }
     // Multi-selection: the extra ranges in a lighter tint of the selection color (visible ones only).
@@ -937,8 +944,26 @@ void HexView::draw(const char* id, Document& doc, const std::vector<const Highli
         for (; it != v.extra_sel.end() && it->begin < vis_end; ++it)
             fill_range(dl, L, top, draw_rows, it->begin, std::min(it->end, size), extra, rounding, true, true);
     }
-    if (v.has_selection())
-        fill_range(dl, L, top, draw_rows, v.sel_begin(), v.sel_end(), C.selection, rounding, true, true);
+    if (v.has_selection()) {
+        // The selection color would mix with a highlight's (a yellow bookmark turning green): selected
+        // highlighted bytes show their own color, stronger, and the selection is outlined around them.
+        // The selection fill covers the rest.
+        for (size_t k = 0; k < sel_hl.size(); ++k) {
+            const uint32_t a = sel_hl_color[k] >> 24;
+            fill_range(dl, L, top, draw_rows, sel_hl[k].begin, sel_hl[k].end,
+                       with_alpha(sel_hl_color[k], std::max(a == 255 ? 150u : a, 150u)), rounding, true, true);
+        }
+        std::vector<ByteRange> covered = sel_hl;
+        std::sort(covered.begin(), covered.end(), [](const ByteRange& x, const ByteRange& y) { return x.begin < y.begin; });
+        uint64_t at = v.sel_begin();
+        for (const ByteRange& c : covered) {
+            if (c.begin > at) fill_range(dl, L, top, draw_rows, at, c.begin, C.selection, rounding, true, true);
+            at = std::max(at, c.end);
+        }
+        fill_range(dl, L, top, draw_rows, at, v.sel_end(), C.selection, rounding, true, true);
+        if (!covered.empty())
+            outline_range(dl, L, top, draw_rows, v.sel_begin(), v.sel_end(), with_alpha(C.selection, 255));
+    }
 
     // Caret geometry. With a selection the caret is an outline on the selection's active end byte
     // (the selection fill stays visible); without one it is the solid nibble/char box.

@@ -1022,6 +1022,33 @@ void toggle_bookmark(App& app) {
     const uint64_t off = v.has_selection() ? v.sel_begin() : v.cursor;
     const uint64_t len = v.has_selection() ? v.sel_len() : 1;
     const auto& bms = v.bookmarks;
+    // A selection over exactly one bookmark plus bytes outside it grows that bookmark to cover both.
+    // (It never shrinks one: Ctrl+B on a bookmark's own bytes removes it, as before.)
+    if (v.has_selection()) {
+        size_t hit = SIZE_MAX, hits = 0;
+        for (size_t i = 0; i < bms.size(); ++i) {
+            const uint64_t e = bms[i].offset + std::max<uint64_t>(bms[i].length, 1);
+            if (bms[i].offset < off + len && off < e) {
+                hit = i;
+                ++hits;
+            }
+        }
+        if (hits == 1) {
+            Bookmark b = bms[hit];
+            const uint64_t e = b.offset + std::max<uint64_t>(b.length, 1);
+            if (off < b.offset || off + len > e) {
+                const uint64_t ne = std::max(e, off + len);
+                b.offset = std::min(b.offset, off);
+                b.length = ne - b.offset;
+                if (d->update_bookmark(hit, b))
+                    set_status(app, "Extended " + (b.name.empty() ? std::string("bookmark") : b.name) + " to " +
+                                        fmt_range(b.offset, b.length));
+                else
+                    report_edit_failure(app, *d);
+                return;
+            }
+        }
+    }
     for (size_t i = 0; i < bms.size(); ++i) {
         if (bms[i].offset == off) {
             std::string name = bms[i].name;
