@@ -365,6 +365,9 @@ public:
     const std::deque<ConsoleLine>& console() const { return console_; }
     void clear_console();
     uint64_t console_generation() const { return console_gen_; }  // bumps on every new line
+    // Lines removed from the front so far (the cap, clear_console): console()[0] is line
+    // console_first() of everything ever logged. Lets a view keep positions across the cap.
+    uint64_t console_first() const { return console_first_; }
 
     // ---- parsers ---------------------------------------------------------------------------
     const std::vector<ParserInfo>& parsers() const { return parsers_; }
@@ -440,6 +443,7 @@ private:
                                                    const std::string& name, const std::atomic<bool>* cancel);
     std::deque<ConsoleLine> console_;   // capped at 5000 lines
     uint64_t console_gen_ = 0;
+    uint64_t console_first_ = 0;
     uint64_t reload_count_ = 0;
     std::unordered_map<uint64_t, HighlightSet> highlights_;
     friend struct Impl;

@@ -67,6 +67,8 @@ src/ui/      theme (dark theme, fonts + live reload_fonts, palette), hex_view (t
              each), window_frame (dark Windows title bar in the theme's kThemePanel / kThemeText), minimap (one per tab, in hexer_ui_view), input (shortcut routing policy,
              InlineEdit row editor, Ctrl+wheel steps; in hexer_ui_view), view_diff (DiffView: two HexViews, App owns the one Compare),
              panel_disasm (Disassembly; in hexer_ui_view so test_disasm drives it headlessly);
+             text_select (TextSelect: selectable read-only text, Console output; selectable_text()
+             for one-off blocks: messages, errors; in hexer_ui_view, tests in test_ui);
              panel_bitmap / panel_packets / view_diff / panel_strings / panel_xor are in
              hexer_ui_view too (headless tests: test_panels / test_diffview)
 src/main.cpp
@@ -181,6 +183,9 @@ action may fire while a text field has focus, and `global_shortcut()` never fire
 text-editing chord then (`text_editing_chord()`: Ctrl+Z/Y/A/C/V/X, Ins, Del, arrows, Home/End,
 Enter, Esc, Tab, typing keys). Global actions (Ctrl+Tab, F3, Ctrl+S...) set `in_text`; actions
 on the document caret (Ctrl+B, F2, Alt+arrows, Ctrl+Enter, F6) do not.
+Read-only text a user may want to copy (console output, messages, errors, paths) is drawn with
+`ui/text_select.h` (`TextSelect` / `selectable_text()`), not `TextUnformatted` / `TextWrapped`:
+mouse selection, Ctrl+C / Ctrl+A routed to the focused window only while it was clicked last.
 Inline row edits (Inspector value, Structure field, Bookmark name / note) all use `InlineEdit` +
 `inline_edit_input()`: double-click / context menu "Edit ..." / Enter on the selected row begins,
 Enter commits (one undo step through Document), Esc cancels; a click elsewhere cancels byte edits

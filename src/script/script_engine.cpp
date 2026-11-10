@@ -559,10 +559,14 @@ void ScriptEngine::log(ConsoleLine::Kind kind, const std::string& text) {
         if (nl == std::string::npos) break;
         pos = nl + 1;
     }
-    while (console_.size() > kMaxConsoleLines) console_.pop_front();
+    while (console_.size() > kMaxConsoleLines) {
+        console_.pop_front();
+        ++console_first_;
+    }
 }
 
 void ScriptEngine::clear_console() {
+    console_first_ += console_.size();
     console_.clear();
     ++console_gen_;
 }

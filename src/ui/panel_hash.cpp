@@ -15,6 +15,7 @@
 #include "core/document.h"
 #include "core/util.h"
 #include "ui/hex_view.h"
+#include "ui/text_select.h"
 
 namespace hx {
 
@@ -326,10 +327,10 @@ void HashPanel::draw(const char* title, bool* open, const Document* doc, ImFont*
         }
     }
     if (have_result_ && result_.io_error && result_.hole)  // a sparse address space: refused
-        ImGui::TextWrapped("No values: %s.", hash_hole_message(result_.io_error_offset).c_str());
+        selectable_text("##hole", "No values: " + hash_hole_message(result_.io_error_offset) + ".");
     else if (have_result_ && result_.io_error)
-        ImGui::TextColored(kErrColor, "Read error at 0x%llX: no values.",
-                           static_cast<unsigned long long>(result_.io_error_offset));
+        selectable_text("##ioerr", "Read error at 0x" + fmt_hex(result_.io_error_offset, 0) + ": no values.",
+                        ImGui::GetColorU32(kErrColor));
     if (have_result_ && !normalize_hex(expected).empty() && !result_.values.empty()) {
         std::string hit;
         for (const auto& r : result_.values)

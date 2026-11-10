@@ -63,6 +63,7 @@ ui_view_lib = static_library('hexer_ui_view',
   'ui/theme.cpp',
   'ui/hex_view.cpp',
   'ui/minimap.cpp',
+  'ui/text_select.cpp',      # selectable read-only text (Console output, messages)
   'ui/input.cpp',            # shortcut routing policy, inline row editor, Ctrl+wheel steps
   'ui/panel_disasm.cpp',     # Disassembly panel (no App dependency; tests/test_disasm.cpp drives it)
   'ui/panel_bitmap.cpp',     # Bitmap / Packets panels, Compare view: no App dependency either

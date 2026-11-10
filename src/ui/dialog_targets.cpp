@@ -15,6 +15,7 @@
 #include "core/document.h"
 #include "core/procmem.h"
 #include "core/util.h"
+#include "ui/text_select.h"
 
 namespace hx {
 
@@ -188,11 +189,7 @@ void TargetsDialog::draw_process_picker(ImFont* mono, float s, const TargetsDial
         }
         ImGui::EndTable();
     }
-    if (!proc_err_.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kErrColor);
-        ImGui::TextWrapped("%s", proc_err_.c_str());
-        ImGui::PopStyleColor();
-    }
+    if (!proc_err_.empty()) selectable_text("##proc_err", proc_err_, ImGui::GetColorU32(kErrColor));
     ImGui::BeginDisabled(!sel || !cb.open_process);
     if (ImGui::Button("Open")) open_now = true;
     ImGui::EndDisabled();
@@ -289,11 +286,7 @@ void TargetsDialog::draw_disk_picker(ImFont* mono, float s, const TargetsDialogC
         ImGui::TextColored(kErrColor, "Danger: saving writes straight to the device and can destroy its file system.");
     else
         ImGui::TextColored(kDimColor, "Read-only (recommended).");
-    if (!disk_err_.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kErrColor);
-        ImGui::TextWrapped("%s", disk_err_.c_str());
-        ImGui::PopStyleColor();
-    }
+    if (!disk_err_.empty()) selectable_text("##disk_err", disk_err_, ImGui::GetColorU32(kErrColor));
     ImGui::BeginDisabled(disk_path.empty() || !cb.open_device);
     if (ImGui::Button("Open")) open_now = true;
     ImGui::EndDisabled();

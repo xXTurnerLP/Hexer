@@ -25,6 +25,7 @@
 #include "ui/hex_view.h"
 #include "ui/input.h"
 #include "ui/minimap.h"
+#include "ui/text_select.h"
 #include "ui/theme.h"
 
 using namespace hx;
@@ -1566,4 +1567,180 @@ TEST_CASE("fonts: reload_fonts applies a hinting change live, without leaking fo
         for (int v : aliased) CHECK((v == 0 || v == 255));
     }
     ImGui::DestroyContext(ctx);
+}
+
+// =============================================================================================
+// selectable text (ui/text_select.h): Console output, messages, errors
+// =============================================================================================
+
+namespace {
+
+std::string g_clip;
+
+// One ImGui context with a host window drawing a TextSelect (or a selectable_text block) and a
+// plain button (somewhere else to click).
+struct TextUi {
+    ImGuiContext* ctx = nullptr;
+    TextSelect ts;
+    std::vector<std::string> store;
+    std::vector<TextLine> lines;
+    float wrap = -1.0f;
+    std::string block;  // non-empty: draw selectable_text(block) below the TextSelect
+    float w = 600.0f, h = 400.0f;
+
+    explicit TextUi(std::vector<std::string> text) : store(std::move(text)) {
+        ctx = ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.LogFilename = nullptr;
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+        io.Fonts->AddFontDefault();
+        ImGui::GetPlatformIO().Platform_SetClipboardTextFn = [](ImGuiContext*, const char* t) { g_clip = t; };
+        g_clip.clear();
+        sync();
+        frame();
+        frame();
+    }
+    ~TextUi() { ImGui::DestroyContext(ctx); }
+    void sync() {
+        lines.clear();
+        for (const std::string& s : store) lines.push_back({s, 0});
+    }
+    void frame(float dt = 1.0f / 60.0f) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(w, h);
+        io.DeltaTime = dt;
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(w, h));
+        ImGui::Begin("host", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::Button("elsewhere");
+        ts.draw("##t", lines, wrap);
+        if (!block.empty()) selectable_text("##block", block);
+        ImGui::End();
+        ImGui::Render();
+    }
+    ImVec2 at(size_t line, size_t col) const {
+        ImVec2 p;
+        REQUIRE(ts.screen_pos({line, col}, &p));
+        return p;
+    }
+    void move(ImVec2 p) {
+        ImGui::GetIO().AddMousePosEvent(p.x, p.y);
+        frame();
+    }
+    void button(bool down) {
+        ImGui::GetIO().AddMouseButtonEvent(0, down);
+        frame();
+    }
+    void key(ImGuiKey k, bool ctrl = false, bool shift = false) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        if (shift) io.AddKeyEvent(ImGuiMod_Shift, true);
+        io.AddKeyEvent(k, true);
+        frame();
+        io.AddKeyEvent(k, false);
+        if (ctrl) io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        if (shift) io.AddKeyEvent(ImGuiMod_Shift, false);
+        frame();
+    }
+    void click(ImVec2 p, int times = 1, bool shift = false) {
+        if (shift) ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+        move(p);
+        for (int i = 0; i < times; ++i) {
+            button(true);
+            button(false);
+        }
+        if (shift) ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+        frame(1.0f);  // the next click is a new one
+    }
+    void drag(ImVec2 a, ImVec2 b) {
+        move(a);
+        button(true);
+        for (int i = 1; i <= 4; ++i) move(ImVec2(a.x + (b.x - a.x) * float(i) / 4.0f, a.y + (b.y - a.y) * float(i) / 4.0f));
+        button(false);
+        frame(1.0f);
+    }
+    std::string sel() const { return ts.selected_text(lines); }
+};
+
+}  // namespace
+
+TEST_CASE("text select: drag selects part of one line or across lines, keyed copy") {
+    TextUi ui({"hello world", "second line", "> print(1)"});
+    ui.drag(ui.at(0, 6), ui.at(0, 11));
+    CHECK(ui.sel() == "world");
+    ui.drag(ui.at(0, 6), ui.at(1, 6));
+    CHECK(ui.sel() == "world\nsecond");
+    ui.drag(ui.at(2, 4), ui.at(1, 7));  // backwards
+    CHECK(ui.sel() == "line\n> pr");
+    CHECK(ui.ts.sel_begin() == TextPos{1, 7});
+
+    // Ctrl+C while the text has focus copies the selection, Ctrl+A selects everything
+    ui.key(ImGuiKey_C, true);
+    CHECK(g_clip == "line\n> pr");
+    ui.key(ImGuiKey_A, true);
+    CHECK(ui.sel() == "hello world\nsecond line\n> print(1)");
+    ui.key(ImGuiKey_C, true);
+    CHECK(g_clip == "hello world\nsecond line\n> print(1)");
+
+    // focus elsewhere: the keys are not the text's (the selection stays)
+    g_clip.clear();
+    ui.click(ImVec2(10.0f, ImGui::GetFrameHeight() * 0.5f + ImGui::GetStyle().WindowPadding.y));
+    ui.key(ImGuiKey_C, true);
+    CHECK(g_clip.empty());
+    CHECK(ui.ts.has_selection());
+
+    // a plain click drops the selection
+    ui.click(ui.at(1, 3));
+    CHECK(!ui.ts.has_selection());
+    CHECK(ui.ts.sel_begin() == TextPos{1, 3});
+}
+
+TEST_CASE("text select: double-click a word, triple-click a line, Shift+click extends") {
+    TextUi ui({"local x = doc:size()  -- bytes", "next"});
+    ui.click(ui.at(0, 11), 2);  // inside "doc"
+    CHECK(ui.sel() == "doc");
+    ui.click(ui.at(0, 13), 2);  // the ':'
+    CHECK(ui.sel() == ":");
+    ui.click(ui.at(0, 1), 3);
+    CHECK(ui.sel() == "local x = doc:size()  -- bytes\n");
+    ui.click(ui.at(0, 6));
+    ui.click(ui.at(1, 2), 1, true);
+    CHECK(ui.sel() == "x = doc:size()  -- bytes\nne");
+}
+
+TEST_CASE("text select: wrapped rows hit-test inside their line; dropped front lines move the selection") {
+    std::string long_line;
+    for (int i = 0; i < 40; ++i) long_line += "word" + std::to_string(i) + " ";
+    TextUi ui({"first", long_line, "last"});
+    ui.wrap = 200.0f;
+    ui.frame();
+    ImVec2 a = ui.at(1, 0), b = ui.at(1, long_line.size() - 8);
+    CHECK(b.y > a.y + ImGui::GetTextLineHeight());  // wrapped onto a later row
+    const size_t w20 = long_line.find("word20");
+    ui.drag(ui.at(1, w20), ui.at(1, w20 + 6));
+    CHECK(ui.sel() == "word20");
+
+    ui.ts.select({1, w20}, {2, 2});
+    ui.ts.drop_front(1);  // "first" scrolled out of a capped log
+    ui.store.erase(ui.store.begin());
+    ui.sync();
+    ui.frame();
+    CHECK(ui.sel() == long_line.substr(w20) + "\nla");
+    ui.ts.drop_front(5);  // cleared
+    CHECK(!ui.ts.has_selection());
+}
+
+TEST_CASE("text select: a selectable_text block selects and copies on its own") {
+    TextUi ui({"x"});
+    ui.block = "Cannot open process 1234: Access is denied.";
+    ui.frame();
+    // the block is the last item: below the TextSelect's single row
+    const float y = ui.at(0, 0).y + ImGui::GetTextLineHeightWithSpacing();
+    const float x0 = ImGui::GetStyle().WindowPadding.x + ImGui::CalcTextSize("Cannot open process ").x;
+    const float x1 = ImGui::GetStyle().WindowPadding.x + ImGui::CalcTextSize("Cannot open process 1234").x;
+    ui.drag(ImVec2(x0 + 1.0f, y), ImVec2(x1 + 1.0f, y));
+    ui.key(ImGuiKey_C, true);
+    CHECK(g_clip == "1234");
 }

@@ -8,8 +8,10 @@
 #include <cfloat>
 #include <climits>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "imgui.h"
@@ -797,13 +799,7 @@ void draw_parse_info(App& app, StructureState& st, const Document& d) {
         ImGui::SameLine();
         ImGui::TextColored(kWarnColor, "(truncated: field limit reached)");
     }
-    if (!r.error.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, kErrColor);
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextUnformatted(r.error.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
-    }
+    if (!r.error.empty()) selectable_text("##parse_err", r.error, ImGui::GetColorU32(kErrColor));
     (void)app;
 }
 
@@ -1203,17 +1199,6 @@ ImVec4 console_color(ConsoleLine::Kind k) {
     }
 }
 
-void draw_console_line(const ConsoleLine& l) {
-    ImGui::PushStyleColor(ImGuiCol_Text, console_color(l.kind));
-    if (l.kind == ConsoleLine::Input) {
-        std::string s = "> " + l.text;
-        ImGui::TextUnformatted(s.c_str(), s.c_str() + s.size());
-    } else {
-        ImGui::TextUnformatted(l.text.c_str(), l.text.c_str() + l.text.size());
-    }
-    ImGui::PopStyleColor();
-}
-
 std::string console_text(const std::deque<ConsoleLine>& lines) {
     std::string all;
     for (const ConsoleLine& l : lines) {
@@ -1263,9 +1248,26 @@ void run_console_input(App& app) {
 }
 
 void draw_console_output(App& app) {
-    const auto& lines = app.engine->console();
+    const auto& con = app.engine->console();
+    // The selection is kept in line numbers of console(): follow lines dropped at the front.
+    const uint64_t first = app.engine->console_first();
+    if (first != app.console_sel_first) {
+        app.console_sel.drop_front(size_t(std::min<uint64_t>(first - app.console_sel_first, SIZE_MAX)));
+        app.console_sel_first = first;
+    }
+    std::deque<std::string> prompts;  // "> code" of the input lines (stable addresses)
+    std::vector<TextLine> lines;
+    lines.reserve(con.size());
+    for (const ConsoleLine& l : con) {
+        std::string_view text = l.text;
+        if (l.kind == ConsoleLine::Input) text = prompts.emplace_back("> " + l.text);
+        lines.push_back({text, ImGui::GetColorU32(console_color(l.kind))});
+    }
     if (ImGui::BeginPopupContextWindow("##conctx")) {
-        if (ImGui::MenuItem("Copy all")) ImGui::SetClipboardText(console_text(lines).c_str());
+        if (ImGui::MenuItem("Copy", "Ctrl+C", false, app.console_sel.has_selection())) app.console_sel.copy(lines);
+        if (ImGui::MenuItem("Select All", "Ctrl+A")) app.console_sel.select_all(lines);
+        if (ImGui::MenuItem("Copy All")) ImGui::SetClipboardText(console_text(con).c_str());
+        ImGui::Separator();
         if (ImGui::MenuItem("Clear", "Ctrl+L")) app.engine->clear_console();
         ImGui::MenuItem("Word wrap", nullptr, &app.console_wrap);
         close_popup_on_escape();
@@ -1273,20 +1275,10 @@ void draw_console_output(App& app) {
     }
     const bool at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.0f;
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 2.0f));
-    if (app.console_wrap) {
-        // Variable-height wrapped lines: no clipper. The console is capped at 5000 lines and
-        // ImGui only measures (does not render) off-screen text.
-        ImGui::PushTextWrapPos(0.0f);
-        for (const ConsoleLine& l : lines) draw_console_line(l);
-        ImGui::PopTextWrapPos();
-    } else {
-        ImGuiListClipper clip;
-        clip.Begin(int(lines.size()));
-        while (clip.Step())
-            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) draw_console_line(lines[size_t(i)]);
-    }
-    ImGui::PopStyleVar();
+    // Only the visible rows are drawn; the wrapped layout is redone when the text changes.
     const uint64_t gen = app.engine->console_generation();
+    app.console_sel.draw("##text", lines, app.console_wrap ? 0.0f : -1.0f, gen + 1);
+    ImGui::PopStyleVar();
     if (app.console_force_scroll || (gen != app.console_seen_gen && at_bottom)) ImGui::SetScrollHereY(1.0f);
     app.console_force_scroll = false;
     app.console_seen_gen = gen;

@@ -7,6 +7,7 @@
 #include "misc/cpp/imgui_stdlib.h"
 
 #include "core/os_file.h"
+#include "ui/text_select.h"
 
 namespace hx {
 
@@ -170,7 +171,7 @@ void CStructDialog::draw(const char* title, ImFont* mono, float ui_scale, const 
 
     // ---- status -------------------------------------------------------------------------------
     if (!error_.empty()) {
-        ImGui::TextColored(kErrColor, "%s", error_.c_str());
+        selectable_text("##error", error_, ImGui::GetColorU32(kErrColor));
     } else {
         std::string s = "Root: " + info_.root;
         for (const CStructInfo::Item& it : info_.structs)
@@ -180,7 +181,8 @@ void CStructDialog::draw(const char* title, ImFont* mono, float ui_scale, const 
         s += "   -   " + std::to_string(info_.structs.size()) + " struct" + (info_.structs.size() == 1 ? "" : "s");
         ImGui::TextUnformatted(s.c_str());
     }
-    if (!message_.empty()) ImGui::TextColored(message_is_error_ ? kErrColor : kOkColor, "%s", message_.c_str());
+    if (!message_.empty())
+        selectable_text("##message", message_, ImGui::GetColorU32(message_is_error_ ? kErrColor : kOkColor));
     else ImGui::NewLine();
 
     // ---- buttons ------------------------------------------------------------------------------

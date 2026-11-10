@@ -3574,9 +3574,7 @@ void draw_message(App& app) {
     center_next_window(app, 0.0f, 0.3f);
     std::string id = app.messages.front().title + kPopMessage;
     if (!ImGui::BeginPopupModal(id.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
-    ImGui::PushTextWrapPos(520.0f * app.ui_scale);
-    ImGui::TextUnformatted(app.messages.front().text.c_str());
-    ImGui::PopTextWrapPos();
+    selectable_text("##msg", app.messages.front().text, 0, 520.0f * app.ui_scale);
     ImGui::Spacing();
     if (ImGui::Button("OK") || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         app.messages.erase(app.messages.begin());
@@ -3591,8 +3589,7 @@ void draw_about(App& app) {
     ImGui::Text("Hexer %s", HEXER_VERSION);
     ImGui::TextDisabled("Hex editor for binary and protocol analysis");
     ImGui::Separator();
-    ImGui::Text("Config: %s", paths::config_dir().c_str());
-    ImGui::Text("Scripts: %s", paths::user_scripts_dir().c_str());
+    selectable_text("##paths", "Config: " + paths::config_dir() + "\nScripts: " + paths::user_scripts_dir(), 0, -1.0f);
     ImGui::Text("Dear ImGui %s", ImGui::GetVersion());
     ImGui::TextDisabled("MIT License. Third-party licenses: THIRD_PARTY_NOTICES.md");
     ImGui::Spacing();

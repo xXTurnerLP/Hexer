@@ -31,6 +31,7 @@
 #include "ui/panel_packets.h"
 #include "ui/panel_strings.h"
 #include "ui/panel_xor.h"
+#include "ui/text_select.h"
 #include "ui/theme.h"
 #include "ui/view_diff.h"
 
@@ -347,6 +348,8 @@ struct App final : ScriptHost {
     uint64_t console_seen_gen = 0;
     bool console_wrap = true;
     bool console_force_scroll = false;
+    TextSelect console_sel;           // mouse selection in the output (transient)
+    uint64_t console_sel_first = 0;   // ScriptEngine::console_first() the selection is relative to
 
     // Inline editors.
     InlineEdit insp_edit, st_edit, bm_edit;

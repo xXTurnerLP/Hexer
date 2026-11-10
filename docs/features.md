@@ -214,6 +214,11 @@ Lua API see [scripting.md](scripting.md).
 - **Lua console** (REPL), script commands, and hot reload: save a `.lua` file and it reloads.
   Commands can ask for a value with `hx.prompt(title, default)` (a small dialog; Enter = OK,
   Esc = Cancel), e.g. *Selection: XOR with key* asks for the key.
+- **Selectable text**: the console output, message boxes, error texts (Structure, Open Process /
+  Open Disk, C Struct to Parser, Hashes) and the About box paths select like a text editor: drag
+  (past the top / bottom scrolls), `Shift`+click extends, double-click a word, triple-click a
+  line; `Ctrl+C` copies and `Ctrl+A` selects all while that text was clicked last (elsewhere they
+  stay the hex view's); the right-click menu has Copy, Select All and Copy All.
 - Tabs (drag to reorder, the order is kept by hot exit; middle-click closes one), drag and drop
   of files (several at once), recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
   read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
@@ -309,6 +314,7 @@ in `<config>/layout.ini` (View > Reset Layout rebuilds it).
 | `F7` / `Shift+F7` (Compare tab) | Next / previous difference |
 | `Ctrl+=` or `Ctrl++` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Zoom in / out / reset |
 | `Ctrl+L` (in the console) | Clear console |
+| `Ctrl+C` / `Ctrl+A` (in selectable text) | Copy the selected text / select all of it |
 
 Mouse: click and drag to select (bytes a..b inclusive; clicking the second hex digit puts the
 caret on the low nibble; clicking below the last row puts it at the end of the file),
