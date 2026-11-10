@@ -777,6 +777,14 @@ TEST_CASE("disasm panel: follows the caret, scrolls, clicks select, double-click
     REQUIRE(layer);
     REQUIRE(layer->items.size() == 1);
     CHECK(layer->items[0].offset == starts[500]);
+    // Not drawn (hidden behind another tab of its dock node): no tint, it would not follow the caret.
+    for (int k = 0; k < 2; ++k) {
+        ImGui::NewFrame();
+        ImGui::Render();
+    }
+    CHECK(ui.panel.layer(ui.doc->id()) == nullptr);
+    ui.frame();
+    CHECK(ui.panel.layer(ui.doc->id()) != nullptr);
 
     // A caret move inside the listing keeps it; one outside re-anchors.
     const uint64_t top = r.front().offset;

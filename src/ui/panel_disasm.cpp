@@ -174,6 +174,7 @@ bool DisasmPanel::row_pos(int row, float& x, float& y) const {
 }
 
 const HighlightSet* DisasmPanel::layer(uint64_t doc_id) const {
+    if (ImGui::GetFrameCount() - drawn_frame_ > 1) return nullptr;  // not drawn: hidden / closed
     auto it = docs_.find(doc_id);
     return it != docs_.end() && !it->second->layer.empty() ? &it->second->layer : nullptr;
 }
@@ -387,6 +388,7 @@ bool DisasmPanel::follow_at(const Document& doc, uint64_t at, const DisasmPanelC
 }
 
 void DisasmPanel::draw(Document* doc, uint64_t caret, const DisasmPanelCallbacks& cb) {
+    drawn_frame_ = ImGui::GetFrameCount();
     if (!doc) {
         ImGui::TextDisabled("No document open");
         return;

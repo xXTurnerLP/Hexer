@@ -99,7 +99,9 @@ public:
     const AddressMap& address_map(const Document& doc);
     // Picks the document's address map as the toolbar does (`base`: the Manual base).
     void set_map_choice(const Document& doc, DisasmMapChoice choice, uint64_t base = 0);
-    // Hex view layer with the current instruction's bytes for that document (nullptr: none).
+    // Hex view layer with the current instruction's bytes for that document (nullptr: none, also
+    // while the panel is not drawn, e.g. hidden behind another tab of its dock node: the
+    // instruction would no longer follow the caret).
     const HighlightSet* layer(uint64_t doc_id) const;
     // Decoding options in effect for `doc` (mode resolved from the map in Auto mode).
     DisasmOptions options_for(const Document& doc);
@@ -148,6 +150,7 @@ private:
     void goto_symbol(DocState& st, const Document& doc, const Symbol& s, const DisasmPanelCallbacks& cb);
 
     std::map<uint64_t, std::unique_ptr<DocState>> docs_;
+    int drawn_frame_ = -100;  // ImGui frame of the last draw() (layer() needs a recent one)
     int rows_ = 24;                // visible rows of the last draw
     float rows_x_ = 0, rows_y_ = 0, row_w_ = 0, row_h_ = 0;  // row geometry of the last draw
     int drawn_rows_ = 0;
