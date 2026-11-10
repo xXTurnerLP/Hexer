@@ -1394,10 +1394,11 @@ namespace {
 // One change requested while drawing the table, applied after it (the lists must not change
 // while they are being iterated).
 struct BookmarkChange {
-    enum Kind { None, Name, Note, Remove } kind = None;
+    enum Kind { None, Name, Note, Color, Remove } kind = None;
     uint64_t doc = 0;
     size_t index = 0;
     std::string text;
+    uint32_t color = 0;  // Color: the new color (0 = default)
 };
 
 // Right-click menu of a bookmark row's Name / Note cell (the same edits as double-clicks).
@@ -1407,6 +1408,11 @@ void bookmark_context_menu(App& app, Tab& t, const Bookmark& b, size_t i, Bookma
     if (ImGui::MenuItem("Select bytes")) reveal_range(app, t, b.offset, b.length, true);
     if (ImGui::MenuItem("Edit name")) app.bm_edit.begin(int(i) * 2, d.id(), b.name);
     if (ImGui::MenuItem("Edit note")) app.bm_edit.begin(int(i) * 2 + 1, d.id(), b.note);
+    if (ImGui::BeginMenu("Color")) {
+        uint32_t c = 0;
+        if (bookmark_color_menu(b.color, &c)) change = {BookmarkChange::Color, d.id(), i, {}, c};
+        ImGui::EndMenu();
+    }
     if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(b.offset).c_str());
     ImGui::Separator();
     if (ImGui::MenuItem("Delete")) change = {BookmarkChange::Remove, d.id(), i, {}};
@@ -1427,6 +1433,7 @@ void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field
     }
     const std::string& text = field == 0 ? b.name : b.note;
     if (field == 0) {
+        const ImVec2 swatch = ImGui::GetCursorScreenPos();
         draw_swatch(b.color ? b.color : hex_colors().bookmark);
         ImGuiSelectableFlags fl = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap |
                                   ImGuiSelectableFlags_AllowDoubleClick;
@@ -1440,6 +1447,17 @@ void bookmark_text_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field
             ImGui::SetTooltip("%s\n%s", fmt_range(b.offset, b.length).c_str(),
                               "Click: select it  \xC2\xB7  double-click the name or note to edit");
         bookmark_context_menu(app, t, b, i, change);
+        // The swatch picks the color: a button on top of the row's Selectable (which allows overlap).
+        ImGui::SetCursorScreenPos(swatch);
+        if (ImGui::InvisibleButton("##color", ImVec2(ImGui::GetTextLineHeight() * 0.7f, ImGui::GetTextLineHeight())))
+            ImGui::OpenPopup("##bmcolor");
+        ImGui::SetItemTooltip("Bookmark color");
+        if (ImGui::BeginPopup("##bmcolor")) {
+            uint32_t c = 0;
+            if (bookmark_color_menu(b.color, &c)) change = {BookmarkChange::Color, d.id(), i, {}, c};
+            close_popup_on_escape();
+            ImGui::EndPopup();
+        }
         return;
     }
     // Note: plain text; a double-click anywhere in the cell edits it.
@@ -1506,6 +1524,9 @@ void apply_bookmark_change(App& app, const BookmarkChange& c) {
     bool ok = true;
     if (c.kind == BookmarkChange::Remove) {
         ok = d.remove_bookmark(c.index);
+    } else if (c.kind == BookmarkChange::Color) {
+        set_bookmark_color(app, d, c.index, c.color);
+        return;
     } else {
         Bookmark b = bms[c.index];
         std::string& field = c.kind == BookmarkChange::Name ? b.name : b.note;
@@ -1532,6 +1553,69 @@ void add_bookmark_here(App& app, Document& d) {
         set_status(app, "Added " + b.name + " at " + fmt_range(b.offset, b.length));
     else
         report_edit_failure(app, d);
+}
+
+bool bookmark_color_menu(uint32_t cur, uint32_t* out) {
+    static const char* const kNames[] = {"red",  "orange", "yellow", "green", "teal", "cyan",
+                                         "blue", "purple", "pink",   "gray",  "white"};
+    static float custom[3] = {1.0f, 0.0f, 0.0f};  // the picker's value while this popup is open
+    const uint32_t shown = cur ? cur : hex_colors().bookmark;
+    if (ImGui::IsWindowAppearing()) {
+        const ImVec4 c = ImGui::ColorConvertU32ToFloat4(shown);
+        custom[0] = c.x, custom[1] = c.y, custom[2] = c.z;
+    }
+    bool picked = false;
+    const float sz = ImGui::GetFrameHeight();
+    for (int k = 0; k < int(IM_ARRAYSIZE(kNames)); ++k) {
+        uint32_t c = 0;
+        parse_color(kNames[k], c);
+        if (k % 6) ImGui::SameLine();
+        ImGui::PushID(k);
+        if (ImGui::ColorButton(kNames[k], ImGui::ColorConvertU32ToFloat4(c), ImGuiColorEditFlags_NoTooltip,
+                               ImVec2(sz, sz))) {
+            *out = c;
+            picked = true;
+            ImGui::CloseCurrentPopup();
+        }
+        if (c == shown)  // the current color
+            ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                                ImGui::GetColorU32(ImGuiCol_Text), 0.0f, 0, 2.0f);
+        ImGui::SetItemTooltip("%s", kNames[k]);
+        ImGui::PopID();
+    }
+    if (ImGui::MenuItem("Default", nullptr, cur == 0)) {
+        *out = 0;
+        picked = true;
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("Custom");
+    ImGui::SetNextItemWidth(sz * 9.0f);
+    ImGui::ColorPicker3("##custom", custom,
+                        ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_DisplayHex |
+                            ImGuiColorEditFlags_PickerHueBar);
+    if (ImGui::IsItemDeactivatedAfterEdit()) {  // one undo step per drag / typed value
+        *out = ImGui::ColorConvertFloat4ToU32(ImVec4(custom[0], custom[1], custom[2], 1.0f));
+        picked = true;
+    }
+    return picked;
+}
+
+size_t bookmark_at_focus(const Document& d) {
+    const ViewState& v = d.view();
+    const uint64_t at = focus_offset(v);
+    for (size_t i = v.bookmarks.size(); i-- > 0;) {
+        const Bookmark& b = v.bookmarks[i];
+        if (at >= b.offset && at - b.offset < std::max<uint64_t>(b.length, 1)) return i;
+    }
+    return SIZE_MAX;
+}
+
+void set_bookmark_color(App& app, Document& d, size_t index, uint32_t color) {
+    if (d.busy() || index >= d.view().bookmarks.size()) return;
+    Bookmark b = d.view().bookmarks[index];
+    if (b.color == color) return;
+    b.color = color;
+    if (!d.update_bookmark(index, b)) report_edit_failure(app, d);
 }
 
 void draw_bookmarks_panel(App& app) {

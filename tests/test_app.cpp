@@ -20,10 +20,12 @@
 #include "imgui.h"
 
 #include "core/document.h"
+#include "core/highlight.h"
 #include "core/os_file.h"
 #include "core/settings.h"
 #include "ui/app_internal.h"
 #include "ui/panel_history.h"
+#include "ui/panels.h"
 #include "ui/theme.h"
 
 using namespace hx;
@@ -336,4 +338,65 @@ TEST_CASE("app: XOR Search panel scans the file and guesses a key from the selec
     h.action("XOR: Guess Key from Selection");
     h.frames_until([&] { return h.app->status.rfind("Best key guess:", 0) == 0; });
     CHECK(h.app->status.find("37") != std::string::npos);
+}
+
+TEST_CASE("app: bookmark colors: the color menu, the bookmark under the caret, one undo step each") {
+    TempDir dir;
+    const std::string f = dir.file("bm.bin", Bytes(256, 0));
+    HeadlessApp h(path_join(dir.path, "config"), {f}, true);
+    Document& d = *h.tab(0).doc;
+    REQUIRE(d.add_bookmark({0x10, 4, "a", 0, ""}));
+    REQUIRE(d.add_bookmark({0x12, 8, "b", 0, ""}));
+    auto caret = [&](uint64_t at) { d.view().cursor = d.view().anchor = at; };
+    caret(0x13);
+    CHECK(bookmark_at_focus(d) == 1);  // overlapping: the later one
+    caret(0x10);
+    CHECK(bookmark_at_focus(d) == 0);
+    caret(0x40);
+    CHECK(bookmark_at_focus(d) == SIZE_MAX);
+
+    // The color menu: a click on the first preset swatch picks red.
+    uint32_t picked = 1;
+    bool got = false;
+    const ImVec2 at(100.0f, 100.0f);
+    auto menu_frame = [&](ImVec2 mouse, bool down) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddMousePosEvent(mouse.x, mouse.y);
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, down);
+        io.DisplaySize = ImVec2(1600, 1000);
+        io.DeltaTime = 1.0f / 60.0f;
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(at);
+        ImGui::Begin("color menu test", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize);
+        uint32_t c = 0;
+        if (bookmark_color_menu(0, &c)) {
+            picked = c;
+            got = true;
+        }
+        ImGui::End();
+        ImGui::Render();
+    };
+    const ImVec2 pad = ImGui::GetStyle().WindowPadding;
+    const ImVec2 first(at.x + pad.x + 3.0f, at.y + pad.y + 3.0f);
+    menu_frame(first, false);
+    menu_frame(first, false);
+    menu_frame(first, true);
+    menu_frame(first, false);
+    REQUIRE(got);
+    uint32_t red = 0;
+    REQUIRE(parse_color("red", red));
+    CHECK(picked == red);
+
+    // Setting it is one undo step; the same color again is none; undo restores the default.
+    const size_t steps = d.undo_stack().size();
+    set_bookmark_color(*h.app, d, 0, red);
+    CHECK(d.view().bookmarks[0].color == red);
+    CHECK(d.undo_stack().size() == steps + 1);
+    set_bookmark_color(*h.app, d, 0, red);
+    CHECK(d.undo_stack().size() == steps + 1);
+    CHECK(d.view().bookmarks[1].color == 0);
+    REQUIRE(d.undo());
+    CHECK(d.view().bookmarks[0].color == 0);
+    REQUIRE(d.redo());
+    CHECK(d.view().bookmarks[0].color == red);
 }

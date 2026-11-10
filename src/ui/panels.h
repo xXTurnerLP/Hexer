@@ -66,6 +66,15 @@ void draw_status_bar(App& app);            // fixed bottom bar (call before the 
 
 // Bookmark the selection (or the caret byte) of `d`, undoable; reports in the status bar.
 void add_bookmark_here(App& app, Document& d);
+// Color choices for a bookmark whose color is `cur` (0 = default), drawn into the current popup /
+// menu: preset swatches, "Default" and a custom picker. True when the user picked one: *out is
+// the new color (0 = default). A drag in the custom picker reports once, when it ends.
+bool bookmark_color_menu(uint32_t cur, uint32_t* out);
+// Index of the bookmark under the caret / selection start of `d` (the last added wins when they
+// overlap), or SIZE_MAX.
+size_t bookmark_at_focus(const Document& d);
+// Sets bookmark `index` of `d` to `color` as one undo step ("Edit bookmark"); reports failures.
+void set_bookmark_color(App& app, Document& d, size_t index, uint32_t color);
 
 // ---- follow pointer type (picked in the Inspector, Settings or Search > Follow Pointer Settings) ----
 // The type itself is app.settings.pointer_type(): width / signedness (clicking an integer row in

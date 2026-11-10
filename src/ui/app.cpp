@@ -2644,6 +2644,14 @@ void draw_hex_context_menu(App& app) {
     }
     ImGui::Separator();
     menu_action(app, "Toggle Bookmark");
+    if (Document* d = usable_doc(app)) {
+        const size_t bi = bookmark_at_focus(*d);
+        if (bi != SIZE_MAX && ImGui::BeginMenu("Bookmark Color")) {
+            uint32_t c = 0;
+            if (bookmark_color_menu(d->view().bookmarks[bi].color, &c)) set_bookmark_color(app, *d, bi, c);
+            ImGui::EndMenu();
+        }
+    }
     menu_action(app, "Go to Offset...");
     menu_action(app, "Find...");
     ImGui::Separator();

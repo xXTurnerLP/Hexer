@@ -200,7 +200,10 @@ Lua API see [scripting.md](scripting.md).
 - **Bookmarks** with a name and a note, kept in the session and undoable. `Ctrl+B` toggles one on
   the selection or caret, `F2` / `Shift+F2` jump, `Ctrl+Shift+B` fuzzy-finds a bookmark in any open
   file. The Bookmarks panel (bottom dock) lists name, note, offset, length and the first bytes,
-  for this file or **all open files**; double-click a name or note to edit it. The Bookmarks menu
+  for this file or **all open files**; double-click a name or note to edit it. Each bookmark has its
+  own **color**: click its swatch in the panel (or *Color* in its right-click menu, or *Bookmark
+  Color* in the hex view's right-click menu on a bookmarked byte) for a preset, the default or any
+  custom color (undoable). The Bookmarks menu
   lists the active file's bookmarks. Bookmarks (and Find All hits) show as ticks on the scrollbar.
   The "All open files" choice is remembered in `settings.ini`.
 - **Settings window** (Edit > Settings..., `Ctrl+,`): bytes per row, grouping, font size, UI
