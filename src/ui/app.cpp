@@ -2677,8 +2677,7 @@ void draw_hex_context_menu(App& app) {
     if (Document* d = usable_doc(app)) {
         const size_t bi = bookmark_at_focus(*d);
         if (bi != SIZE_MAX && ImGui::BeginMenu("Bookmark Color")) {
-            uint32_t c = 0;
-            if (bookmark_color_menu(d->view().bookmarks[bi].color, &c)) set_bookmark_color(app, *d, bi, c);
+            bookmark_color_menu(app, *d, bi);
             ImGui::EndMenu();
         }
     }
@@ -4446,6 +4445,7 @@ void draw_panels(App& app) {
         draw_search_results_panel(app);
     }
     if (app.show_bookmarks) draw_bookmarks_panel(app);
+    bookmark_color_preview_tick(app);
     if (app.show_strings) {
         if (app.focus_strings) {
             ImGui::SetNextWindowFocus();

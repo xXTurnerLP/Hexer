@@ -66,10 +66,15 @@ void draw_status_bar(App& app);            // fixed bottom bar (call before the 
 
 // Bookmark the selection (or the caret byte) of `d`, undoable; reports in the status bar.
 void add_bookmark_here(App& app, Document& d);
-// Color choices for a bookmark whose color is `cur` (0 = default), drawn into the current popup /
-// menu: preset swatches, "Default" and a custom picker. True when the user picked one: *out is
-// the new color (0 = default). A drag in the custom picker reports once, when it ends.
-bool bookmark_color_menu(uint32_t cur, uint32_t* out);
+// Color choices for bookmark `index` of `d`, drawn into the current popup / menu: preset swatches,
+// "Default" and a custom picker. A pick is one undo step (set_bookmark_color). While the custom
+// picker is dragged (or its hex value typed) the bookmark shows the color live, and the release
+// makes the step. True when a color was set this frame.
+bool bookmark_color_menu(App& app, Document& d, size_t index);
+// Puts the original color back if a live preview's picker went away mid-drag (no undo step).
+void end_bookmark_color_preview(App& app);
+// Once per frame: ends a preview whose picker was not drawn last frame (its popup closed).
+void bookmark_color_preview_tick(App& app);
 // Index of the bookmark under the caret / selection start of `d` (the last added wins when they
 // overlap), or SIZE_MAX.
 size_t bookmark_at_focus(const Document& d);

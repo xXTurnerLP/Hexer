@@ -219,6 +219,16 @@ struct Notification {
     uint64_t id = 0;
 };
 
+// A bookmark showing the color of a custom color picker being dragged (no undo step yet).
+struct BookmarkColorPreview {
+    uint64_t doc = 0;
+    size_t index = 0;
+    uint32_t original = 0;  // the color the undo step starts from
+    uint32_t shown = 0;     // the preview color written into the view
+    int frame = 0;          // ImGui frame the picker last changed it (ended when the picker is gone)
+    bool active = false;
+};
+
 struct MsgBox {
     std::string title;
     std::string text;
@@ -353,6 +363,7 @@ struct App final : ScriptHost {
 
     // Inline editors.
     InlineEdit insp_edit, st_edit, bm_edit;
+    BookmarkColorPreview bm_preview;  // live color of a dragged bookmark color picker (panels.cpp)
     uint64_t edit_doc = 0;            // active doc id the inline edits belong to (ended on change)
     int insp_sel = -1;                // selected inspector row (Enter edits it)
 

@@ -1394,11 +1394,10 @@ namespace {
 // One change requested while drawing the table, applied after it (the lists must not change
 // while they are being iterated).
 struct BookmarkChange {
-    enum Kind { None, Name, Note, Color, Range, Bytes, Remove } kind = None;
+    enum Kind { None, Name, Note, Range, Bytes, Remove } kind = None;
     uint64_t doc = 0;
     size_t index = 0;
     std::string text;                 // Name / Note
-    uint32_t color = 0;               // Color: the new color (0 = default)
     uint64_t offset = 0, length = 0;  // Range
     std::vector<uint8_t> bytes;       // Bytes: written over the bookmark's bytes
 };
@@ -1497,11 +1496,7 @@ void bookmark_context_menu(App& app, Tab& t, const Bookmark& b, size_t i, Bookma
     if (ImGui::MenuItem("Edit bytes", nullptr, false, b.length <= kBmEditMaxBytes))
         begin_bookmark_edit(app, d, b, i, kBmBytes);
     if (ImGui::BeginMenu("Color")) {
-        uint32_t c = 0;
-        if (bookmark_color_menu(b.color, &c)) {
-            change = {BookmarkChange::Color, d.id(), i};
-            change.color = c;
-        }
+        bookmark_color_menu(app, d, i);
         ImGui::EndMenu();
     }
     if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(b.offset).c_str());
@@ -1555,11 +1550,7 @@ void bookmark_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, boo
             ImGui::OpenPopup("##bmcolor");
         ImGui::SetItemTooltip("Bookmark color");
         if (ImGui::BeginPopup("##bmcolor")) {
-            uint32_t c = 0;
-            if (bookmark_color_menu(b.color, &c)) {
-                change = {BookmarkChange::Color, d.id(), i};
-                change.color = c;
-            }
+            bookmark_color_menu(app, d, i);
             close_popup_on_escape();
             ImGui::EndPopup();
         }
@@ -1639,7 +1630,6 @@ void apply_bookmark_change(App& app, const BookmarkChange& c) {
     bool ok = true;
     switch (c.kind) {
     case BookmarkChange::Remove: ok = d.remove_bookmark(c.index); break;
-    case BookmarkChange::Color: set_bookmark_color(app, d, c.index, c.color); return;
     case BookmarkChange::Range:
         if (b.offset == c.offset && b.length == c.length) return;
         b.offset = c.offset;
@@ -1682,10 +1672,51 @@ void add_bookmark_here(App& app, Document& d) {
         report_edit_failure(app, d);
 }
 
-bool bookmark_color_menu(uint32_t cur, uint32_t* out) {
+namespace {
+
+// Shows `color` on bookmark `index` of `d` while the custom picker is dragged: written straight into
+// the view state, no undo step (set_bookmark_color() restores the original first, so its step goes
+// from the original color to the final one).
+void preview_bookmark_color(App& app, Document& d, size_t index, uint32_t color) {
+    BookmarkColorPreview& p = app.bm_preview;
+    std::vector<Bookmark>& bms = d.view().bookmarks;
+    if (d.busy() || index >= bms.size()) return;
+    if (!p.active || p.doc != d.id() || p.index != index) {
+        end_bookmark_color_preview(app);
+        p = {d.id(), index, bms[index].color, 0, 0, true};
+    }
+    p.shown = color;
+    p.frame = ImGui::GetFrameCount();
+    bms[index].color = color;
+    d.view_generation++;
+}
+
+}  // namespace
+
+void end_bookmark_color_preview(App& app) {
+    BookmarkColorPreview& p = app.bm_preview;
+    if (!p.active) return;
+    p.active = false;
+    Tab* t = find_tab(app, p.doc);
+    if (!t || t->doc->busy()) return;
+    std::vector<Bookmark>& bms = t->doc->view().bookmarks;
+    // Only while the bookmark still shows the preview (an undo meanwhile replaced the list).
+    if (p.index < bms.size() && bms[p.index].color == p.shown) {
+        bms[p.index].color = p.original;
+        t->doc->view_generation++;
+    }
+}
+
+void bookmark_color_preview_tick(App& app) {
+    if (app.bm_preview.active && ImGui::GetFrameCount() - app.bm_preview.frame > 1) end_bookmark_color_preview(app);
+}
+
+bool bookmark_color_menu(App& app, Document& d, size_t index) {
     static const char* const kNames[] = {"red",  "orange", "yellow", "green", "teal", "cyan",
                                          "blue", "purple", "pink",   "gray",  "white"};
     static float custom[3] = {1.0f, 0.0f, 0.0f};  // the picker's value while this popup is open
+    if (index >= d.view().bookmarks.size()) return false;
+    const uint32_t cur = d.view().bookmarks[index].color;
     const uint32_t shown = cur ? cur : hex_colors().bookmark;
     if (ImGui::IsWindowAppearing()) {
         const ImVec4 c = ImGui::ColorConvertU32ToFloat4(shown);
@@ -1700,7 +1731,7 @@ bool bookmark_color_menu(uint32_t cur, uint32_t* out) {
         ImGui::PushID(k);
         if (ImGui::ColorButton(kNames[k], ImGui::ColorConvertU32ToFloat4(c), ImGuiColorEditFlags_NoTooltip,
                                ImVec2(sz, sz))) {
-            *out = c;
+            set_bookmark_color(app, d, index, c);
             picked = true;
             ImGui::CloseCurrentPopup();
         }
@@ -1711,18 +1742,21 @@ bool bookmark_color_menu(uint32_t cur, uint32_t* out) {
         ImGui::PopID();
     }
     if (ImGui::MenuItem("Default", nullptr, cur == 0)) {
-        *out = 0;
+        set_bookmark_color(app, d, index, 0);
         picked = true;
     }
     ImGui::Separator();
     ImGui::TextDisabled("Custom");
     ImGui::SetNextItemWidth(sz * 9.0f);
-    ImGui::ColorPicker3("##custom", custom,
-                        ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_DisplayHex |
-                            ImGuiColorEditFlags_PickerHueBar);
+    const bool changed = ImGui::ColorPicker3("##custom", custom,
+                                             ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_DisplayHex |
+                                                 ImGuiColorEditFlags_PickerHueBar);
+    const uint32_t pc = ImGui::ColorConvertFloat4ToU32(ImVec4(custom[0], custom[1], custom[2], 1.0f));
     if (ImGui::IsItemDeactivatedAfterEdit()) {  // one undo step per drag / typed value
-        *out = ImGui::ColorConvertFloat4ToU32(ImVec4(custom[0], custom[1], custom[2], 1.0f));
+        set_bookmark_color(app, d, index, pc);
         picked = true;
+    } else if (changed) {
+        preview_bookmark_color(app, d, index, pc);  // live while dragging / typing
     }
     return picked;
 }
@@ -1738,6 +1772,7 @@ size_t bookmark_at_focus(const Document& d) {
 }
 
 void set_bookmark_color(App& app, Document& d, size_t index, uint32_t color) {
+    end_bookmark_color_preview(app);  // the undo step starts from the original color
     if (d.busy() || index >= d.view().bookmarks.size()) return;
     Bookmark b = d.view().bookmarks[index];
     if (b.color == color) return;

@@ -356,10 +356,9 @@ TEST_CASE("app: bookmark colors: the color menu, the bookmark under the caret, o
     caret(0x40);
     CHECK(bookmark_at_focus(d) == SIZE_MAX);
 
-    // The color menu: a click on the first preset swatch picks red.
-    uint32_t picked = 1;
-    bool got = false;
+    // The color menu, drawn for bookmark 0 in a window of its own.
     const ImVec2 at(100.0f, 100.0f);
+    ImVec2 pick_min, pick_max;  // the custom picker (its group: the SV square at its top left)
     auto menu_frame = [&](ImVec2 mouse, bool down) {
         ImGuiIO& io = ImGui::GetIO();
         io.AddMousePosEvent(mouse.x, mouse.y);
@@ -369,37 +368,59 @@ TEST_CASE("app: bookmark colors: the color menu, the bookmark under the caret, o
         ImGui::NewFrame();
         ImGui::SetNextWindowPos(at);
         ImGui::Begin("color menu test", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize);
-        uint32_t c = 0;
-        if (bookmark_color_menu(0, &c)) {
-            picked = c;
-            got = true;
-        }
+        bookmark_color_menu(*h.app, d, 0);
+        pick_min = ImGui::GetItemRectMin();
+        pick_max = ImGui::GetItemRectMax();
         ImGui::End();
         ImGui::Render();
     };
+    // A click on the first preset swatch sets red: one undo step.
+    const size_t steps = d.undo_stack().size();
     const ImVec2 pad = ImGui::GetStyle().WindowPadding;
     const ImVec2 first(at.x + pad.x + 3.0f, at.y + pad.y + 3.0f);
     menu_frame(first, false);
     menu_frame(first, false);
     menu_frame(first, true);
     menu_frame(first, false);
-    REQUIRE(got);
     uint32_t red = 0;
     REQUIRE(parse_color("red", red));
-    CHECK(picked == red);
-
-    // Setting it is one undo step; the same color again is none; undo restores the default.
-    const size_t steps = d.undo_stack().size();
-    set_bookmark_color(*h.app, d, 0, red);
     CHECK(d.view().bookmarks[0].color == red);
-    CHECK(d.undo_stack().size() == steps + 1);
-    set_bookmark_color(*h.app, d, 0, red);
     CHECK(d.undo_stack().size() == steps + 1);
     CHECK(d.view().bookmarks[1].color == 0);
+    // The same color again is no step.
+    set_bookmark_color(*h.app, d, 0, red);
+    CHECK(d.undo_stack().size() == steps + 1);
+
+    // Dragging in the custom picker shows the color live, without undo steps; the release is one
+    // step from red to the final color.
+    REQUIRE(pick_max.x > pick_min.x + 40.0f);
+    const ImVec2 sv_a(pick_min.x + 10.0f, pick_min.y + 10.0f), sv_b(pick_min.x + 30.0f, pick_min.y + 35.0f);
+    menu_frame(sv_a, false);
+    menu_frame(sv_a, true);
+    const uint32_t live_a = d.view().bookmarks[0].color;
+    CHECK(live_a != red);
+    CHECK(d.undo_stack().size() == steps + 1);
+    menu_frame(sv_b, true);
+    const uint32_t live_b = d.view().bookmarks[0].color;
+    CHECK(live_b != live_a);
+    CHECK(d.undo_stack().size() == steps + 1);
+    menu_frame(sv_b, false);
+    CHECK(d.view().bookmarks[0].color == live_b);
+    CHECK(d.undo_stack().size() == steps + 2);
     REQUIRE(d.undo());
-    CHECK(d.view().bookmarks[0].color == 0);
-    REQUIRE(d.redo());
     CHECK(d.view().bookmarks[0].color == red);
+    REQUIRE(d.redo());
+    CHECK(d.view().bookmarks[0].color == live_b);
+
+    // The picker goes away mid-drag (popup closed): the color before the drag comes back, no step.
+    menu_frame(sv_a, false);
+    menu_frame(sv_a, true);
+    CHECK(d.view().bookmarks[0].color != live_b);
+    h.frames(3);  // the App's frames, without the menu
+    CHECK(d.view().bookmarks[0].color == live_b);
+    CHECK(d.undo_stack().size() == steps + 2);
+    ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    h.frames();
 }
 
 TEST_CASE("app: Toggle Bookmark grows the one bookmark a selection overlaps; never shrinks one") {
