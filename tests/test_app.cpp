@@ -433,6 +433,17 @@ TEST_CASE("app: Toggle Bookmark grows the one bookmark a selection overlaps; nev
     h.action("Toggle Bookmark");
     REQUIRE(d.view().bookmarks.size() == 3);
     CHECK(d.view().bookmarks[0].length == 0x28);
+    {  // the caret past the end: the last byte, toggled (not stacked)
+        const size_t n = d.view().bookmarks.size();
+        d.view().cursor = d.view().anchor = d.size();
+        h.action("Toggle Bookmark");
+        REQUIRE(d.view().bookmarks.size() == n + 1);
+        CHECK(d.view().bookmarks.back().offset == d.size() - 1);
+        h.action("Toggle Bookmark");
+        CHECK(d.view().bookmarks.size() == n);
+        REQUIRE(d.undo());
+        REQUIRE(d.undo());
+    }
     select(0x08, 0x30);  // exactly the first one: removed
     h.action("Toggle Bookmark");
     CHECK(d.view().bookmarks.size() == 2);

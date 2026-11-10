@@ -1019,7 +1019,9 @@ void toggle_bookmark(App& app) {
     Document* d = usable_doc(app);
     if (!d) return;
     const ViewState& v = d->view();
-    const uint64_t off = v.has_selection() ? v.sel_begin() : v.cursor;
+    // The caret past the end (where typing appends) means the last byte, as the new bookmark does:
+    // otherwise a second Ctrl+B there would not find the first one and stack another.
+    const uint64_t off = v.has_selection() ? v.sel_begin() : std::min(v.cursor, d->size() ? d->size() - 1 : 0);
     const uint64_t len = v.has_selection() ? v.sel_len() : 1;
     const auto& bms = v.bookmarks;
     // A selection over exactly one bookmark plus bytes outside it grows that bookmark to cover both.
