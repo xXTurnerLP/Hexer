@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include "core/document.h"
 #include "core/highlight.h"
@@ -494,4 +495,45 @@ TEST_CASE("app: the Bookmarks panel edits offset, length and bytes in place") {
     REQUIRE(d.undo());
     REQUIRE(d.read(0x28, now.data(), 4) == 4);
     CHECK(now == before);
+}
+
+TEST_CASE("app: double-clicking a Bookmarks panel cell edits that cell") {
+    TempDir dir;
+    const std::string f = dir.file("bc.bin", pattern(256, 6));
+    HeadlessApp h(path_join(dir.path, "config"), {f}, true);
+    Document& d = *h.tab(0).doc;
+    REQUIRE(d.add_bookmark({0x10, 4, "a", 0, "n"}));
+    h.app->settings.bookmarks_all_files = false;  // no file header row
+    h.app->show_bookmarks = h.app->focus_bookmarks = true;
+    h.frames(4);
+    ImGuiWindow* win = ImGui::FindWindowByName(kWinBookmarks);
+    REQUIRE(win);
+    ImGuiTable* tbl = ImGui::TableFindByID(ImHashStr("##bms", 0, win->ID));
+    REQUIRE(tbl);
+    // The first bookmark row: below the header row (both one text line + cell padding high).
+    const float rh = ImGui::GetTextLineHeight() + 2.0f * ImGui::GetStyle().CellPadding.y;
+    const float y = tbl->InnerRect.Min.y + 1.5f * rh;
+    auto dbl_click = [&](int column) {
+        const float x = 0.5f * (tbl->Columns[column].MinX + tbl->Columns[column].MaxX);
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddMousePosEvent(x, y);
+        h.frames();
+        for (int k = 0; k < 2; ++k) {
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+            h.frames();
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+            h.frames();
+        }
+        h.frames();
+    };
+    // InlineEdit row = bookmark index * 5 + field (0 name, 1 note, 2 offset, 3 length, 4 bytes).
+    for (int col : {3, 2, 4, 1, 0}) {
+        INFO("column " << col);
+        dbl_click(col);
+        CHECK(h.app->bm_edit.active(col, d.id()));
+        h.frames(3);  // the editor takes its keyboard focus
+        h.key(ImGuiKey_Escape);
+        h.frames(2);
+        CHECK_FALSE(h.app->bm_edit.active(col, d.id()));
+    }
 }
