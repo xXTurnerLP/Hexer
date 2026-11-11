@@ -323,6 +323,7 @@ struct App final : ScriptHost {
     // Popup requests (opened at the root ID stack in draw_popups()).
     bool req_goto = false, req_palette = false, req_fill = false, req_copy_as = false,
          req_about = false, req_bookmark_jump = false, req_compare = false;
+    uint64_t req_rename = 0;          // doc id of an untitled tab to rename (Rename popup)
     uint64_t close_prompt_doc = 0;    // doc id awaiting Save/Discard/Cancel
     bool close_prompt_pending = false;
     uint64_t reload_prompt_doc = 0;   // doc id awaiting "Reload from disk and discard edits?"
@@ -339,6 +340,9 @@ struct App final : ScriptHost {
     bool goto_select = false;
     // Fill popup.
     std::string fill_input = "00";
+    // Rename popup (untitled tabs).
+    uint64_t rename_doc = 0;
+    std::string rename_input;
     // Command palette.
     std::string palette_query;
     std::string palette_last_query = "\x01";

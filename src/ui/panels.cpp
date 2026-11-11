@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <string>
@@ -1394,9 +1395,10 @@ namespace {
 // One change requested while drawing the table, applied after it (the lists must not change
 // while they are being iterated).
 struct BookmarkChange {
-    enum Kind { None, Name, Note, Range, Bytes, Remove } kind = None;
+    enum Kind { None, Name, Note, Range, Bytes, Remove, Move } kind = None;
     uint64_t doc = 0;
     size_t index = 0;
+    size_t to = 0;                    // Move: the new position
     std::string text;                 // Name / Note
     uint64_t offset = 0, length = 0;  // Range
     std::vector<uint8_t> bytes;       // Bytes: written over the bookmark's bytes
@@ -1407,6 +1409,13 @@ enum BmField { kBmName, kBmNote, kBmOffset, kBmLength, kBmBytes, kBmFieldCount }
 constexpr uint64_t kBmEditMaxBytes = 4096;  // longer bookmarks' bytes are edited in the hex view
 
 int bm_row(size_t i, int field) { return int(i) * kBmFieldCount + field; }
+
+// Drag and drop payload of a bookmark row (reordering within one document).
+const char* const kBmDragType = "HX_BOOKMARK";
+struct BookmarkDrag {
+    uint64_t doc;
+    size_t index;
+};
 
 std::string bookmark_field_text(const Document& d, const Bookmark& b, int field) {
     switch (field) {
@@ -1501,6 +1510,18 @@ void bookmark_context_menu(App& app, Tab& t, const Bookmark& b, size_t i, Bookma
     }
     if (ImGui::MenuItem("Copy offset")) ImGui::SetClipboardText(fmt_offset(b.offset).c_str());
     ImGui::Separator();
+    const size_t n = d.view().bookmarks.size();
+    auto move_item = [&](const char* label, size_t to, bool enabled) {
+        if (ImGui::MenuItem(label, nullptr, false, enabled)) {
+            change = {BookmarkChange::Move, d.id(), i};
+            change.to = to;
+        }
+    };
+    move_item("Move up", i - 1, i > 0);
+    move_item("Move down", i + 1, i + 1 < n);
+    move_item("Move to top", 0, i > 0);
+    move_item("Move to bottom", n - 1, i + 1 < n);
+    ImGui::Separator();
     if (ImGui::MenuItem("Delete")) change = {BookmarkChange::Remove, d.id(), i};
     close_popup_on_escape();
     ImGui::EndPopup();
@@ -1542,7 +1563,26 @@ void bookmark_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, boo
         }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s\n%s", fmt_range(b.offset, b.length).c_str(),
-                              "Click: select it  \xC2\xB7  double-click a cell to edit it");
+                              "Click: select it  \xC2\xB7  double-click a cell to edit it  \xC2\xB7  "
+                              "drag to reorder");
+        // Drag the row onto another row of the same file to move it there.
+        if (ImGui::BeginDragDropSource()) {
+            const BookmarkDrag drag{d.id(), i};
+            ImGui::SetDragDropPayload(kBmDragType, &drag, sizeof drag);
+            ImGui::TextUnformatted(b.name.empty() ? "(unnamed)" : b.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+            const ImGuiPayload* pl = ImGui::GetDragDropPayload();
+            BookmarkDrag drag{};
+            if (pl && pl->IsDataType(kBmDragType) && pl->DataSize == int(sizeof drag))
+                std::memcpy(&drag, pl->Data, sizeof drag);
+            if (drag.doc == d.id() && drag.index != i && ImGui::AcceptDragDropPayload(kBmDragType)) {
+                change = {BookmarkChange::Move, d.id(), drag.index};  // other files' rows are no target
+                change.to = i;
+            }
+            ImGui::EndDragDropTarget();
+        }
         bookmark_context_menu(app, t, b, i, change);
         // The swatch picks the color: a button on top of the row's Selectable (which allows overlap).
         ImGui::SetCursorScreenPos(swatch);
@@ -1630,6 +1670,10 @@ void apply_bookmark_change(App& app, const BookmarkChange& c) {
     bool ok = true;
     switch (c.kind) {
     case BookmarkChange::Remove: ok = d.remove_bookmark(c.index); break;
+    case BookmarkChange::Move:
+        if (c.to >= bms.size() || c.to == c.index) return;
+        ok = d.move_bookmark(c.index, c.to);
+        break;
     case BookmarkChange::Range:
         if (b.offset == c.offset && b.length == c.length) return;
         b.offset = c.offset;
@@ -1799,7 +1843,7 @@ void draw_bookmarks_panel(App& app) {
     if (ImGui::Checkbox("All open files", &app.settings.bookmarks_all_files)) mark_settings_dirty(app);
     ImGui::SameLine();
     ImGui::TextDisabled("Ctrl+B toggle  \xC2\xB7  F2 / Shift+F2 next / previous  \xC2\xB7  Ctrl+Shift+B find  \xC2\xB7  "
-                        "double-click a cell to edit");
+                        "double-click a cell to edit  \xC2\xB7  drag a name to reorder");
 
     // The tabs to list: the active one, or every open (not saving) one.
     std::vector<Tab*> tabs;

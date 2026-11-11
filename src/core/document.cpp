@@ -1101,6 +1101,21 @@ bool Document::update_bookmark(size_t index, const Bookmark& b) {
     return true;
 }
 
+bool Document::move_bookmark(size_t from, size_t to) {
+    std::lock_guard<std::mutex> lk(mu_);
+    apply_pending();
+    auto& bms = view_.bookmarks;
+    if (busy_ || from >= bms.size() || to >= bms.size() || from == to) return false;
+    push_undo("Move bookmark", false, 0, 0);
+    const auto f = bms.begin() + std::ptrdiff_t(from), t = bms.begin() + std::ptrdiff_t(to);
+    if (from < to)
+        std::rotate(f, f + 1, t + 1);
+    else
+        std::rotate(t, f, f + 1);
+    view_generation++;
+    return true;
+}
+
 bool Document::can_undo() const {
     std::lock_guard<std::mutex> lk(mu_);
     const auto& u = eff_undo();

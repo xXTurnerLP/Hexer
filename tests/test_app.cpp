@@ -572,3 +572,73 @@ TEST_CASE("app: double-clicking a Bookmarks panel cell edits that cell") {
         CHECK_FALSE(h.app->bm_edit.active(col, d.id()));
     }
 }
+
+TEST_CASE("app: dragging a Bookmarks panel row onto another moves it (one undo step)") {
+    TempDir dir;
+    const std::string f = dir.file("bd.bin", pattern(256, 7));
+    HeadlessApp h(path_join(dir.path, "config"), {f}, true);
+    Document& d = *h.tab(0).doc;
+    for (const char* n : {"a", "b", "c"}) REQUIRE(d.add_bookmark({0x10, 1, n, 0, ""}));
+    h.app->settings.bookmarks_all_files = false;
+    h.app->show_bookmarks = h.app->focus_bookmarks = true;
+    h.frames(4);
+    ImGuiWindow* win = ImGui::FindWindowByName(kWinBookmarks);
+    REQUIRE(win);
+    ImGuiTable* tbl = ImGui::TableFindByID(ImHashStr("##bms", 0, win->ID));
+    REQUIRE(tbl);
+    const float rh = ImGui::GetTextLineHeight() + 2.0f * ImGui::GetStyle().CellPadding.y;
+    const float x = 0.5f * (tbl->Columns[0].MinX + tbl->Columns[0].MaxX);
+    auto row_y = [&](int r) { return tbl->InnerRect.Min.y + (1.5f + float(r)) * rh; };
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, row_y(0));
+    h.frames();
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+    h.frames();
+    for (int k = 1; k <= 8; ++k) {  // drag "a" down onto "c"
+        io.AddMousePosEvent(x, row_y(0) + (row_y(2) - row_y(0)) * float(k) / 8.0f);
+        h.frames();
+    }
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    h.frames(2);
+    auto names = [&] {
+        std::string s;
+        for (const Bookmark& b : d.view().bookmarks) s += b.name;
+        return s;
+    };
+    CHECK(names() == "bca");
+    CHECK(d.undo_stack().back().label == "Move bookmark");
+    h.action("Undo");
+    CHECK(names() == "abc");
+}
+
+TEST_CASE("app: Rename Tab names an untitled document; the name survives a restart") {
+    TempDir dir;
+    const std::string cfg = path_join(dir.path, "config");
+    {
+        HeadlessApp h(cfg, {});
+        h.action("New");
+        REQUIRE(!h.app->tabs.empty());
+        Tab& t = *h.app->tabs.back();
+        REQUIRE(!t.doc->has_path());
+        const uint8_t x = 0x41;
+        REQUIRE(t.doc->insert(0, &x, 1));  // an edit, so the untitled tab is kept by the session
+        h.action("Rename Tab...");
+        h.frames(3);  // the popup takes its keyboard focus (the old name is selected)
+        ImGui::GetIO().AddInputCharactersUTF8("notes.bin");
+        h.frames();
+        h.key(ImGuiKey_Enter);
+        CHECK(t.doc->display_name() == "notes.bin");
+        CHECK(t.label == "notes.bin");
+    }
+    {
+        HeadlessApp h(cfg, {});
+        bool found = false;
+        for (auto& t : h.app->tabs) found |= t->label == "notes.bin" && !t->doc->has_path();
+        CHECK(found);
+    }
+    // A file on disk cannot be renamed this way.
+    const std::string f = dir.file("r.bin", pattern(16, 8));
+    HeadlessApp h2(path_join(dir.path, "config2"), {f}, true);
+    std::string err;
+    CHECK_FALSE(run_named_action(*h2.app, "Rename Tab...", &err));
+}

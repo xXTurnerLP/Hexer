@@ -340,6 +340,9 @@ public:
     bool add_bookmark(const Bookmark& b);
     bool remove_bookmark(size_t index);
     bool update_bookmark(size_t index, const Bookmark& b);
+    // Moves bookmark `from` to position `to` (the list order the Bookmarks panel shows), shifting
+    // the ones between. One undo step "Move bookmark"; false if busy, out of range or from == to.
+    bool move_bookmark(size_t from, size_t to);
 
     // Full history: undo/redo survive saves (both in-place and rewrite) and restarts (session).
     // A read-only document only undoes / redoes view steps (e.g. the read-only toggle itself).

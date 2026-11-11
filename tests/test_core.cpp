@@ -728,6 +728,30 @@ TEST_CASE("document: groups, bookmarks, cursor in history") {
     CHECK(d->undo_stack().back().label == "inner");
 }
 
+TEST_CASE("document: move_bookmark reorders as one undo step") {
+    auto d = Document::create_empty("Untitled 1");
+    for (const char* n : {"a", "b", "c", "d"}) REQUIRE(d->add_bookmark(Bookmark{0, 1, n, 0, ""}));
+    auto names = [&] {
+        std::string s;
+        for (const Bookmark& b : d->view().bookmarks) s += b.name;
+        return s;
+    };
+    CHECK_FALSE(d->move_bookmark(1, 1));
+    CHECK_FALSE(d->move_bookmark(4, 0));
+    CHECK_FALSE(d->move_bookmark(0, 4));
+    CHECK(d->move_bookmark(0, 2));  // down
+    CHECK(names() == "bcad");
+    CHECK(d->undo_stack().back().label == "Move bookmark");
+    CHECK(d->move_bookmark(3, 0));  // up
+    CHECK(names() == "dbca");
+    CHECK(d->undo());
+    CHECK(names() == "bcad");
+    CHECK(d->undo());
+    CHECK(names() == "abcd");
+    CHECK(d->redo());
+    CHECK(names() == "bcad");
+}
+
 TEST_CASE("document: group labels - innermost non-empty label names the step") {
     auto d = Document::create_empty("Untitled 1");
     const uint8_t x[2] = {1, 2};

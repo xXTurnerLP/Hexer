@@ -206,7 +206,8 @@ Lua API see [scripting.md](scripting.md).
   that bookmark to cover both (it never shrinks one). Each bookmark has its
   own **color**: click its swatch in the panel (or *Color* in its right-click menu, or *Bookmark
   Color* in the hex view's right-click menu on a bookmarked byte) for a preset, the default or any
-  custom color (undoable). The Bookmarks menu
+  custom color (undoable). Drag a bookmark's name onto another row to **reorder** them (or *Move
+  up / down / to top / to bottom* in its right-click menu; one undo step). The Bookmarks menu
   lists the active file's bookmarks. Bookmarks (and Find All hits) show as ticks on the scrollbar.
   The "All open files" choice is remembered in `settings.ini`.
 - **Settings window** (Edit > Settings..., `Ctrl+,`): bytes per row, grouping, font size, UI
@@ -225,7 +226,9 @@ Lua API see [scripting.md](scripting.md).
   (past the top / bottom scrolls), `Shift`+click extends, double-click a word, triple-click a
   line; `Ctrl+C` copies and `Ctrl+A` selects all while that text was clicked last (elsewhere they
   stay the hex view's); the right-click menu has Copy, Select All and Copy All.
-- Tabs (drag to reorder, the order is kept by hot exit; middle-click closes one), drag and drop
+- Tabs (drag to reorder, the order is kept by hot exit; middle-click closes one; a new, not yet
+  saved document can be **renamed** from its tab's right-click menu or File > Rename Tab..., and
+  Save As suggests that name), drag and drop
   of files (several at once), recent files, reopen a closed tab with its edits (`Ctrl+Shift+T`), a
   read-only mode, and zoom (`Ctrl+=` / `Ctrl+-`, `Ctrl+wheel`).
 - **File changed on disk** banner: **Reload** (the file as it is now; edits and undo history are

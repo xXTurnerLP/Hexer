@@ -64,6 +64,7 @@ const char* const kPopOverwrite = "File changed on disk###overwriteprompt";
 const char* const kPopSaving = "Saving###saving";
 const char* const kPopMessage = "###message";
 const char* const kPopAbout = "About Hexer###about";
+const char* const kPopRename = "Rename###rename";
 const char* const kPopPrompt = "###script_prompt";  // hx.prompt (title = the script's title)
 
 std::vector<std::string> command_line_utf8(int argc, char** argv);  // bottom of file
@@ -321,6 +322,21 @@ std::string path_key(const std::string& p) {
 void new_document(App& app) {
     std::string name = "Untitled " + std::to_string(++app.untitled_counter);
     add_tab(app, Document::create_empty(name));
+}
+
+std::string trim_name(const std::string& s) {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
+}
+
+bool rename_untitled(App& app, Tab& t, const std::string& name) {
+    const std::string n = trim_name(name);
+    if (n.empty() || t.doc->has_path() || t.doc->busy()) return false;
+    t.doc->set_display_name(n);
+    refresh_tab_cache(t);
+    set_status(app, "Renamed to " + n);
+    return true;
 }
 
 void end_compare(App& app) {
@@ -1621,6 +1637,11 @@ bool has_file(App& a) {
     Document* d = usable_doc(a);
     return d && d->has_path();
 }
+// An untitled document (not saved yet): its tab name can be changed (Rename...).
+bool has_untitled(App& a) {
+    Document* d = usable_doc(a);
+    return d && !d->has_path() && d->persistable();
+}
 bool idle(App& a) { return !a.save.running; }
 bool can_back(App& a) {
     Tab* t = active_tab(a);
@@ -1882,6 +1903,7 @@ const Action kActions[] = {
      [](App& a) { if (Tab* t = active_tab(a)) start_save(a, *t, false, AfterSave::None); }, has_doc, true, false},
     {"Save As...", {CS(ImGuiKey_S), 0},
      [](App& a) { if (Tab* t = active_tab(a)) start_save(a, *t, true, AfterSave::None); }, has_doc, true, false},
+    {"Rename Tab...", {0, 0}, [](App& a) { a.req_rename = usable_doc(a)->id(); }, has_untitled, true, false},
     {"Close Tab", {C(ImGuiKey_W), 0}, [](App& a) { request_close_tab(a, a.active); }, has_tab, true, false},
     {"Reopen Closed Tab", {CS(ImGuiKey_T), 0}, [](App& a) { reopen_closed_tab(a); },
      [](App& a) { return !a.closed.empty(); }, true, false},
@@ -2366,6 +2388,7 @@ void draw_main_menu(App& app) {
         menu_action(app, "Save");
         menu_action(app, "Save As...");
         menu_action(app, "Reload from Disk");
+        if (has_untitled(app)) menu_action(app, "Rename Tab...");
         if (has_process(app)) menu_action(app, "Refresh Memory");
         ImGui::Separator();
         if (ImGui::BeginMenu("Compare With", has_doc(app))) {
@@ -3092,7 +3115,15 @@ void draw_editor(App& app) {
             t.tab_id = ImGui::GetItemID();
             if (ImGui::IsItemClicked(ImGuiMouseButton_Middle)) open = false;  // middle-click closes, like x
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-                ImGui::SetTooltip("%s", t.path.empty() ? "Untitled (not saved yet)" : t.path.c_str());
+                ImGui::SetTooltip("%s", t.path.empty() ? "Not saved yet (right-click: Rename...)" : t.path.c_str());
+            if (ImGui::BeginPopupContextItem("##tabctx")) {
+                const bool untitled = !t.doc->has_path() && t.doc->persistable() && !t.doc->busy();
+                if (ImGui::MenuItem("Rename...", nullptr, false, untitled)) app.req_rename = t.doc->id();
+                if (!untitled) ImGui::SetItemTooltip("Only documents that are not saved yet; Save As names the file");
+                if (ImGui::MenuItem("Close")) open = false;
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
             if (selected) {
                 shown = int(i);
                 draw_tab_content(app, t);
@@ -3437,6 +3468,34 @@ void draw_fill(App& app) {
     ImGui::EndPopup();
 }
 
+// Rename an untitled tab (its name is also Save As's suggested file name).
+void draw_rename(App& app) {
+    center_next_window(app, 360.0f);
+    if (!ImGui::BeginPopupModal(kPopRename, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    Tab* t = find_tab(app, app.rename_doc);
+    if (!t || t->doc->has_path()) {  // closed or saved meanwhile
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ImGui::TextUnformatted("Name of this unsaved document:");
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    ImGui::SetNextItemWidth(320.0f * app.ui_scale);
+    const bool enter = ImGui::InputText("##name", &app.rename_input,
+                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    const std::string name = trim_name(app.rename_input);
+    ImGui::BeginDisabled(name.empty());
+    const bool go = ImGui::Button("Rename") || (enter && !name.empty());
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+    if (go) {
+        rename_untitled(app, *t, name);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void draw_copy_as_popup(App& app) {
     if (!ImGui::BeginPopup(kPopCopyAs)) return;
     ImGui::TextDisabled("Copy selection as");
@@ -3736,6 +3795,13 @@ void open_pending_popup(App& app) {
     } else if (app.req_about) {
         app.req_about = false;
         ImGui::OpenPopup(kPopAbout);
+    } else if (app.req_rename) {
+        if (Tab* t = find_tab(app, app.req_rename); t && !t->doc->has_path()) {
+            app.rename_doc = t->doc->id();
+            app.rename_input = t->doc->display_name();
+            ImGui::OpenPopup(kPopRename);
+        }
+        app.req_rename = 0;
     }
 }
 
@@ -3750,6 +3816,7 @@ void draw_popups(App& app) {
     draw_palette(app);
     draw_goto(app);
     draw_fill(app);
+    draw_rename(app);
     draw_copy_as_popup(app);
     draw_about(app);
     draw_script_prompt(app);
