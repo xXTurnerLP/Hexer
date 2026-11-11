@@ -367,6 +367,10 @@ struct App final : ScriptHost {
 
     // Inline editors.
     InlineEdit insp_edit, st_edit, bm_edit;
+    // The Bookmarks panel row clicked last (Shift+Up / Shift+Down move it): used while that bookmark
+    // still covers the caret, else the bookmark under the caret is the selected row.
+    uint64_t bm_sel_doc = 0;
+    size_t bm_sel = SIZE_MAX;
     BookmarkColorPreview bm_preview;  // live color of a dragged bookmark color picker (panels.cpp)
     uint64_t edit_doc = 0;            // active doc id the inline edits belong to (ended on change)
     int insp_sel = -1;                // selected inspector row (Enter edits it)

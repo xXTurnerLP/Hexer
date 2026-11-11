@@ -1410,6 +1410,24 @@ constexpr uint64_t kBmEditMaxBytes = 4096;  // longer bookmarks' bytes are edite
 
 int bm_row(size_t i, int field) { return int(i) * kBmFieldCount + field; }
 
+// The selected row of `d`'s bookmarks (see App::bm_sel), SIZE_MAX = none.
+size_t selected_bookmark(const App& app, const Document& d) {
+    const ViewState& v = d.view();
+    const uint64_t at = focus_offset(v);
+    if (app.bm_sel_doc == d.id() && app.bm_sel < v.bookmarks.size()) {
+        const Bookmark& b = v.bookmarks[app.bm_sel];
+        if (at >= b.offset && at - b.offset < std::max<uint64_t>(b.length, 1)) return app.bm_sel;
+    }
+    return bookmark_at_focus(d);
+}
+
+// A click on a bookmark row: selects its bytes and makes it the selected row.
+void click_bookmark(App& app, Tab& t, const Bookmark& b, size_t i) {
+    app.bm_sel_doc = t.doc->id();
+    app.bm_sel = i;
+    reveal_range(app, t, b.offset, b.length, false);
+}
+
 // Drag and drop payload of a bookmark row (reordering within one document).
 const char* const kBmDragType = "HX_BOOKMARK";
 struct BookmarkDrag {
@@ -1559,7 +1577,7 @@ void bookmark_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, boo
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 begin_bookmark_edit(app, d, b, i, kBmName);
             else
-                reveal_range(app, t, b.offset, b.length, false);
+                click_bookmark(app, t, b, i);
         }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
             ImGui::SetTooltip("%s\n%s", fmt_range(b.offset, b.length).c_str(),
@@ -1602,7 +1620,7 @@ void bookmark_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, boo
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##hit", ImVec2(w, ImGui::GetTextLineHeight()), ImGuiButtonFlags_AllowOverlap);
     const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-    if (ImGui::IsItemClicked() && !dbl) reveal_range(app, t, b.offset, b.length, false);
+    if (ImGui::IsItemClicked() && !dbl) click_bookmark(app, t, b, i);
     if (field == kBmBytes && b.length > kBmEditMaxBytes)
         ImGui::SetItemTooltip("Too long to edit here: select it and edit the bytes in the hex view");
     bookmark_context_menu(app, t, b, i, change);
@@ -1631,7 +1649,7 @@ void bookmark_cell(App& app, Tab& t, const Bookmark& b, size_t i, int field, boo
 void draw_bookmark_rows(App& app, Tab& t, BookmarkChange& change) {
     Document& d = *t.doc;
     const std::vector<Bookmark>& bms = d.view().bookmarks;
-    const uint64_t at = focus_offset(d.view());
+    const size_t sel = &t == active_tab(app) ? selected_bookmark(app, d) : SIZE_MAX;
     ImGuiListClipper clip;
     clip.Begin(int(bms.size()));
     while (clip.Step()) {
@@ -1640,7 +1658,7 @@ void draw_bookmark_rows(App& app, Tab& t, BookmarkChange& change) {
             const Bookmark& b = bms[i];
             ImGui::TableNextRow();
             ImGui::PushID(k);
-            const bool selected = &t == active_tab(app) && at >= b.offset && at - b.offset < std::max<uint64_t>(b.length, 1);
+            const bool selected = i == sel;
             ImGui::TableSetColumnIndex(0);
             bookmark_cell(app, t, b, i, kBmName, selected, change);
             ImGui::TableSetColumnIndex(1);
@@ -1673,6 +1691,10 @@ void apply_bookmark_change(App& app, const BookmarkChange& c) {
     case BookmarkChange::Move:
         if (c.to >= bms.size() || c.to == c.index) return;
         ok = d.move_bookmark(c.index, c.to);
+        if (ok) {  // the moved row stays the selected one
+            app.bm_sel_doc = d.id();
+            app.bm_sel = c.to;
+        }
         break;
     case BookmarkChange::Range:
         if (b.offset == c.offset && b.length == c.length) return;
@@ -1843,7 +1865,7 @@ void draw_bookmarks_panel(App& app) {
     if (ImGui::Checkbox("All open files", &app.settings.bookmarks_all_files)) mark_settings_dirty(app);
     ImGui::SameLine();
     ImGui::TextDisabled("Ctrl+B toggle  \xC2\xB7  F2 / Shift+F2 next / previous  \xC2\xB7  Ctrl+Shift+B find  \xC2\xB7  "
-                        "double-click a cell to edit  \xC2\xB7  drag a name to reorder");
+                        "double-click a cell to edit  \xC2\xB7  drag a name or Shift+Up / Down to reorder");
 
     // The tabs to list: the active one, or every open (not saving) one.
     std::vector<Tab*> tabs;
@@ -1900,6 +1922,21 @@ void draw_bookmarks_panel(App& app) {
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    // Shift+Up / Shift+Down move the selected bookmark of the active file (panel focused, no cell
+    // being edited).
+    if (d && change.kind == BookmarkChange::None && app.bm_edit.row < 0) {
+        const ImGuiInputFlags fl = ImGuiInputFlags_RouteFocused | ImGuiInputFlags_Repeat;
+        const bool up = ImGui::Shortcut(ImGuiMod_Shift | ImGuiKey_UpArrow, fl);
+        const bool down = !up && ImGui::Shortcut(ImGuiMod_Shift | ImGuiKey_DownArrow, fl);
+        const size_t i = selected_bookmark(app, *d);
+        if ((up || down) && i != SIZE_MAX) {
+            const size_t to = up ? i - 1 : i + 1;
+            if (i < d->view().bookmarks.size() && (up ? i > 0 : to < d->view().bookmarks.size())) {
+                change = {BookmarkChange::Move, d->id(), i};
+                change.to = to;
+            }
+        }
     }
     apply_bookmark_change(app, change);
     ImGui::End();

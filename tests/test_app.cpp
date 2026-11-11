@@ -642,3 +642,51 @@ TEST_CASE("app: Rename Tab names an untitled document; the name survives a resta
     std::string err;
     CHECK_FALSE(run_named_action(*h2.app, "Rename Tab...", &err));
 }
+
+TEST_CASE("app: Shift+Up / Shift+Down move the selected Bookmarks panel row") {
+    TempDir dir;
+    const std::string f = dir.file("bk.bin", pattern(256, 9));
+    HeadlessApp h(path_join(dir.path, "config"), {f}, true);
+    Document& d = *h.tab(0).doc;
+    for (const char* n : {"a", "b", "c"}) REQUIRE(d.add_bookmark({0x10, 4, n, 0, ""}));  // overlapping
+    h.app->settings.bookmarks_all_files = false;
+    h.app->show_bookmarks = h.app->focus_bookmarks = true;
+    h.frames(4);
+    ImGuiWindow* win = ImGui::FindWindowByName(kWinBookmarks);
+    REQUIRE(win);
+    ImGuiTable* tbl = ImGui::TableFindByID(ImHashStr("##bms", 0, win->ID));
+    REQUIRE(tbl);
+    const float rh = ImGui::GetTextLineHeight() + 2.0f * ImGui::GetStyle().CellPadding.y;
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(0.5f * (tbl->Columns[0].MinX + tbl->Columns[0].MaxX), tbl->InnerRect.Min.y + 1.5f * rh);
+    h.frames();
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);  // click "a"
+    h.frames();
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    h.frames(2);
+    auto names = [&] {
+        std::string s;
+        for (const Bookmark& b : d.view().bookmarks) s += b.name;
+        return s;
+    };
+    auto shift_key = [&](ImGuiKey k) {
+        io.AddKeyEvent(ImGuiMod_Shift, true);
+        h.key(k);
+        io.AddKeyEvent(ImGuiMod_Shift, false);
+        h.frames();
+    };
+    shift_key(ImGuiKey_DownArrow);
+    CHECK(names() == "bac");
+    shift_key(ImGuiKey_DownArrow);
+    CHECK(names() == "bca");
+    shift_key(ImGuiKey_DownArrow);  // already last
+    CHECK(names() == "bca");
+    shift_key(ImGuiKey_UpArrow);
+    CHECK(names() == "bac");
+    CHECK(d.undo_stack().back().label == "Move bookmark");
+    // In the hex view Shift+arrows extend the selection; the bookmarks stay.
+    h.tab(0).view.request_focus();
+    h.frames(3);
+    shift_key(ImGuiKey_UpArrow);
+    CHECK(names() == "bac");
+}

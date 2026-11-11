@@ -206,8 +206,9 @@ Lua API see [scripting.md](scripting.md).
   that bookmark to cover both (it never shrinks one). Each bookmark has its
   own **color**: click its swatch in the panel (or *Color* in its right-click menu, or *Bookmark
   Color* in the hex view's right-click menu on a bookmarked byte) for a preset, the default or any
-  custom color (undoable). Drag a bookmark's name onto another row to **reorder** them (or *Move
-  up / down / to top / to bottom* in its right-click menu; one undo step). The Bookmarks menu
+  custom color (undoable). Drag a bookmark's name onto another row to **reorder** them (or
+  `Shift+Up` / `Shift+Down` on the selected row while the panel has focus, or *Move up / down / to
+  top / to bottom* in its right-click menu; one undo step each). The Bookmarks menu
   lists the active file's bookmarks. Bookmarks (and Find All hits) show as ticks on the scrollbar.
   The "All open files" choice is remembered in `settings.ini`.
 - **Settings window** (Edit > Settings..., `Ctrl+,`): bytes per row, grouping, font size, UI
@@ -312,6 +313,7 @@ in `<config>/layout.ini` (View > Reset Layout rebuilds it).
 | `Ctrl+G` | Go to offset (`Shift+Enter` selects from the cursor) |
 | `Ctrl+B` | Toggle bookmark (on the selection, else the caret byte); grows the one bookmark a selection partly covers |
 | `F2` / `Shift+F2` | Next / previous bookmark |
+| `Shift+Up` / `Shift+Down` | Bookmarks panel: move the selected bookmark up / down |
 | `Ctrl+Shift+B` | Jump to a bookmark in any open file (fuzzy search) |
 | `Ctrl+click` / `Ctrl+Enter` | Follow the pointer under the mouse / at the cursor (`Ctrl+hover` previews the target) |
 | `Alt+Left` / `Alt+Right`, mouse back / forward | Back / forward through the jump history |
