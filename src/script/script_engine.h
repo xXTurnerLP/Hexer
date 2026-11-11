@@ -14,7 +14,7 @@
 // __gc finalizers set through setmetatable run under a 1 s limit each (also at reload / exit).
 // Global table `hexer` (also aliased as `hx`):
 //
-//   hx.version                          "1.1.2"
+//   hx.version                          "1.1.3"
 //   hx.parser{ name=, extensions={"png",..}, detect=function(doc) -> bool, parse=function(p, doc) }
 //   hx.command{ name=, description=, run=function(doc) }   -- shown in palette + Scripts menu
 //   hx.run(name)                        -- run a registered command (as the palette does); inside

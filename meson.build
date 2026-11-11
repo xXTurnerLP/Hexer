@@ -1,5 +1,5 @@
 project('hexer', ['c', 'cpp'],
-  version : '1.1.2',
+  version : '1.1.3',
   meson_version : '>=1.3.0',
   default_options : [
     'cpp_std=c++20',

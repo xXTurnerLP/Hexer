@@ -30,6 +30,14 @@
   <url type="bugtracker">https://github.com/xXTurnerLP/Hexer/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.3" date="2026-11-11">
+      <description>
+        <ul>
+          <li>Reorder bookmarks: drag a bookmark onto another row, use Shift+Up / Shift+Down, or the Move items in its right-click menu</li>
+          <li>Rename a new, unsaved document from its tab's right-click menu or File &gt; Rename Tab...</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.2" date="2026-11-10">
       <description>
         <ul>
